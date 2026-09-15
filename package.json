@@ -1,0 +1,11 @@
+{
+  "name": "clinch-workspace",
+  "private": true,
+  "workspaces": ["apps/desktop"],
+  "scripts": {
+    "dev": "npm run dev --workspace @clinch/desktop",
+    "build": "npm run build --workspace @clinch/desktop",
+    "check": "npm run check --workspace @clinch/desktop",
+    "tauri": "npm run tauri --workspace @clinch/desktop --"
+  }
+}

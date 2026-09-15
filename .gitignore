@@ -1,0 +1,17 @@
+/target/
+node_modules/
+dist/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+apps/desktop/src-tauri/gen/
+
+
+.codex
+skills
+*txt
+*log
+.agents
+AGENTS.md
+opencode.json

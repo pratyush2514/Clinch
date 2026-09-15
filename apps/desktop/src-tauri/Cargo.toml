@@ -1,0 +1,30 @@
+[package]
+name = "clinch-desktop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "clinch_desktop"
+# Desktop-only Rust linkage; mobile static/dynamic outputs are outside Phase 0.
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+url.workspace = true
+browser-driver = { path = "../../../packages/browser-driver" }
+session-sync = { path = "../../../packages/session-sync" }
+playbook-store = { path = "../../../packages/playbook-store" }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+serde_json = "1"
+
+[lints]
+workspace = true

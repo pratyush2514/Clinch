@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["apps/desktop/src-tauri", "packages/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "sync"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+zeroize = { version = "1", features = ["derive"] }
+url = { version = "2", features = ["serde"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Keep unwinding: blocking-task failures must remain recoverable as fallback.
