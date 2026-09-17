@@ -1,12 +1,17 @@
 #![deny(unsafe_code)]
 //! One managed, isolated Chromium child; native CDP only.
+mod actions;
+mod preview;
+pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
 use chromiumoxide::{
     Browser, Page,
     cdp::browser_protocol::network::{
         CookieSameSite as CdpSameSite, SetCookieParams, TimeSinceEpoch,
     },
+    cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
 };
 use futures::StreamExt;
+pub use preview::{DomRegion, Viewport};
 use session_sync::{Cookie, CookieSameSite};
 use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
 use tokio::{
@@ -29,10 +34,28 @@ pub enum BrowserError {
     Injection,
     #[error("The portal could not be opened")]
     Navigation,
+    #[error("The page is replacing its execution context")]
+    PageChanging,
+    #[error("The recorded selector needs repair")]
+    Selector(SelectorIssue),
+    #[error("The action or its target is not permitted")]
+    InvalidAction,
+    #[error("The page left the configured portal")]
+    WrongOrigin,
+    #[error("The download failed or was canceled")]
+    Download,
+    #[error("Local download storage is unavailable")]
+    Storage,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LaunchOptions {
+    pub headless: bool,
 }
 
 // No Debug: CDP objects may contain session data.
 pub struct ManagedBrowser {
+    headless: bool,
     child: Mutex<Option<Child>>,
     browser: Browser,
     page: Page,
@@ -45,6 +68,17 @@ impl ManagedBrowser {
     /// # Errors
     /// Reports launch, connection, or timeout failures without exposing CDP data.
     pub async fn launch(executable: &Path, profile: &Path) -> Result<Self, BrowserError> {
+        Self::launch_with_options(executable, profile, LaunchOptions::default()).await
+    }
+
+    /// Launch the managed profile with explicit window visibility.
+    /// # Errors
+    /// Reports launch, connection, or timeout failures.
+    pub async fn launch_with_options(
+        executable: &Path,
+        profile: &Path,
+        options: LaunchOptions,
+    ) -> Result<Self, BrowserError> {
         tokio::fs::create_dir_all(profile)
             .await
             .map_err(|_| BrowserError::Launch)?;
@@ -62,6 +96,8 @@ impl ManagedBrowser {
                 "--remote-debugging-address=127.0.0.1",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
             ])
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("about:blank")
@@ -69,6 +105,9 @@ impl ManagedBrowser {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if options.headless {
+            command.arg("--headless=new");
+        }
         // Hide the helper console, but keep the requested interactive browser window.
         #[cfg(target_os = "windows")]
         command.creation_flags(0x0800_0000);
@@ -107,12 +146,79 @@ impl ManagedBrowser {
             task.abort();
             return Err(BrowserError::Connection);
         };
-        Ok(Self {
+        // Register in the main world before any portal scripts can run. Keep the
+        // managed owner alive during setup so failures clean up the child/task.
+        let managed = Self {
+            headless: options.headless,
             child: Mutex::new(Some(child)),
             browser,
             page,
             handler: task,
-        })
+        };
+        let mut script = AddScriptToEvaluateOnNewDocumentParams::new(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
+        );
+        script.run_immediately = Some(true);
+        tokio::time::timeout(IO_TIMEOUT, managed.page.execute(script))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        Ok(managed)
+    }
+
+    pub fn is_headless(&self) -> bool {
+        self.headless
+    }
+
+    /// Restart the same app-owned profile, carrying session cookies only in memory.
+    /// # Errors
+    /// Fails closed if cookies cannot be preserved or the new process cannot start.
+    pub async fn restart(
+        &self,
+        executable: &Path,
+        profile: &Path,
+        options: LaunchOptions,
+    ) -> Result<Self, BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+        let cookies = tokio::time::timeout(IO_TIMEOUT, self.browser.get_cookies())
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        let mut params = Vec::with_capacity(cookies.len());
+        for cookie in cookies {
+            if cookie.partition_key_opaque == Some(true) {
+                return Err(BrowserError::Injection);
+            }
+            let mut param = CookieParam::new(cookie.name, cookie.value);
+            if cookie.domain.starts_with('.') {
+                param.domain = Some(cookie.domain);
+            } else {
+                param.url = Some(format!(
+                    "{}://{}/",
+                    if cookie.secure { "https" } else { "http" },
+                    cookie.domain
+                ));
+            }
+            param.path = Some(cookie.path);
+            param.secure = Some(cookie.secure);
+            param.http_only = Some(cookie.http_only);
+            param.same_site = cookie.same_site;
+            if !cookie.session {
+                param.expires = Some(TimeSinceEpoch::new(cookie.expires));
+            }
+            param.priority = Some(cookie.priority);
+            param.source_scheme = Some(cookie.source_scheme);
+            param.source_port = Some(cookie.source_port);
+            param.partition_key = cookie.partition_key;
+            params.push(param);
+        }
+        self.shutdown().await?;
+        let managed = Self::launch_with_options(executable, profile, options).await?;
+        tokio::time::timeout(IO_TIMEOUT, managed.browser.set_cookies(params))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Injection)?;
+        Ok(managed)
     }
 
     /// Inject only the prepared cookie set through Network.setCookie.
@@ -261,6 +367,21 @@ mod tests {
         let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
         let profile = tempfile::tempdir()?;
         let browser = ManagedBrowser::launch(Path::new(&executable), profile.path()).await?;
+        // A document's own first script must see the override, including after
+        // subsequent navigations (not just an evaluation in the initial blank tab).
+        for _ in 0..2 {
+            browser.navigate(&Url::parse(
+                "data:text/html,<script>window.initialWebdriver = typeof navigator.webdriver</script>",
+            )?).await?;
+            let hidden = browser
+                .page
+                .evaluate(
+                    "window.initialWebdriver === 'undefined' && navigator.webdriver === undefined",
+                )
+                .await?
+                .into_value::<bool>()?;
+            assert!(hidden);
+        }
         browser
             .inject(&[cookie("example.com"), cookie(".example.org")])
             .await?;

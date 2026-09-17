@@ -4,5 +4,18 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+llm-provider = { path = "../llm-provider" }
+browser-driver = { path = "../browser-driver" }
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

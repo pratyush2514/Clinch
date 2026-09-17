@@ -2,7 +2,43 @@
 mod service;
 use service::{AppError, AppService, ApprovalPreview, SessionStatus, StorageStatus};
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
+#[tauri::command]
+async fn downloaded_file_action<R: tauri::Runtime>(
+    id: orchestration_engine::TaskId,
+    index: usize,
+    reveal: bool,
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppService>,
+) -> Result<(), AppError> {
+    let path = state.downloaded_file(id, index).await?;
+    if reveal {
+        app.opener()
+            .reveal_item_in_dir(path)
+            .map_err(|_| AppError::StorageUnavailable)
+    } else {
+        app.opener()
+            .open_path(path.to_string_lossy(), None::<&str>)
+            .map_err(|_| AppError::StorageUnavailable)
+    }
+}
+
+#[tauri::command]
+async fn task_decision(
+    id: orchestration_engine::TaskId,
+    index: usize,
+    approved: bool,
+    state: tauri::State<'_, AppService>,
+) -> Result<(), AppError> {
+    state.decide_task(id, index, approved).await
+}
+#[tauri::command]
+async fn browser_viewport(
+    state: tauri::State<'_, AppService>,
+) -> Result<browser_driver::Viewport, AppError> {
+    state.viewport().await
+}
 #[tauri::command]
 async fn initialize(state: tauri::State<'_, AppService>) -> Result<StorageStatus, AppError> {
     state.initialize().await
@@ -26,6 +62,26 @@ async fn close_browser(state: tauri::State<'_, AppService>) -> Result<(), AppErr
     state.close_browser().await
 }
 #[tauri::command]
+async fn harvest_invoices(
+    request: orchestration_engine::InvoiceRequest,
+    progress: tauri::ipc::Channel<orchestration_engine::TaskEvent>,
+    state: tauri::State<'_, AppService>,
+) -> Result<orchestration_engine::Task, AppError> {
+    state
+        .harvest(&request, |event| {
+            // If the view closes, execution still checkpoints; get_task restores its durable result.
+            let _ = progress.send(event);
+        })
+        .await
+}
+#[tauri::command]
+async fn get_task(
+    id: orchestration_engine::TaskId,
+    state: tauri::State<'_, AppService>,
+) -> Result<orchestration_engine::Task, AppError> {
+    state.task(id).await
+}
+#[tauri::command]
 // Tauri's CommandArg contract requires the State wrapper by value.
 #[allow(clippy::needless_pass_by_value)]
 fn preview_approval(state: tauri::State<'_, AppService>) -> Result<ApprovalPreview, AppError> {
@@ -45,16 +101,21 @@ fn resolve_approval(
 fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         initialize,
+        downloaded_file_action,
+        task_decision,
+        browser_viewport,
         sync_session,
         manual_login,
         close_browser,
+        harvest_invoices,
+        get_task,
         preview_approval,
         resolve_approval
     ])
 }
 
 pub fn run() {
-    let result = with_commands(tauri::Builder::default())
+    let result = with_commands(tauri::Builder::default().plugin(tauri_plugin_opener::init()))
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let home = app.path().home_dir()?;
@@ -85,6 +146,36 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct Preview {
         id: u64,
+    }
+
+    #[test]
+    fn invoice_channel_command_requires_connected_session() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let app = with_commands(mock_builder())
+            .manage(AppService::new(
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+            ))
+            .build(mock_context(noop_assets()))?;
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
+        let request = InvokeRequest {
+            cmd: "harvest_invoices".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: url::Url::parse("http://tauri.localhost")?,
+            body: InvokeBody::Json(serde_json::json!({
+                "request": {"workflow":"bills", "portalUrl":"https://example.com/billing", "billingSelector":null, "invoiceSelector":"a.invoice"},
+                "progress":"__CHANNEL__:7"
+            })),
+            headers: tauri::http::HeaderMap::new(),
+            invoke_key: INVOKE_KEY.into(),
+        };
+        let error = get_ipc_response(&webview, request)
+            .err()
+            .ok_or("Expected session rejection")?;
+        assert_eq!(error["code"], "session_required");
+        Ok(())
     }
 
     #[test]

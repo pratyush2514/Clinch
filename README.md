@@ -1,6 +1,8 @@
-# Clinch — Phase 0, Week 1
+# Clinch — Phase 0, Steps 1–4
 
-Implements **Steps 1 and 2 only** from `Phase_0_Prompt.md`: workspace initialization and consent-gated session sync. No invoice automation, macro execution, ATS forms, scheduling, or LLM calls.
+Implements the desktop/session-sync scaffold and Phase A Invoice Harvester: checkpointed Task → Plan → Step execution, versioned CDP macros, deterministic replay, bounded local selector repair, Sentinel approvals, and a mirrored viewport. First-run planning uses a configured script. No ATS forms or scheduling.
+
+See [Phase A final integration](docs/PHASE_A_FINAL_INTEGRATION.md) for the Python/Ollama adapter setup, launch commands, and live-portal manual walkthrough.
 
 ## Run
 
@@ -11,9 +13,9 @@ npm ci
 npm run tauri -- dev
 ```
 
-`CLINCH_CHROMIUM_PATH` optionally selects the browser executable. On macOS the default is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. The browser runs as a managed, headed child with an app-owned persistent profile, `--remote-debugging-port=0`, and loopback CDP. No sandbox-disabling switches are used. This spike opens a separate interactive Chromium window; it does not claim inline embedding in the left pane.
+`CLINCH_CHROMIUM_PATH` optionally selects the browser executable. On macOS the default is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. The browser runs as a managed, headed child with an app-owned persistent profile, `--remote-debugging-port=0`, and loopback CDP. This spike opens a separate interactive Chromium window; it does not claim inline embedding in the left pane. Existing local browser launch flags are preserved by this implementation.
 
-The desktop app initializes `clinch.db` in its platform app-data directory through one lazy `sqlx` pool, with WAL mode and foreign keys enabled. Its sibling `browser-profile` directory holds Chromium's own persistent profile. The database records outcome metadata only, never cookie values or Safe Storage keys. Chrome controls encryption of its own profile. No separate plaintext cookie dump is written.
+The desktop app initializes `clinch.db` in its platform app-data directory through one lazy `sqlx` pool, with WAL mode and foreign keys enabled. Its sibling `browser-profile` directory holds Chromium's own persistent profile. The database stores session outcome metadata and task checkpoints, never imported cookie values or Safe Storage keys. Chrome controls encryption of its own profile. No separate plaintext cookie dump is written.
 
 ## Workspace and dependency structure
 
@@ -23,14 +25,14 @@ apps/desktop/                 React + TypeScript + Vite + Tailwind
   src/                        Resizable shell, consent/fallback UI, dummy gate
   src-tauri/                  Thin Tauri v2 commands and service wiring
 packages/
-  orchestration-engine/       Reserved boundary; no execution yet
+  orchestration-engine/       Task state, SQLite checkpoints, Invoice Harvester
   browser-driver/             Managed child + chromiumoxide CDP bridge
-  macro-engine/               Reserved boundary
+  macro-engine/               Versioned JSON record/replay, selector repair flags
   session-sync/               Consent, profile reader, decryption, fallback
   filesystem-tool/            Reserved boundary
   credential-vault/           keyring-core + macOS Keychain adapter
   playbook-store/             SQLite WAL initialization; schemas deferred
-  llm-provider/               Reserved boundary; no provider requests
+  llm-provider/               Bounded local selector-repair adapter process
 ```
 
 Dependency direction:
@@ -39,10 +41,25 @@ Dependency direction:
 desktop -> session-sync -> credential-vault
 desktop -> browser-driver -> session-sync (cookie contract)
 desktop -> playbook-store -> sqlx/SQLite
+desktop -> orchestration-engine -> macro-engine -> browser-driver
+orchestration-engine -> sqlx (shared application pool)
 browser-driver -> chromiumoxide -> native CDP WebSocket
 ```
 
-The other four packages deliberately have no dependencies or placeholder APIs. UI uses `react-resizable-panels` and `cmdk`; the command menu currently exposes only scaffold actions.
+The filesystem-tool boundary remains reserved. UI uses `react-resizable-panels` and `cmdk`; task progress streams through a typed Tauri `Channel`, with no frontend polling.
+
+## Run the Invoice Harvester
+
+1. Enter a stable HTTPS billing page URL (no query or fragment), then sync the session or sign in manually. Finish any login/2FA in the managed Chromium window.
+2. In **Invoice Harvester**, choose a workflow name and the CSS selector for invoice download links. If the starting page has a link to invoice history, supply that link's selector too.
+3. Click **Run Invoice Harvester**. The first successful run records its script into `macros/<workflow>.json` under app data. Reusing that workflow and URL loads the saved macro; new selector fields do not overwrite it.
+4. The step list reports live state, timings, DOM targets, and local download paths. Downloads are scoped to `downloads/<task-id>/`, use Chromium GUID filenames, and require a completed CDP download event plus a nonempty local file.
+
+The Phase A vocabulary is intentionally narrow: same-origin navigation links, non-secret filter inputs, and invoice download links (at most 25 per download step). Buttons that generate PDFs, new-tab downloads, cross-origin/CDN downloads, nested frames, and shadow DOM require additional adapters. No generic script evaluation, credential entry, or form submission is exposed through macros.
+
+Task snapshots and append-only `task_checkpoints` are committed in SQLite WAL before dispatch and after each step. Macro publication is atomic and occurs only after all steps succeed. On restart, unfinished tasks become `interrupted`; uncertain actions are never retried automatically. Missing/ambiguous/invalid/invisible selectors yield a targeted repair request containing the step index, selector, reason, and target-versus-wait stage. Automatic LLM repair and resume are outside these steps. Failed/partial downloads may leave files in that run's directory; inspect it before starting a fresh run.
+
+See [Steps 3–4 implementation and verification](docs/PHASE_0_STEPS_3_4.md) for the current evidence and boundaries.
 
 ## Session-sync logic
 
