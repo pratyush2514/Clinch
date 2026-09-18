@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 //! One managed, isolated Chromium child; native CDP only.
 mod actions;
+mod picker;
 mod preview;
+mod session;
 pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
 use chromiumoxide::{
     Browser, Page,
@@ -11,7 +13,11 @@ use chromiumoxide::{
     cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
 };
 use futures::StreamExt;
+pub use picker::{
+    PICKER_BINDING, PickedElement, PickerRect, parse_binding_payload, rank_selectors_from_attrs,
+};
 pub use preview::{DomRegion, Viewport};
+pub use session::{AuthSignal, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
 use tokio::{
@@ -46,11 +52,30 @@ pub enum BrowserError {
     Download,
     #[error("Local download storage is unavailable")]
     Storage,
+    #[error("The element picker is unavailable or timed out")]
+    Picker,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LaunchOptions {
     pub headless: bool,
+}
+
+impl LaunchOptions {
+    /// Foreground browser for consent, manual login, and element picking.
+    /// The window is app-owned; it never touches the user's daily profile.
+    #[must_use]
+    pub fn interactive() -> Self {
+        Self { headless: false }
+    }
+
+    /// Background macro replay. No OS window may spawn on this path —
+    /// enforced by `Engine::harvest` (`HeadlessRequired`) and asserted by
+    /// the `headless_replay_*` integration tests.
+    #[must_use]
+    pub fn replay() -> Self {
+        Self { headless: true }
+    }
 }
 
 // No Debug: CDP objects may contain session data.
@@ -360,6 +385,14 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn launch_options_separate_replay_from_interactive() {
+        // Phase B headless-first contract: replays never spawn an OS window.
+        assert!(LaunchOptions::replay().headless);
+        assert!(!LaunchOptions::interactive().headless);
+        assert!(!LaunchOptions::default().headless);
+    }
+
     #[tokio::test]
     #[ignore = "Requires CLINCH_CHROMIUM_PATH and launches a real browser using a temporary profile"]
     async fn real_cdp_cookie_injection() -> Result<(), Box<dyn std::error::Error>> {
@@ -405,6 +438,22 @@ mod tests {
         let mut invalid = cookie("example.com");
         invalid.name = "invalid;name".into();
         assert!(browser.inject(&[invalid]).await.is_err());
+        browser.shutdown().await?;
+        profile.close()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires CLINCH_CHROMIUM_PATH and launches a real headless browser using a temporary profile"]
+    async fn headless_launch_confirms_no_window() -> Result<(), Box<dyn std::error::Error>> {
+        let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
+        let profile = tempfile::tempdir()?;
+        let options = LaunchOptions::replay();
+        assert!(options.headless);
+        let browser =
+            ManagedBrowser::launch_with_options(Path::new(&executable), profile.path(), options)
+                .await?;
+        assert!(browser.is_headless());
         browser.shutdown().await?;
         profile.close()?;
         Ok(())

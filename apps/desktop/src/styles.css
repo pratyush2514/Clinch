@@ -63,3 +63,7 @@ dialog::backdrop, [cmdk-overlay] { background: #1a201766; position: fixed; inset
 .browser-highlight { position: absolute; pointer-events: none; border: 2px solid #748b17; background: #b8d84426; box-sizing: border-box; }
 .invoice-task dialog { margin: auto 24px auto auto; width: min(480px, calc(45vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
 .invoice-task dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.element-picker { margin: -8px 0 16px; }
+.element-picker .actions { margin-bottom: 8px; }
+.auth-panel { border: 1px solid #b9c4a3; background: #f2f5e9; border-radius: 6px; padding: 20px; margin-top: 20px; }
+.auth-panel code { overflow-wrap: anywhere; font-size: 11px; }

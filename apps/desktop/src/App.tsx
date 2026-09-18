@@ -4,11 +4,12 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { Command } from "cmdk";
 import InvoiceTask, { type Highlight } from "./InvoiceTask";
 import BrowserViewport from "./BrowserViewport";
+import AuthPanel, { type AuthPanelState } from "./AuthPanel";
 
 type SessionStatus = { state: "cookies_imported"; count: number }
   | { state: "manual_login"; reason: string | null };
 
-type StorageStatus = { ready: boolean; cookieImportSupported: boolean };
+type StorageStatus = { ready: boolean; cookieImportSupported: boolean; defaultBrowser: string };
 
 function message(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
@@ -33,6 +34,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("Connect a portal to begin.");
   const [events, setEvents] = useState<string[]>([]);
+  const [authPanel, setAuthPanel] = useState<AuthPanelState | null>(null);
 
   const [commandOpen, setCommandOpen] = useState(false);
 
@@ -41,6 +43,12 @@ export default function App() {
     if (!isTauri()) { setStatus("Browser preview. Start the Tauri app to access local storage and session sync."); return; }
     invoke<StorageStatus>("initialize").then(result => {
       setReady(result.ready); setSupported(result.cookieImportSupported);
+      // The backend preselects the most reliable source browser per OS
+      // (Brave on Windows — Chrome 127+ seals its key with App-Bound
+      // encryption that third-party apps cannot unwrap).
+      if (["chrome", "brave", "edge"].includes(result.defaultBrowser)) {
+        setBrowser(result.defaultBrowser);
+      }
     }).catch(error => setStatus(message(error)));
   }, []);
   useEffect(() => {
@@ -57,15 +65,45 @@ export default function App() {
   function report(text: string) {
     setStatus(text); setEvents(previous => [...previous.slice(-19), text]);
   }
+  async function afterConnect(result: SessionStatus) {
+    // Zero-touch reconciliation: a login/2FA challenge raises the embedded
+    // in-app panel instead of opening an external OS browser window.
+    try {
+      const panel = await invoke<AuthPanelState | null>("auth_status");
+      setAuthPanel(panel);
+    } catch { /* panel state is best effort; status text below still applies */ }
+    report(result.state === "cookies_imported"
+      ? `Imported ${result.count} cookies. Verify the session in the Chromium window; sign in there if needed.`
+      : result.reason === "app_bound_locked"
+        ? "Chrome seals its cookies with App-Bound encryption that Clinch cannot unwrap. Switch the source browser to Brave for instant import, or sign in manually in the app-owned Chromium profile."
+        : `Manual login is ready in the app-owned Chromium profile.${result.reason ? " Reason: " + result.reason.replaceAll("_", " ") + "." : ""}`);
+  }
   async function connect(manual: boolean) {
     setBusy(true);
     try {
       const result = manual
         ? await invoke<SessionStatus>("manual_login", { portalUrl: portal })
         : await invoke<SessionStatus>("sync_session", { request: { browser, profile, portalUrl: portal, consent } });
-      report(result.state === "cookies_imported"
-        ? `Imported ${result.count} cookies. Verify the session in the Chromium window; sign in there if needed.`
-        : `Manual login is ready in the app-owned Chromium profile.${result.reason ? " Reason: " + result.reason.replaceAll("_", " ") + "." : ""}`);
+      await afterConnect(result);
+    } catch (error) { report(message(error)); }
+    finally { setBusy(false); }
+  }
+  async function connectViaExtension() {
+    setBusy(true);
+    try {
+      // No profile-consent checkbox needed: the click itself scopes this sync
+      // to the portal above, and the extension only answers that domain.
+      const result = await invoke<SessionStatus>("bridge_sync_session", { portalUrl: portal });
+      await afterConnect(result);
+    } catch (error) { report(message(error)); }
+    finally { setBusy(false); }
+  }
+  async function openEmbeddedAuth() {
+    setBusy(true);
+    try {
+      const panel = await invoke<AuthPanelState>("begin_embedded_auth", { portalUrl: portal });
+      setAuthPanel(panel);
+      report("Embedded sign-in opened in the app-owned profile. Complete login there, then continue.");
     } catch (error) { report(message(error)); }
     finally { setBusy(false); }
   }
@@ -87,14 +125,17 @@ export default function App() {
           <BrowserViewport ready={ready} highlight={highlight} />
           <form onSubmit={event => { event.preventDefault(); void connect(false); }}>
             <label>Portal URL<input type="url" required placeholder="https://billing.example.com" value={portal} onChange={event => { setPortal(event.target.value); setConsent(false); }} /></label>
-            <div className="fields"><label>Source browser<select value={browser} onChange={event => { setBrowser(event.target.value); setConsent(false); }}><option value="chrome">Google Chrome</option><option value="brave">Brave</option></select></label>
+            <div className="fields"><label>Source browser<select value={browser} onChange={event => { setBrowser(event.target.value); setConsent(false); }}><option value="chrome">Google Chrome</option><option value="brave">Brave</option><option value="edge">Microsoft Edge</option></select></label>
               <label>Profile folder<input value={profile} onChange={event => { setProfile(event.target.value); setConsent(false); }} placeholder="Default" /></label></div>
             <label className="consent"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />
               <span>Allow Clinch to read this browser profile’s cookies for the portal above. macOS may ask for access to the browser’s Safe Storage key in Keychain. Cookies stay local and are never sent to an AI provider.</span></label>
-            {!supported && <p className="notice">Cookie import requires macOS. Manual login is available in the desktop app.</p>}
+            {!supported && <p className="notice">Cookie import is unavailable on this platform. Manual login is available in the desktop app.</p>}
             <div className="actions"><button className="primary" disabled={!ready || busy || !consent || !portal} type="submit">{busy ? "Connecting…" : "Sync session"}</button>
-              <button type="button" disabled={!ready || busy || !portal} onClick={() => void connect(true)}>Sign in manually</button></div>
+              <button type="button" disabled={!ready || busy || !portal} onClick={() => void connect(true)}>Sign in manually</button>
+              <button type="button" disabled={!ready || busy || !portal} onClick={() => void connectViaExtension()}>Sync via extension</button>
+              <button type="button" disabled={!ready || busy || !portal} onClick={() => void openEmbeddedAuth()}>Re-authenticate in app</button></div>
           </form>
+          {authPanel && <AuthPanel panel={authPanel} onResolved={() => setAuthPanel(null)} report={report} errorMessage={message} />}
 
           <div className="browser-note"><span className="eyebrow">MANAGED CHROMIUM</span><p>The live preview mirrors the managed Chromium viewport. Use its separate window for manual interaction.</p>
             <button disabled={!ready || busy} onClick={() => void closeBrowser()}>Close managed browser</button></div>

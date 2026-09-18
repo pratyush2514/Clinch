@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import ElementPicker from "./ElementPicker";
 
 type TaskState = "planned" | "running" | "needs_repair" | "completed" | "failed" | "interrupted";
 type StepState = "pending" | "running" | "completed" | "needs_repair" | "failed" | "interrupted";
@@ -104,7 +105,9 @@ export default function InvoiceTask({ ready, busy, portal, setBusy, report, erro
       <fieldset disabled={!ready || busy}>
         <label>Workflow name<input required pattern="[A-Za-z0-9_-]+" maxLength={64} value={workflow} onChange={event => setWorkflow(event.target.value)} /></label>
         <label>Invoice history link selector · optional<input placeholder='a[href="/billing"]' value={billingSelector} onChange={event => setBillingSelector(event.target.value)} /></label>
+        <ElementPicker disabled={!ready || busy} onPick={selector => setBillingSelector(selector)} report={report} />
         <label>Invoice download link selector · required for first run<input placeholder="a.invoice-download" value={invoiceSelector} onChange={event => setInvoiceSelector(event.target.value)} /></label>
+        <ElementPicker disabled={!ready || busy} onPick={selector => setInvoiceSelector(selector)} report={report} />
         <p className="notice">Use the billing page URL on the left. Selectors are used when creating a workflow; an existing workflow replays its saved steps. Downloads must be same-origin links.</p>
         <button className="primary" disabled={!portal} type="submit">{busy ? "Task in progress…" : "Run Invoice Harvester"}</button>
       </fieldset>

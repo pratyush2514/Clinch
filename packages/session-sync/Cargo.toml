@@ -6,13 +6,16 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 zeroize.workspace = true
 url.workspace = true
 credential-vault = { path = "../credential-vault" }
+dirs = "6"
 aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 cbc = { version = "0.1", features = ["alloc", "zeroize"] }
 pbkdf2 = "0.12"
 sha1 = "0.10"

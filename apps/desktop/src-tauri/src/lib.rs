@@ -1,6 +1,9 @@
 #![deny(unsafe_code)]
+mod auth;
 mod service;
-use service::{AppError, AppService, ApprovalPreview, SessionStatus, StorageStatus};
+mod ws_server;
+use auth::AuthPanel;
+use service::{AppError, AppService, ApprovalPreview, BridgeStatus, SessionStatus, StorageStatus};
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 
@@ -62,6 +65,53 @@ async fn close_browser(state: tauri::State<'_, AppService>) -> Result<(), AppErr
     state.close_browser().await
 }
 #[tauri::command]
+async fn bridge_status(state: tauri::State<'_, AppService>) -> Result<BridgeStatus, AppError> {
+    state.bridge_status()
+}
+#[tauri::command]
+async fn bridge_sync_session(
+    portal_url: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<SessionStatus, AppError> {
+    state.bridge_sync(&portal_url).await
+}
+#[tauri::command]
+async fn auth_status(state: tauri::State<'_, AppService>) -> Result<Option<AuthPanel>, AppError> {
+    state.auth_status()
+}
+#[tauri::command]
+async fn begin_embedded_auth(
+    portal_url: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<AuthPanel, AppError> {
+    state.begin_embedded_auth(&portal_url).await
+}
+#[tauri::command]
+async fn complete_embedded_auth(
+    state: tauri::State<'_, AppService>,
+) -> Result<SessionStatus, AppError> {
+    state.complete_embedded_auth().await
+}
+#[tauri::command]
+async fn cancel_embedded_auth(state: tauri::State<'_, AppService>) -> Result<(), AppError> {
+    state.cancel_embedded_auth().await
+}
+#[tauri::command]
+async fn picker_enable(state: tauri::State<'_, AppService>) -> Result<(), AppError> {
+    state.picker_enable().await
+}
+#[tauri::command]
+async fn picker_pick(
+    timeout_ms: Option<u64>,
+    state: tauri::State<'_, AppService>,
+) -> Result<browser_driver::PickedElement, AppError> {
+    state.picker_pick(timeout_ms.unwrap_or(60_000)).await
+}
+#[tauri::command]
+async fn picker_disable(state: tauri::State<'_, AppService>) -> Result<(), AppError> {
+    state.picker_disable().await
+}
+#[tauri::command]
 async fn harvest_invoices(
     request: orchestration_engine::InvoiceRequest,
     progress: tauri::ipc::Channel<orchestration_engine::TaskEvent>,
@@ -107,6 +157,15 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         sync_session,
         manual_login,
         close_browser,
+        bridge_status,
+        bridge_sync_session,
+        auth_status,
+        begin_embedded_auth,
+        complete_embedded_auth,
+        cancel_embedded_auth,
+        picker_enable,
+        picker_pick,
+        picker_disable,
         harvest_invoices,
         get_task,
         preview_approval,
@@ -120,6 +179,21 @@ pub fn run() {
             let data = app.path().app_data_dir()?;
             let home = app.path().home_dir()?;
             app.manage(AppService::new(data, home));
+            // The companion extension dials on browser launch, long before any
+            // sync click — bind the loopback listener here so early dials are
+            // accepted instead of refused. `bridge_sync` reuses this listener.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppService>();
+                match state.ensure_bridge().await {
+                    Ok(port) => {
+                        eprintln!("[clinch] companion bridge listening on 127.0.0.1:{port}");
+                    }
+                    Err(error) => {
+                        eprintln!("[clinch] companion bridge failed to start: {error:?}");
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!());

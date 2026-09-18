@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use url::Url;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserSource {
     Chrome,
     Brave,
+    Edge,
 }
 
 #[derive(Deserialize)]
@@ -77,14 +78,16 @@ impl ValidatedRequest {
         &self.portal
     }
     #[must_use]
+    pub fn profile_name(&self) -> &str {
+        &self.profile
+    }
+    /// Unresolved `<user-data>/<profile>` join. Prefer
+    /// `crate::paths::resolve_profile_dir` at the call site: it verifies the
+    /// directory exists, falls back `Default` → `Profile 1`, and reports the
+    /// attempted path on failure.
+    #[must_use]
     pub fn profile_directory(&self, home: &Path) -> PathBuf {
-        let root = match self.browser {
-            BrowserSource::Chrome => "Google/Chrome",
-            BrowserSource::Brave => "BraveSoftware/Brave-Browser",
-        };
-        home.join("Library/Application Support")
-            .join(root)
-            .join(&self.profile)
+        crate::paths::user_data_dir(self.browser, home).join(&self.profile)
     }
 }
 
@@ -128,7 +131,33 @@ mod tests {
         fn valid_numbered_profiles_stay_under_browser_root(n in 0u32..100_000) {
             let req = SyncRequest { browser: BrowserSource::Chrome, profile: format!("Profile {n}"),
                 portal_url: "https://example.com".into(), consent: true }.validate()?;
-            prop_assert!(req.profile_directory(Path::new("/home/test")).starts_with("/home/test/Library/Application Support/Google/Chrome"));
+            // The profile segment must stay nested under the browser root on
+            // every OS; traversal is rejected by `validate` above.
+            let dir = req.profile_directory(Path::new("/home/test"));
+            let expected = format!("Profile {n}");
+            prop_assert!(dir.ends_with(&expected));
+            prop_assert!(dir.components().count() > 3);
+        }
+        #[test]
+        fn edge_profiles_resolve_without_traversal(n in 0u32..100_000) {
+            let req = SyncRequest { browser: BrowserSource::Edge, profile: format!("Profile {n}"),
+                portal_url: "https://example.com".into(), consent: true }.validate()?;
+            let dir = req.profile_directory(Path::new("/home/test"));
+            let expected = format!("Profile {n}");
+            prop_assert!(dir.ends_with(&expected));
+            // Canonical roots differ per OS (`Microsoft/Edge/User Data` on
+            // Windows, `Microsoft Edge` elsewhere) — both nest Edge profiles
+            // under a vendor directory, never the filesystem root.
+            #[cfg(target_os = "windows")]
+            {
+                let tail: std::path::PathBuf =
+                    ["Microsoft", "Edge", "User Data", &expected].iter().collect();
+                prop_assert!(dir.ends_with(&tail));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                prop_assert!(dir.to_string_lossy().contains("Microsoft Edge"));
+            }
         }
         #[test]
         fn arbitrary_urls_never_panic(value in ".{0,300}") {

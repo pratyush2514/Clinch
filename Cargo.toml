@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["apps/desktop/src-tauri", "packages/*"]
+# The MV3 companion extension is plain JS (no Cargo manifest); without this
+# exclusion every cargo invocation would fail resolving `packages/*`.
+exclude = ["packages/extension-bridge"]
 
 [workspace.package]
 version = "0.1.0"

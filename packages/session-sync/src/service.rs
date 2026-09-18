@@ -14,6 +14,13 @@ pub enum FallbackReason {
     NoCookies,
     TimedOut,
     InjectionFailed,
+    /// Cookies injected but the portal still shows a login/2FA challenge;
+    /// the embedded in-app auth panel (not an external window) continues.
+    ReauthRequired,
+    /// The profile seals its cookie key with OS app-bound encryption
+    /// (Chrome 127+ on Windows): only the browser's own elevation service
+    /// can unwrap it, so zero-touch import is impossible from this source.
+    AppBoundLocked,
 }
 
 pub enum PreparedSync {
@@ -38,6 +45,7 @@ pub async fn prepare(request: &ValidatedRequest, home: &Path) -> PreparedSync {
     let browser = match request.browser() {
         BrowserSource::Chrome => credential_vault::BrowserKey::Chrome,
         BrowserSource::Brave => credential_vault::BrowserKey::Brave,
+        BrowserSource::Edge => credential_vault::BrowserKey::Edge,
     };
     let secret = match tokio::time::timeout(
         Duration::from_mins(2),
@@ -49,15 +57,39 @@ pub async fn prepare(request: &ValidatedRequest, home: &Path) -> PreparedSync {
         Ok(Err(credential_vault::VaultError::UnsupportedPlatform)) => {
             return PreparedSync::ManualLogin(FallbackReason::UnsupportedPlatform);
         }
-        Ok(Err(_)) => return PreparedSync::ManualLogin(FallbackReason::KeychainUnavailable),
+        Ok(Err(_)) => {
+            // Chrome 127+ seals its key with App-Bound encryption: tell the
+            // UI exactly that (switch to Brave) instead of a dead-end
+            // "keychain unavailable" that reads as a bug.
+            let app_bound =
+                tokio::task::spawn_blocking(move || credential_vault::has_app_bound_key(browser))
+                    .await
+                    .unwrap_or(false);
+            return PreparedSync::ManualLogin(if app_bound {
+                FallbackReason::AppBoundLocked
+            } else {
+                FallbackReason::KeychainUnavailable
+            });
+        }
         Err(_) => return PreparedSync::ManualLogin(FallbackReason::TimedOut),
     };
     let Some(host) = request.portal().host_str() else {
         return PreparedSync::ManualLogin(FallbackReason::ProfileUnavailable);
     };
+    // Resolve the on-disk profile first: a missing `Default` falls back to a
+    // surviving `Profile 1`, and a miss names the attempted path in the error.
+    let profile_dir = match crate::paths::resolve_profile_dir(
+        &crate::paths::user_data_dir(request.browser(), home),
+        request.profile_name(),
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(error) => return PreparedSync::ManualLogin(FallbackReason::from(&error)),
+    };
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        read_profile(&request.profile_directory(home), host, secret),
+        read_profile(&profile_dir, host, secret),
     )
     .await;
     match result {
@@ -85,7 +117,7 @@ mod tests {
             FallbackReason::UnsupportedFormat
         );
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[tokio::test]
     async fn unsupported_host_offers_manual_login() -> Result<(), SyncError> {
         let request = crate::SyncRequest {

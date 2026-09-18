@@ -12,6 +12,8 @@ apps/desktop/src-tauri/gen/
 skills
 *txt
 *log
+*md
 .agents
 AGENTS.md
 opencode.json
+
