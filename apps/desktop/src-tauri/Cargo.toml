@@ -26,6 +26,7 @@ async-tungstenite = { version = "0.32", default-features = false, features = ["t
 browser-driver = { path = "../../../packages/browser-driver" }
 session-sync = { path = "../../../packages/session-sync" }
 playbook-store = { path = "../../../packages/playbook-store" }
+macro-engine = { path = "../../../packages/macro-engine" }
 orchestration-engine = { path = "../../../packages/orchestration-engine" }
 tauri-plugin-opener = "2"
 

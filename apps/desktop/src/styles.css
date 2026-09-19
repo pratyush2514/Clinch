@@ -41,6 +41,8 @@ li { display: flex; gap: 16px; font-size: 12px; line-height: 1.6; padding: 14px 
 li span { color: #898f78; }
 .gate-card { border: 1px solid #d9dacf; padding: 24px; margin-top: 34px; border-radius: 6px; }
 .invoice-task { border-top: 1px solid #deded5; padding-top: 24px; }
+.workflow-form { border-top: 1px solid #deded5; padding-top: 24px; margin-top: 24px; }
+.workflow-form pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; background: #eeeFE7; padding: 15px; border-radius: 6px; }
 .invoice-task fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .invoice-task label { margin-bottom: 16px; }
 .run-result { margin-top: 24px; }

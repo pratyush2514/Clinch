@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Command } from "cmdk";
 import InvoiceTask, { type Highlight } from "./InvoiceTask";
+import WorkflowForm from "./components/WorkflowForm";
 import BrowserViewport from "./BrowserViewport";
 import AuthPanel, { type AuthPanelState } from "./AuthPanel";
 
@@ -18,6 +19,7 @@ function message(error: unknown): string {
     if (error.code === "storage_unavailable") return "Local storage is unavailable. Check app data permissions.";
     if (error.code === "session_required") return "Connect this portal and finish signing in in the managed browser before running invoices.";
     if (error.code === "workflow_failed") return "The workflow could not finish. Check its saved macro and the latest task checkpoint; no automatic retry was attempted.";
+    if (error.code === "picker_unavailable") return "Element picking needs the visible managed Chromium window. Replays run headless — click Sync session to reopen it, then pick again.";
     if ("message" in error && typeof error.message === "string") return error.message;
   }
   return "The operation could not finish. Please retry.";
@@ -147,6 +149,7 @@ export default function App() {
           <p role="status" aria-live="polite" className="status">{status}</p>
           <ol>{events.map((event, index) => <li key={index}><span>{String(index + 1).padStart(2, "0")}</span>{event}</li>)}</ol>
           <InvoiceTask onHighlight={setHighlight} ready={ready} busy={busy} portal={portal} setBusy={setBusy} report={report} errorMessage={message} />
+          <WorkflowForm ready={ready} busy={busy} portal={portal} report={report} errorMessage={message} />
           <div className="gate-card"><div className="eyebrow">SENTINEL GATE</div><h3>A human decision.</h3><p>Clicks, typing, and form submissions pause here for your approval. Review Details keeps the task paused; Reject stops execution.</p></div>
         </section>
       </Panel>

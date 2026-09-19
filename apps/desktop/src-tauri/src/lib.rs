@@ -3,7 +3,10 @@ mod auth;
 mod service;
 mod ws_server;
 use auth::AuthPanel;
-use service::{AppError, AppService, ApprovalPreview, BridgeStatus, SessionStatus, StorageStatus};
+use service::{
+    AppError, AppService, ApprovalPreview, BridgeStatus, IntentPreview, PickerStatus,
+    SessionStatus, StorageStatus,
+};
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 
@@ -101,6 +104,10 @@ async fn picker_enable(state: tauri::State<'_, AppService>) -> Result<(), AppErr
     state.picker_enable().await
 }
 #[tauri::command]
+async fn picker_status(state: tauri::State<'_, AppService>) -> Result<PickerStatus, AppError> {
+    state.picker_status()
+}
+#[tauri::command]
 async fn picker_pick(
     timeout_ms: Option<u64>,
     state: tauri::State<'_, AppService>,
@@ -110,6 +117,54 @@ async fn picker_pick(
 #[tauri::command]
 async fn picker_disable(state: tauri::State<'_, AppService>) -> Result<(), AppError> {
     state.picker_disable().await
+}
+#[tauri::command]
+async fn preview_intent(
+    role: String,
+    label: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<IntentPreview, AppError> {
+    state.preview_intent(role, label).await
+}
+#[tauri::command]
+async fn save_playbook(
+    name: String,
+    portal_url: String,
+    steps: Vec<playbook_store::Step>,
+    state: tauri::State<'_, AppService>,
+) -> Result<String, AppError> {
+    state.save_playbook(name, portal_url, steps).await
+}
+#[tauri::command]
+async fn list_playbooks(
+    state: tauri::State<'_, AppService>,
+) -> Result<Vec<playbook_store::PlaybookSummary>, AppError> {
+    state.list_playbooks().await
+}
+#[tauri::command]
+async fn execute_playbook(
+    id: String,
+    progress: tauri::ipc::Channel<service::PlaybookEvent>,
+    state: tauri::State<'_, AppService>,
+) -> Result<orchestration_engine::SequenceOutcome, AppError> {
+    state
+        .execute_playbook(id, |event| {
+            // If the view closes, the run still completes; the terminal
+            // outcome return value carries its final state.
+            let _ = progress.send(event);
+        })
+        .await
+}
+#[tauri::command]
+// Tauri's CommandArg contract requires the State wrapper by value.
+#[allow(clippy::needless_pass_by_value)]
+fn decide_playbook(
+    run_id: u64,
+    index: usize,
+    approved: bool,
+    state: tauri::State<'_, AppService>,
+) -> Result<(), AppError> {
+    state.decide_playbook(run_id, index, approved)
 }
 #[tauri::command]
 async fn harvest_invoices(
@@ -164,8 +219,14 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         complete_embedded_auth,
         cancel_embedded_auth,
         picker_enable,
+        picker_status,
         picker_pick,
         picker_disable,
+        preview_intent,
+        save_playbook,
+        list_playbooks,
+        execute_playbook,
+        decide_playbook,
         harvest_invoices,
         get_task,
         preview_approval,

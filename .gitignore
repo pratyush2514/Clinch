@@ -8,6 +8,9 @@ dist/
 apps/desktop/src-tauri/gen/
 
 
+.env
+.env.local
+
 .codex
 skills
 *txt
@@ -16,4 +19,5 @@ skills
 .agents
 AGENTS.md
 opencode.json
-
+skills-lock.json
+.opencode

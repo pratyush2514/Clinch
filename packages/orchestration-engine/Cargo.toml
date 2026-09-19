@@ -8,6 +8,7 @@ publish.workspace = true
 llm-provider = { path = "../llm-provider" }
 browser-driver = { path = "../browser-driver" }
 macro-engine = { path = "../macro-engine" }
+playbook-store = { path = "../playbook-store" }
 serde.workspace = true
 serde_json = "1"
 sqlx.workspace = true

@@ -8,6 +8,11 @@ publish.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json = "1"
+url.workspace = true
+browser-driver = { path = "../browser-driver" }
+macro-engine = { path = "../macro-engine" }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,9 +1,12 @@
 #![deny(unsafe_code)]
 //! One managed, isolated Chromium child; native CDP only.
+pub mod a11y;
 mod actions;
 mod picker;
 mod preview;
 mod session;
+mod som;
+pub use a11y::{AxElement, interactive_elements, render_semantic_list};
 pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
 use chromiumoxide::{
     Browser, Page,
@@ -19,6 +22,7 @@ pub use picker::{
 pub use preview::{DomRegion, Viewport};
 pub use session::{AuthSignal, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
+pub use som::Mark;
 use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
 use tokio::{
     process::{Child, Command},

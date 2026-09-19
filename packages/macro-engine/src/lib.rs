@@ -1,7 +1,11 @@
 #![deny(unsafe_code)]
 //! Versioned native-CDP replay with bounded, localized selector healing.
+pub mod executor;
 use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
+};
+pub use executor::{
+    IntentError, IntentOutcome, ResolvedIntent, SemanticIntent, execute_intent, resolve_intent,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};

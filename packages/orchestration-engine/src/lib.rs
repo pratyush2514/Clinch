@@ -1,9 +1,14 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
+mod runner;
 mod store;
 mod task;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
+pub use runner::{
+    SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError, StepOutcome,
+    execute_step, run_playbook_sequence,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{path::Path, time::Instant};

@@ -20,6 +20,13 @@ export default function ElementPicker({ disabled, onPick, report }: {
     setPicking(true);
     setPicked(null);
     try {
+      // Fail fast when no visible window exists to click in: headless replay
+      // targets and disconnected sessions can never produce a pick.
+      const status = await invoke<{ ready: boolean }>("picker_status");
+      if (!status.ready) {
+        report("Element picking needs the visible managed Chromium window, not the preview image. Replays run headless — click Sync session to reopen it, then pick again.");
+        return;
+      }
       await invoke("picker_enable");
       // Bounded wait: the Rust side times out and the overlay is torn down
       // in `picker_pick` even when nothing is clicked.
@@ -53,7 +60,7 @@ export default function ElementPicker({ disabled, onPick, report }: {
         {picking && <button type="button" onClick={() => void cancel()}>Cancel</button>}
       </div>
       {picking && (
-        <p className="notice">Hover highlights elements in the managed Chromium window. Click to capture its selector chain.</p>
+        <p className="notice">Click an element in the managed Chromium window itself — the preview image is not clickable. Hover highlights the live target.</p>
       )}
       {picked && !picking && (
         <p className="target">

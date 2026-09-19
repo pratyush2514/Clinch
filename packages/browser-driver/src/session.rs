@@ -110,6 +110,51 @@ impl ManagedBrowser {
         let current = Url::parse(&current).map_err(|_| BrowserError::WrongOrigin)?;
         Ok(detect_auth_signal(&current, portal))
     }
+
+    /// Resolve a backend node id to its viewport rectangle via
+    /// `DOM.getBoxModel`. This is the bridge between AX identity (which node)
+    /// and `SoM` geometry (where to click): no selector is ever constructed.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] on CDP failure, timeout, or degenerate boxes.
+    pub async fn node_rect(&self, backend_node_id: i64) -> Result<crate::Highlight, BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, GetBoxModelParams};
+        let params = GetBoxModelParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .build();
+        let model = tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?
+            .result
+            .model;
+        let points = model.border.inner();
+        if points.len() != 8 || !points.iter().all(|value| value.is_finite()) {
+            return Err(BrowserError::InvalidAction);
+        }
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for pair in points.chunks_exact(2) {
+            min_x = min_x.min(pair[0]);
+            min_y = min_y.min(pair[1]);
+            max_x = max_x.max(pair[0]);
+            max_y = max_y.max(pair[1]);
+        }
+        let (width, height) = (max_x - min_x, max_y - min_y);
+        if width <= 0.0 || height <= 0.0 {
+            return Err(BrowserError::InvalidAction);
+        }
+        Ok(crate::Highlight {
+            // AX targets carry backend ids, not CSS: the marker keeps the
+            // highlight plumbing working without pretending otherwise.
+            selector: format!("ax:{backend_node_id}"),
+            x: min_x,
+            y: min_y,
+            width,
+            height,
+            matches: 1,
+        })
+    }
     /// Seed extracted `LocalStorage` pairs via `Page.addScriptToEvaluateOnNewDocument`
     ///
     /// The script runs in the portal origin before every document load, so it

@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 use crate::auth::{AuthPanel, ReauthReason, reason_for_signal};
-use browser_driver::{LaunchOptions, ManagedBrowser};
+use browser_driver::{Action, LaunchOptions, ManagedBrowser};
 use orchestration_engine::{Engine, EngineError, InvoiceRequest, Task, TaskEvent, TaskId};
 use serde::Serialize;
 use session_sync::{FallbackReason, PreparedSync, SyncRequest};
@@ -10,8 +10,9 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{OnceCell, Semaphore, oneshot};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
@@ -24,6 +25,9 @@ pub enum AppError {
     StaleApproval,
     SessionRequired,
     WorkflowFailed,
+    /// Picking needs the visible managed window: replays run headless, so an
+    /// overlay armed there can never receive a click.
+    PickerUnavailable,
 }
 
 #[derive(Serialize)]
@@ -61,6 +65,53 @@ pub struct BridgeStatus {
     extensions: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickerStatus {
+    /// True only with a headed (visible-window) browser connected. Headless
+    /// replay targets and absent browsers both report false.
+    ready: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentPreview {
+    role: String,
+    name: String,
+    description: String,
+    backend_node_id: i64,
+    score: u8,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookApproval {
+    run_id: u64,
+    step_index: usize,
+    kind: &'static str,
+    summary: String,
+}
+
+/// Progress plus approval requests for one playbook run, streamed over a
+/// single Tauri channel. The UI renders an inline approval card whenever
+/// `approval` is present; `phase` keeps tracking the run underneath.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookEvent {
+    run_id: u64,
+    step_index: usize,
+    total_steps: usize,
+    phase: orchestration_engine::SequencePhase,
+    highlight: Option<browser_driver::Highlight>,
+    approval: Option<PlaybookApproval>,
+}
+
+struct PendingPlaybookGate {
+    run_id: u64,
+    step_index: usize,
+    reply: oneshot::Sender<bool>,
+}
+
 pub struct AppService {
     data: PathBuf,
     home: PathBuf,
@@ -78,6 +129,10 @@ pub struct AppService {
     /// The task handle is retained (never detached) for the app lifetime.
     bridge: Mutex<Option<Arc<crate::ws_server::BridgeServer>>>,
     bridge_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Pending playbook-run approval. Single-flight like the Sentinel gate:
+    /// stale and duplicate decisions fail closed.
+    playbook_gate: Mutex<Option<PendingPlaybookGate>>,
+    next_playbook_run: AtomicU64,
 }
 
 impl AppService {
@@ -95,6 +150,8 @@ impl AppService {
             auth_pending: Mutex::new(None),
             bridge: Mutex::new(None),
             bridge_task: Mutex::new(None),
+            playbook_gate: Mutex::new(None),
+            next_playbook_run: AtomicU64::new(1),
         }
     }
 
@@ -578,7 +635,21 @@ impl AppService {
         Ok(())
     }
 
-    /// Arm the visual element picker overlay on the live target.
+    /// Whether picking can work right now: a headed browser must be
+    /// connected. Never touches the browser; safe to poll before arming.
+    pub fn picker_status(&self) -> Result<PickerStatus, AppError> {
+        let ready = self
+            .browser
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .as_ref()
+            .is_some_and(|browser| !browser.is_headless());
+        Ok(PickerStatus { ready })
+    }
+
+    /// Arm the visual element picker overlay on the live target. Refuses
+    /// headless targets outright: an invisible overlay can never be clicked,
+    /// and silently arming one is exactly the stuck-`Picking…` trap.
     pub async fn picker_enable(&self) -> Result<(), AppError> {
         let browser = {
             self.browser
@@ -587,6 +658,9 @@ impl AppService {
                 .clone()
                 .ok_or(AppError::SessionRequired)?
         };
+        if browser.is_headless() {
+            return Err(AppError::PickerUnavailable);
+        }
         browser
             .enable_picker()
             .await
@@ -630,6 +704,257 @@ impl AppService {
             .disable_picker()
             .await
             .map_err(|_| AppError::BrowserUnavailable)
+    }
+
+    /// Resolve a semantic intent against the connected portal without acting.
+    /// Read-only preview for the workflow builder: snapshots, matches, and
+    /// reports — never clicks, so no approval gate is involved.
+    pub async fn preview_intent(
+        &self,
+        role: String,
+        label: String,
+    ) -> Result<IntentPreview, AppError> {
+        let intent = macro_engine::SemanticIntent {
+            role,
+            label_query: label,
+        };
+        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        let portal = self
+            .session_origin
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone()
+            .ok_or(AppError::SessionRequired)?;
+        let browser = self
+            .browser
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone()
+            .ok_or(AppError::SessionRequired)?;
+        let elements = browser
+            .ax_snapshot(&portal)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        macro_engine::resolve_intent(&elements, &intent)
+            .map(|resolved| IntentPreview {
+                role: resolved.element.role,
+                name: resolved.element.name,
+                description: resolved.element.description,
+                backend_node_id: resolved.element.backend_node_id,
+                score: resolved.score,
+            })
+            .ok_or(AppError::InvalidInput(
+                "No live control matches this intent on the connected portal.",
+            ))
+    }
+
+    async fn playbooks(&self) -> Result<playbook_store::PlaybookStore, AppError> {
+        Ok(playbook_store::PlaybookStore::new(
+            self.database().await?.clone(),
+        ))
+    }
+
+    /// Persist a validated playbook (insert or replace by name). Returns the
+    /// row id as text for `execute_playbook`.
+    pub async fn save_playbook(
+        &self,
+        name: String,
+        portal_url: String,
+        steps: Vec<playbook_store::Step>,
+    ) -> Result<String, AppError> {
+        let portal = session_sync::validate_portal(&portal_url)
+            .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
+        let playbook = playbook_store::Playbook::new(name, portal, steps)
+            .map_err(|_| AppError::InvalidInput("Check the workflow name, portal, and steps."))?;
+        self.playbooks()
+            .await?
+            .save_playbook(&playbook)
+            .await
+            .map_err(|error| match error {
+                playbook_store::StoreError::Invalid(_) | playbook_store::StoreError::Json(_) => {
+                    AppError::InvalidInput("Check the workflow name, portal, and steps.")
+                }
+                _ => AppError::StorageUnavailable,
+            })
+    }
+
+    /// Newest-first stored-playbook summaries for the workflow list.
+    pub async fn list_playbooks(&self) -> Result<Vec<playbook_store::PlaybookSummary>, AppError> {
+        self.playbooks()
+            .await?
+            .list_playbooks()
+            .await
+            .map_err(|_| AppError::StorageUnavailable)
+    }
+
+    /// Resolve exactly one pending playbook-run decision. Stale and duplicate
+    /// decisions fail closed, mirroring `Engine::decide`.
+    pub fn decide_playbook(
+        &self,
+        run_id: u64,
+        index: usize,
+        approved: bool,
+    ) -> Result<(), AppError> {
+        let mut gate = self.playbook_gate.lock().map_err(|_| AppError::Internal)?;
+        if gate
+            .as_ref()
+            .is_none_or(|pending| pending.run_id != run_id || pending.step_index != index)
+        {
+            return Err(AppError::StaleApproval);
+        }
+        gate.take()
+            .ok_or(AppError::StaleApproval)?
+            .reply
+            .send(approved)
+            .map_err(|_| AppError::StaleApproval)
+    }
+
+    /// Block on one local playbook-run approval, emitted over the run's
+    /// progress channel with a five-minute deadline. Single-flight: an
+    /// occupied gate, a poisoned lock, a timeout, or a dropped receiver all
+    /// deny. Every decision is journaled to `session_events` (metadata only).
+    async fn approve_playbook_step(
+        &self,
+        run_id: u64,
+        step_index: usize,
+        total_steps: usize,
+        kind: &'static str,
+        summary: String,
+        emit: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
+    ) -> bool {
+        let (reply, receive) = oneshot::channel();
+        if let Ok(mut gate) = self.playbook_gate.lock() {
+            if gate.is_some() {
+                return false;
+            }
+            *gate = Some(PendingPlaybookGate {
+                run_id,
+                step_index,
+                reply,
+            });
+        } else {
+            return false;
+        }
+        if let Ok(mut emit) = emit.lock() {
+            emit(PlaybookEvent {
+                run_id,
+                step_index,
+                total_steps,
+                phase: orchestration_engine::SequencePhase::Running,
+                highlight: None,
+                approval: Some(PlaybookApproval {
+                    run_id,
+                    step_index,
+                    kind,
+                    summary,
+                }),
+            });
+        }
+        let approved = tokio::time::timeout(Duration::from_mins(5), receive)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        if let Ok(mut gate) = self.playbook_gate.lock() {
+            *gate = None;
+        }
+        let outcome = if approved { "approved" } else { "rejected" };
+        let _ = self
+            .record(&format!(
+                "playbook_decision:{run_id}:{step_index}:{outcome}"
+            ))
+            .await;
+        approved
+    }
+
+    fn action_summary(action: &Action) -> String {
+        match action {
+            Action::Navigate { url } => format!("Open {}", url.as_str()),
+            Action::Click { selector } => format!("Click {selector}"),
+            Action::Fill { selector, .. } => format!("Fill {selector}"),
+            Action::Submit { selector } => format!("Submit {selector}"),
+            Action::DownloadLinks { selector } => format!("Download {selector}"),
+        }
+    }
+
+    /// Execute a stored playbook step-by-step on the connected portal,
+    /// streaming progress plus inline approvals over `emit`. Shares the
+    /// connected-session contract and the single-operation semaphore with
+    /// macro runs; semantic and legacy clicks gate exactly like first-run
+    /// execution, so playbooks cannot bypass Sentinel approval.
+    pub async fn execute_playbook(
+        &self,
+        id: String,
+        mut emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<orchestration_engine::SequenceOutcome, AppError> {
+        let playbook =
+            self.playbooks()
+                .await?
+                .load_playbook(&id)
+                .await
+                .map_err(|error| match error {
+                    playbook_store::StoreError::NotFound => {
+                        AppError::InvalidInput("Unknown playbook.")
+                    }
+                    _ => AppError::StorageUnavailable,
+                })?;
+        let portal = playbook.origin.clone();
+        let connected = self
+            .session_origin
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone();
+        if connected.is_none_or(|url| url.origin() != portal.origin()) {
+            return Err(AppError::SessionRequired);
+        }
+        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        let browser = self.browser(false).await?;
+        let run_id = self.next_playbook_run.fetch_add(1, Ordering::Relaxed);
+        let output = self
+            .data
+            .join("downloads")
+            .join(format!("playbook-{run_id}"));
+        let total_steps = playbook.steps.len();
+        let events = std::sync::Mutex::new(&mut emit);
+        Ok(orchestration_engine::run_playbook_sequence(
+            &browser,
+            &portal,
+            &output,
+            &playbook.steps,
+            |event| {
+                if let Ok(mut emit) = events.lock() {
+                    emit(PlaybookEvent {
+                        run_id,
+                        step_index: event.step_index,
+                        total_steps: event.total_steps,
+                        phase: event.phase,
+                        highlight: event.highlight,
+                        approval: None,
+                    });
+                }
+            },
+            |index, action| {
+                self.approve_playbook_step(
+                    run_id,
+                    index,
+                    total_steps,
+                    "action",
+                    Self::action_summary(&action),
+                    &events,
+                )
+            },
+            |index, intent| {
+                self.approve_playbook_step(
+                    run_id,
+                    index,
+                    total_steps,
+                    "intent",
+                    format!("{} · {}", intent.role, intent.label_query),
+                    &events,
+                )
+            },
+        )
+        .await)
     }
 
     pub async fn close_browser(&self) -> Result<(), AppError> {
@@ -831,6 +1156,9 @@ mod tests {
     #[tokio::test]
     async fn picker_commands_require_a_managed_browser() -> Result<(), AppError> {
         let service = AppService::new(PathBuf::new(), PathBuf::new());
+        // No browser connected: status reports not-ready instead of arming an
+        // overlay nobody can click.
+        assert!(!service.picker_status()?.ready);
         assert!(matches!(
             service.picker_enable().await,
             Err(AppError::SessionRequired)
@@ -868,6 +1196,65 @@ mod tests {
         // The setup-hook entry point reuses the same listener and reports it.
         let port = first.local_port().ok_or(AppError::Internal)?;
         assert_eq!(service.ensure_bridge().await?, port);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn intent_preview_requires_a_connected_session() -> Result<(), AppError> {
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        // No portal connected and no browser: fails before any CDP traffic.
+        assert!(matches!(
+            service.preview_intent("button".into(), "Pay".into()).await,
+            Err(AppError::SessionRequired)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playbook_commands_validate_and_gate_without_a_browser()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        // Invalid portal and empty steps fail before touching storage.
+        assert!(matches!(
+            service
+                .save_playbook("x".into(), "http://insecure.example/".into(), Vec::new())
+                .await,
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(
+            service
+                .save_playbook(
+                    "run".into(),
+                    "https://example.com/".into(),
+                    vec![playbook_store::Step::Semantic {
+                        intent: macro_engine::SemanticIntent {
+                            role: "button".into(),
+                            label_query: "Pay".into(),
+                        },
+                    }],
+                )
+                .await
+                .is_ok()
+        );
+        let listed = service.list_playbooks().await.map_err(|_| "list")?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "run");
+        assert_eq!(listed[0].step_count, 1);
+        // No portal connected: execution is rejected before any browser I/O.
+        assert!(matches!(
+            service.execute_playbook(listed[0].id.clone(), |_| {}).await,
+            Err(AppError::SessionRequired)
+        ));
+        // No pending gate: decisions fail closed without side effects.
+        assert!(matches!(
+            service.decide_playbook(1, 0, true),
+            Err(AppError::StaleApproval)
+        ));
+        assert!(matches!(
+            service.execute_playbook("999".into(), |_| {}).await,
+            Err(AppError::InvalidInput(_))
+        ));
         Ok(())
     }
 }

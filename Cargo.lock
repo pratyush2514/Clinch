@@ -668,6 +668,7 @@ dependencies = [
  "async-tungstenite",
  "browser-driver",
  "futures",
+ "macro-engine",
  "orchestration-engine",
  "playbook-store",
  "serde",
@@ -3007,10 +3008,15 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "playbook-store"
 version = "0.1.0"
 dependencies = [
+ "browser-driver",
+ "macro-engine",
+ "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "url",
 ]
 
 [[package]]
