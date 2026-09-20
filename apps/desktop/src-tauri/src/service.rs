@@ -1,16 +1,17 @@
 #![deny(unsafe_code)]
 use crate::auth::{AuthPanel, ReauthReason, reason_for_signal};
 use browser_driver::{Action, LaunchOptions, ManagedBrowser};
-use orchestration_engine::{Engine, EngineError, InvoiceRequest, Task, TaskEvent, TaskId};
+use orchestration_engine::{Engine, EngineError, Task, TaskEvent, TaskId, TaskRequest};
 use serde::Serialize;
 use session_sync::{FallbackReason, PreparedSync, SyncRequest};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{OnceCell, Semaphore, oneshot};
 
@@ -112,6 +113,44 @@ struct PendingPlaybookGate {
     reply: oneshot::Sender<bool>,
 }
 
+/// What a run journal entry describes: stored-playbook runs carry their row
+/// id; ephemeral NL runs carry none.
+#[derive(Clone, Debug)]
+struct RunScope {
+    kind: playbook_store::RunKind,
+    playbook_id: Option<String>,
+}
+
+/// What a natural-language command ran: which workflow (stored or
+/// single-step ephemeral) plus its terminal sequence outcome.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchOutcome {
+    kind: &'static str,
+    name: String,
+    result: orchestration_engine::SequenceOutcome,
+    /// Steps that actually ran, so ad-hoc outcomes can be saved as
+    /// playbooks without reconstructing them client-side. Additive to the
+    /// IPC shape: older clients ignore unknown keys.
+    steps: Vec<playbook_store::Step>,
+}
+
+/// POC health metrics for local testing: playbook runs, macro-replay share
+/// derived from task checkpoints, and session-sync outcomes. Everything is
+/// computed from local tables; missing tables (a flow that never ran) read
+/// as zero rather than failing the command.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PocMetrics {
+    total_runs: i64,
+    runs_by_status: BTreeMap<String, i64>,
+    completed_tasks: i64,
+    macro_replay_pct: Option<f64>,
+    sync_imported: i64,
+    sync_fallback: i64,
+    sync_by_outcome: BTreeMap<String, i64>,
+}
+
 pub struct AppService {
     data: PathBuf,
     home: PathBuf,
@@ -196,16 +235,16 @@ impl AppService {
             .await
     }
 
-    pub async fn harvest(
+    pub async fn run_task(
         &self,
-        request: &InvoiceRequest,
+        request: &TaskRequest,
         emit: impl FnMut(TaskEvent) + Send,
     ) -> Result<Task, AppError> {
         session_sync::validate_portal(request.portal_url.as_str())
-            .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS billing page URL."))?;
+            .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal page URL."))?;
         if request.portal_url.query().is_some() || request.portal_url.fragment().is_some() {
             return Err(AppError::InvalidInput(
-                "Use a stable billing page URL without a query or fragment.",
+                "Use a stable portal page URL without a query or fragment.",
             ));
         }
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
@@ -225,7 +264,7 @@ impl AppService {
             .await?;
         self.engine()
             .await?
-            .harvest(request, &browser, &self.data, emit)
+            .run_task(request, &browser, &self.data, emit)
             .await
             .map_err(|error| engine_error(&error))
     }
@@ -347,7 +386,7 @@ impl AppService {
         }
         // Headless-first note: session establishment itself stays interactive
         // (the user may need to see login/2FA), but every macro replay runs
-        // headless via `harvest()` → `browser(mode == Replay)`.
+        // headless via `run_task()` → `browser(mode == Replay)`.
         let injected = match prepared {
             PreparedSync::Cookies(cookies) => {
                 if browser.inject(&cookies).await.is_ok() {
@@ -599,7 +638,7 @@ impl AppService {
     /// Only the origin is checked plus the login-marker classifier — page
     /// content is never exfiltrated. On success the WAL `session_events`
     /// row is appended (metadata only, never cookie values) and
-    /// `session_origin` is set so `harvest()` can proceed.
+    /// `session_origin` is set so `run_task()` can proceed.
     pub async fn complete_embedded_auth(&self) -> Result<SessionStatus, AppError> {
         let (portal, _reason) = self
             .auth_pending
@@ -717,6 +756,7 @@ impl AppService {
         let intent = macro_engine::SemanticIntent {
             role,
             label_query: label,
+            container_query: None,
         };
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         let portal = self
@@ -785,6 +825,79 @@ impl AppService {
             .list_playbooks()
             .await
             .map_err(|_| AppError::StorageUnavailable)
+    }
+
+    /// POC metrics over local tables. Tables for flows that never ran read
+    /// as zero; only a broken pool fails the command.
+    pub async fn poc_metrics(&self) -> Result<PocMetrics, AppError> {
+        const IMPORTED: &[&str] = &["cookies_imported_unverified", "bridge_cookies_imported"];
+        const FALLBACK: &[&str] = &[
+            "manual_login_injection_failed",
+            "manual_login_extraction_unavailable",
+            "manual_login_requested",
+            "embedded_auth_opened",
+            "embedded_auth_completed",
+            "embedded_auth_cancelled",
+            "session_reauth_required",
+            "bridge_injection_failed",
+        ];
+        let pool = self.database().await?;
+        let run_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM runs GROUP BY status")
+                .fetch_all(pool)
+                .await
+                .map_err(|_| AppError::StorageUnavailable)?;
+        let mut runs_by_status = BTreeMap::new();
+        let mut total_runs = 0;
+        for (status, count) in run_rows {
+            total_runs += count;
+            runs_by_status.insert(status, count);
+        }
+        // The tasks table only exists after the engine initializes; a flow
+        // that never ran contributes zero completed tasks, not an error.
+        let completed_tasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE json_extract(snapshot,'$.state')='completed'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        let replayed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE json_extract(snapshot,'$.state')='completed' AND json_extract(snapshot,'$.mode')='replay'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        let macro_replay_pct = if completed_tasks > 0 {
+            // Counts are run volumes, far below the 2^53 exact-integer range
+            // of `f64`; callers format for display.
+            #[allow(clippy::cast_precision_loss)]
+            Some(replayed as f64 / completed_tasks as f64 * 100.0)
+        } else {
+            None
+        };
+        let sync_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT outcome, COUNT(*) FROM session_events GROUP BY outcome")
+                .fetch_all(pool)
+                .await
+                .map_err(|_| AppError::StorageUnavailable)?;
+        let mut sync_by_outcome = BTreeMap::new();
+        for (outcome, count) in sync_rows {
+            sync_by_outcome.insert(outcome, count);
+        }
+        let total = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| sync_by_outcome.get(*key))
+                .sum()
+        };
+        Ok(PocMetrics {
+            total_runs,
+            runs_by_status,
+            completed_tasks,
+            macro_replay_pct,
+            sync_imported: total(IMPORTED),
+            sync_fallback: total(FALLBACK),
+            sync_by_outcome,
+        })
     }
 
     /// Resolve exactly one pending playbook-run decision. Stale and duplicate
@@ -885,7 +998,7 @@ impl AppService {
     pub async fn execute_playbook(
         &self,
         id: String,
-        mut emit: impl FnMut(PlaybookEvent) + Send,
+        emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<orchestration_engine::SequenceOutcome, AppError> {
         let playbook =
             self.playbooks()
@@ -898,7 +1011,114 @@ impl AppService {
                     }
                     _ => AppError::StorageUnavailable,
                 })?;
-        let portal = playbook.origin.clone();
+        self.run_steps(
+            playbook.origin.clone(),
+            &playbook.steps,
+            RunScope {
+                kind: playbook_store::RunKind::Saved,
+                playbook_id: Some(id),
+            },
+            emit,
+        )
+        .await
+    }
+
+    /// Route a free-form command to a saved playbook (or a single-step
+    /// ephemeral intent against the connected portal) and run it with the
+    /// same approvals and streaming as stored playbooks.
+    pub async fn dispatch_natural_command(
+        &self,
+        prompt: String,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        if prompt.trim().is_empty() {
+            return Err(AppError::InvalidInput(
+                "Describe what to run, for example 'download the monthly site report'.",
+            ));
+        }
+        let saved = self
+            .playbooks()
+            .await?
+            .list_playbooks()
+            .await
+            .map_err(|_| AppError::StorageUnavailable)?;
+        let connected = self
+            .session_origin
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone();
+        match orchestration_engine::resolve_command(&prompt, connected.as_ref(), &saved) {
+            None => Err(AppError::InvalidInput(
+                "No saved workflow matches, and no portal is connected for an ad-hoc intent. Connect a portal or save a workflow first.",
+            )),
+            Some(orchestration_engine::CommandMatch::Saved { id }) => {
+                let playbook = self.playbooks().await?.load_playbook(&id).await.map_err(
+                    |error| match error {
+                        playbook_store::StoreError::NotFound => {
+                            AppError::InvalidInput("Unknown playbook.")
+                        }
+                        _ => AppError::StorageUnavailable,
+                    },
+                )?;
+                let name = playbook.name.clone();
+                let result = self
+                    .run_steps(
+                        playbook.origin.clone(),
+                        &playbook.steps,
+                        RunScope {
+                            kind: playbook_store::RunKind::Saved,
+                            playbook_id: Some(id),
+                        },
+                        emit,
+                    )
+                    .await?;
+                Ok(DispatchOutcome {
+                    kind: "saved",
+                    name,
+                    result,
+                    steps: playbook.steps.clone(),
+                })
+            }
+            Some(orchestration_engine::CommandMatch::Ephemeral { intent }) => {
+                let portal = connected.ok_or(AppError::SessionRequired)?;
+                let name = orchestration_engine::ephemeral_name(&prompt);
+                let playbook = playbook_store::Playbook::new(
+                    name.clone(),
+                    portal.clone(),
+                    vec![playbook_store::Step::Semantic { intent }],
+                )
+                .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+                let result = self
+                    .run_steps(
+                        portal,
+                        &playbook.steps,
+                        RunScope {
+                            kind: playbook_store::RunKind::Ephemeral,
+                            playbook_id: None,
+                        },
+                        emit,
+                    )
+                    .await?;
+                Ok(DispatchOutcome {
+                    kind: "ephemeral",
+                    name,
+                    result,
+                    steps: playbook.steps.clone(),
+                })
+            }
+        }
+    }
+
+    /// Shared run machinery for stored and ephemeral playbooks: session
+    /// contract, semaphore, headed browser, per-run output dir, approval
+    /// gates, and progress streaming.
+    async fn run_steps(
+        &self,
+        portal: url::Url,
+        steps: &[playbook_store::Step],
+        scope: RunScope,
+        mut emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<orchestration_engine::SequenceOutcome, AppError> {
         let connected = self
             .session_origin
             .lock()
@@ -914,13 +1134,33 @@ impl AppService {
             .data
             .join("downloads")
             .join(format!("playbook-{run_id}"));
-        let total_steps = playbook.steps.len();
+        let total_steps = steps.len();
+        // Telemetry is fail-open by design: a journal write must never fail a
+        // run. The id mixes the per-launch counter with wall time so restarts
+        // cannot collide.
+        let journal_id = format!(
+            "run-{run_id}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let journal = self.playbooks().await.ok();
+        if let Some(store) = &journal {
+            let _ = store
+                .record_run_start(
+                    &journal_id,
+                    scope.playbook_id.as_deref(),
+                    scope.kind,
+                    total_steps,
+                )
+                .await;
+        }
         let events = std::sync::Mutex::new(&mut emit);
-        Ok(orchestration_engine::run_playbook_sequence(
+        let outcome = orchestration_engine::run_playbook_sequence(
             &browser,
             &portal,
             &output,
-            &playbook.steps,
+            steps,
             |event| {
                 if let Ok(mut emit) = events.lock() {
                     emit(PlaybookEvent {
@@ -954,7 +1194,19 @@ impl AppService {
                 )
             },
         )
-        .await)
+        .await;
+        if let Some(store) = &journal {
+            let status = match outcome.status {
+                orchestration_engine::SequenceStatus::Completed => "completed",
+                orchestration_engine::SequenceStatus::NeedsRepair => "needs_repair",
+                orchestration_engine::SequenceStatus::Denied => "denied",
+                orchestration_engine::SequenceStatus::Failed => "failed",
+            };
+            let _ = store
+                .record_run_finish(&journal_id, status, outcome.completed_steps)
+                .await;
+        }
+        Ok(outcome)
     }
 
     pub async fn close_browser(&self) -> Result<(), AppError> {
@@ -1005,7 +1257,7 @@ impl AppService {
 fn engine_error(error: &EngineError) -> AppError {
     match error {
         EngineError::Invalid => AppError::InvalidInput(
-            "Check the workflow name, portal, and selectors. Saved workflows must use the same billing URL.",
+            "Check the workflow name, portal, and selectors. Saved workflows must use the same portal URL.",
         ),
         EngineError::Database(_) | EngineError::Io(_) => AppError::StorageUnavailable,
         _ => AppError::WorkflowFailed,
@@ -1031,22 +1283,22 @@ fn default_chromium() -> PathBuf {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn harvester_requires_a_connected_session_and_exclusive_browser_access()
+    async fn task_run_requires_a_connected_session_and_exclusive_browser_access()
     -> Result<(), Box<dyn std::error::Error>> {
         let service = AppService::new(PathBuf::new(), PathBuf::new());
-        let request = InvoiceRequest {
-            workflow: "bills".into(),
-            portal_url: url::Url::parse("https://example.com/billing")?,
-            billing_selector: None,
-            invoice_selector: "a.invoice".into(),
+        let request = TaskRequest {
+            workflow: "reports".into(),
+            portal_url: url::Url::parse("https://example.com/files")?,
+            link_selector: None,
+            download_selector: "a.report".into(),
         };
         assert!(matches!(
-            service.harvest(&request, |_| {}).await,
+            service.run_task(&request, |_| {}).await,
             Err(AppError::SessionRequired)
         ));
         let _permit = service.operation.try_acquire()?;
         assert!(matches!(
-            service.harvest(&request, |_| {}).await,
+            service.run_task(&request, |_| {}).await,
             Err(AppError::Busy)
         ));
         assert!(matches!(service.close_browser().await, Err(AppError::Busy)));
@@ -1064,11 +1316,11 @@ mod tests {
         let outside = dir.path().join("outside.dat");
         tokio::fs::write(&file, b"data").await?;
         tokio::fs::write(&outside, b"data").await?;
-        let request = InvoiceRequest {
+        let request = TaskRequest {
             workflow: "fixture".into(),
             portal_url: url::Url::parse("https://example.com")?,
-            billing_selector: None,
-            invoice_selector: "a.invoice".into(),
+            link_selector: None,
+            download_selector: "a.report".into(),
         };
         let mut plan = request.plan()?;
         plan.steps[1]
@@ -1231,6 +1483,7 @@ mod tests {
                         intent: macro_engine::SemanticIntent {
                             role: "button".into(),
                             label_query: "Pay".into(),
+                            container_query: None,
                         },
                     }],
                 )
@@ -1255,6 +1508,81 @@ mod tests {
             service.execute_playbook("999".into(), |_| {}).await,
             Err(AppError::InvalidInput(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn natural_commands_reject_empties_and_dead_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        // Empty prompts fail before touching storage.
+        assert!(matches!(
+            service.dispatch_natural_command("   ".into(), |_| {}).await,
+            Err(AppError::InvalidInput(_))
+        ));
+        // No saved match and no connected portal: honest dead end, no browser I/O.
+        assert!(matches!(
+            service
+                .dispatch_natural_command("download my report".into(), |_| {})
+                .await,
+            Err(AppError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poc_metrics_reads_empty_and_seeded_databases() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        // A fresh database reports zeros with no replay share, never an error.
+        let empty = service.poc_metrics().await.map_err(|_| "metrics")?;
+        assert_eq!(empty.total_runs, 0);
+        assert_eq!(empty.completed_tasks, 0);
+        assert_eq!(empty.macro_replay_pct, None);
+        assert_eq!(empty.sync_imported, 0);
+        assert_eq!(empty.sync_fallback, 0);
+        // Seed one completed replay, one completed record, and mixed sync rows.
+        let pool = service.database().await.map_err(|_| "database")?;
+        sqlx::query("CREATE TABLE tasks(id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, snapshot TEXT NOT NULL)")
+            .execute(pool)
+            .await?;
+        for (state, mode) in [("completed", "replay"), ("completed", "record")] {
+            sqlx::query("INSERT INTO tasks(revision, snapshot) VALUES(0, ?)")
+                .bind(format!("{{\"state\":\"{state}\",\"mode\":\"{mode}\"}}"))
+                .execute(pool)
+                .await?;
+        }
+        for outcome in [
+            "cookies_imported_unverified",
+            "manual_login_requested",
+            "playbook_decision:1:0:approved",
+        ] {
+            sqlx::query("INSERT INTO session_events(outcome) VALUES(?)")
+                .bind(outcome)
+                .execute(pool)
+                .await?;
+        }
+        let store = playbook_store::PlaybookStore::new(pool.clone());
+        store
+            .record_run_start("run-1", None, playbook_store::RunKind::Ephemeral, 2)
+            .await?;
+        store.record_run_finish("run-1", "completed", 2).await?;
+        let metrics = service.poc_metrics().await.map_err(|_| "metrics")?;
+        assert_eq!(metrics.total_runs, 1);
+        assert_eq!(metrics.completed_tasks, 2);
+        assert_eq!(metrics.macro_replay_pct, Some(50.0));
+        assert_eq!(metrics.sync_imported, 1);
+        assert_eq!(metrics.sync_fallback, 1);
+        assert_eq!(
+            metrics
+                .sync_by_outcome
+                .get("playbook_decision:1:0:approved"),
+            Some(&1)
+        );
+        assert_eq!(metrics.runs_by_status.get("completed"), Some(&1));
+        pool.close().await;
         Ok(())
     }
 }

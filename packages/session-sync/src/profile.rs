@@ -106,7 +106,7 @@ mod tests {
                 SyncRequest {
                     browser: BrowserSource::Chrome,
                     profile: profile.into(),
-                    portal_url: "https://billing.example.com".into(),
+                    portal_url: "https://portal.example.com".into(),
                     consent
                 }
                 .validate()

@@ -83,7 +83,7 @@ pub(crate) async fn unfinished(pool: &SqlitePool) -> Result<Vec<Task>, EngineErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Engine, InvoiceRequest, RunMode, StepState, TaskState};
+    use crate::{Engine, RunMode, StepState, TaskRequest, TaskState};
     #[tokio::test]
     async fn checkpoints_survive_reopen_and_recover_without_reexecution()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -91,10 +91,10 @@ mod tests {
         let path = dir.path().join("test.db");
         let pool = playbook_store::initialize(&path).await?;
         initialize(&pool).await?;
-        let request: InvoiceRequest = serde_json::from_str(
-            r#"{"workflow":"bills","portalUrl":"https://example.com","billingSelector":null,"invoiceSelector":"a.invoice"}"#,
+        let request: TaskRequest = serde_json::from_str(
+            r#"{"workflow":"reports","portalUrl":"https://example.com","linkSelector":null,"downloadSelector":"a.report"}"#,
         )?;
-        let mut task = Task::new("bills".into(), request.plan()?, RunMode::Record);
+        let mut task = Task::new("reports".into(), request.plan()?, RunMode::Record);
         create(&pool, &mut task).await?;
         let mut stale = task.clone();
         task.start_step(0)?;

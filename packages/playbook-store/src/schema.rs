@@ -160,7 +160,7 @@ mod tests {
     use super::*;
 
     fn origin() -> Result<Url, url::ParseError> {
-        Url::parse("https://billing.example.com/")
+        Url::parse("https://portal.example.com/")
     }
 
     fn macro_fixture() -> Result<Macro, serde_json::Error> {
@@ -168,10 +168,10 @@ mod tests {
             "version": 1,
             "lastHealedAt": null,
             "healingHistory": [],
-            "origin": "https://billing.example.com/",
+            "origin": "https://portal.example.com/",
             "steps": [
-                {"action": {"type": "navigate", "url": "https://billing.example.com/"}, "wait": {"selector": "a.invoice", "timeoutMs": 5000}},
-                {"action": {"type": "download_links", "selector": "a.invoice"}, "wait": null},
+                {"action": {"type": "navigate", "url": "https://portal.example.com/"}, "wait": {"selector": "a.report", "timeoutMs": 5000}},
+                {"action": {"type": "download_links", "selector": "a.report"}, "wait": null},
             ],
         }))
     }
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn v1_macros_migrate_losslessly() -> Result<(), Box<dyn std::error::Error>> {
         let recording = macro_fixture()?;
-        let playbook = Playbook::from_macro("bills".into(), &recording)?;
+        let playbook = Playbook::from_macro("reports".into(), &recording)?;
         assert_eq!(playbook.version, SCHEMA_VERSION);
         assert_eq!(playbook.steps.len(), 2);
         assert!(matches!(
@@ -197,6 +197,7 @@ mod tests {
             intent: SemanticIntent {
                 role: "button".into(),
                 label_query: "Pay".into(),
+                container_query: None,
             },
         }
     }
@@ -216,7 +217,7 @@ mod tests {
         playbook.version = 99;
         assert!(matches!(playbook.validate(), Err(SchemaError::Version)));
         assert!(Playbook::parse(r#"{"version":1,"name":"x","origin":"https://example.com/","steps":[{"kind":"xpath","selector":"//a"}]}"#).is_err());
-        for name in ["", "../bills", "bills/name", &"b".repeat(65)] {
+        for name in ["", "../reports", "reports/name", &"b".repeat(65)] {
             assert!(Playbook::new(name.into(), origin()?, vec![pay_step()]).is_err());
         }
         assert!(Playbook::new("empty".into(), origin()?, Vec::new()).is_err());

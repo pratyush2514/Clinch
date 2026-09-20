@@ -421,8 +421,8 @@ mod download_tests {
     #[test]
     fn blob_downloads_are_scoped_to_the_portal_without_allowing_blob_navigation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let origin = Url::parse("https://github.com/settings/billing")?;
-        let expected = Url::parse("https://github.com/invoice")?;
+        let origin = Url::parse("https://github.com/settings/files")?;
+        let expected = Url::parse("https://github.com/report")?;
         let blob = Url::parse("blob:https://github.com/fixture-guid")?;
         assert!(validate_download_url(&blob, &origin).is_ok());
         assert!(matches_download_url(blob.as_str(), &expected, &origin));

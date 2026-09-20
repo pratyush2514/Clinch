@@ -14,11 +14,12 @@ const MAX_COOKIES: i64 = 2_000;
 static SHADOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Strict ancestor suffixes for wildcard SSO matching, minimum two labels
-/// (`billing.example.com` → `["example.com"]`; `a.b.example.com` →
+/// (`portal.example.com` → `["example.com"]`; `a.b.example.com` →
 /// `["b.example.com", "example.com"]`; bare `example.com` → none).
 /// A bare TLD can never become a root, so `example.co.uk`-style portals only
 /// ever match their own site family — never the whole public suffix.
-fn like_roots(host: &str) -> Vec<String> {
+#[must_use]
+pub fn ancestor_roots(host: &str) -> Vec<String> {
     let host = host.trim_end_matches('.');
     let labels: Vec<&str> = host.split('.').collect();
     let mut roots = Vec::new();
@@ -28,14 +29,39 @@ fn like_roots(host: &str) -> Vec<String> {
     roots
 }
 
-/// Cookie selection statement with one `LIKE` wildcard per ancestor root.
+/// Curated cross-root SSO secondaries no suffix rule can derive
+/// (`chatgpt.com` shares nothing with `openai.com`). Entries require observed
+/// evidence — this is an allowlist, not a guess list. Looks up the host and
+/// its parent, so portals nested under a known root inherit the entry.
+#[must_use]
+pub fn sso_secondaries(host: &str) -> Vec<String> {
+    fn table(key: &str, out: &mut Vec<String>) {
+        if key == "chatgpt.com" {
+            out.extend(
+                ["openai.com", "auth.openai.com"]
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let mut roots = Vec::new();
+    table(&host, &mut roots);
+    if let Some((_, parent)) = host.split_once('.') {
+        table(parent, &mut roots);
+    }
+    roots
+}
+
+/// Cookie selection statement: exact host, its subdomains, one `LIKE`
+/// wildcard per ancestor root and curated cross-root secondary.
 /// `?1` is the exact host, `?2..=?{n+1}` the escaped roots, the final
 /// parameter the row cap. Every parameter is bound — no string interpolation
 /// of host data into SQL.
 fn cookie_query(root_count: usize) -> String {
     use std::fmt::Write as _;
     let mut sql = String::from(
-        "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite, has_expires, top_frame_site_key FROM cookies WHERE host_key = ?1 OR host_key = '.' || ?1",
+        "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite, has_expires, top_frame_site_key FROM cookies WHERE host_key = ?1 OR host_key = '.' || ?1 OR host_key LIKE '%.' || ?1",
     );
     for index in 0..root_count {
         let _ = write!(sql, " OR host_key LIKE '%.' || ?{} ESCAPE '\\'", index + 2);
@@ -196,12 +222,14 @@ pub async fn read_profile(
     if !(23..=24).contains(&version) {
         return Err(SyncError::UnsupportedFormat);
     }
-    // Wildcard SSO extraction: the exact host, dotted host, every strict
+    // Wildcard SSO extraction: the exact host, its subdomains, every strict
     // ancestor as a `LIKE` root (`%.example.com` covers `auth.example.com`
-    // and `.sso.example.com`), plus the legacy dot-boundary parent check.
-    // `httpOnly`, `secure`, and path columns are selected unfiltered, so
-    // full SSO token chains survive intact.
-    let roots = like_roots(host);
+    // and `.sso.example.com`), plus curated cross-root secondaries for pairs
+    // like `chatgpt.com`/`openai.com` that share no suffix — and the legacy
+    // dot-boundary parent check. `httpOnly`, `secure`, and path columns are
+    // selected unfiltered, so full SSO token chains survive intact.
+    let mut roots = ancestor_roots(host);
+    roots.extend(sso_secondaries(host));
     let sql = cookie_query(roots.len());
     let mut query = sqlx::query(&sql).bind(host);
     for root in &roots {
@@ -317,21 +345,37 @@ mod tests {
     }
     #[test]
     fn wildcard_roots_cover_strict_ancestors_only() {
-        assert_eq!(like_roots("billing.example.com"), vec!["example.com"]);
+        assert_eq!(ancestor_roots("portal.example.com"), vec!["example.com"]);
         assert_eq!(
-            like_roots("a.billing.example.com"),
-            vec!["billing.example.com", "example.com"]
+            ancestor_roots("a.portal.example.com"),
+            vec!["portal.example.com", "example.com"]
         );
         // Bare domains and bare TLDs yield no wildcard: no behavior change.
-        assert!(like_roots("example.com").is_empty());
-        assert!(like_roots("localhost").is_empty());
+        assert!(ancestor_roots("example.com").is_empty());
+        assert!(ancestor_roots("localhost").is_empty());
         assert_eq!(escape_like("exa%mple_com\\x"), "exa\\%mple\\_com\\\\x");
-        // The statement numbers every parameter explicitly.
+        // The statement numbers every parameter explicitly, including the
+        // subdomain wildcard on the exact host.
         let sql = cookie_query(2);
         assert!(sql.contains("host_key = ?1"));
+        assert!(sql.contains("LIKE '%.' || ?1"));
         assert!(sql.contains("LIKE '%.' || ?2 ESCAPE '\\'"));
         assert!(sql.contains("LIKE '%.' || ?3 ESCAPE '\\'"));
         assert!(sql.contains("LIMIT ?4"));
+    }
+
+    #[test]
+    fn curated_secondaries_need_no_shared_suffix() {
+        assert_eq!(
+            sso_secondaries("chatgpt.com"),
+            vec!["openai.com".to_owned(), "auth.openai.com".to_owned()]
+        );
+        assert_eq!(
+            sso_secondaries("app.chatgpt.com"),
+            vec!["openai.com".to_owned(), "auth.openai.com".to_owned()]
+        );
+        assert!(sso_secondaries("portal.example.com").is_empty());
+        assert!(sso_secondaries("").is_empty());
     }
 
     #[tokio::test]
@@ -341,7 +385,7 @@ mod tests {
         let key = derive_key(b"fixture");
         // SSO family: exact host, dotted parent, bare + dotted siblings.
         for host in [
-            "billing.example.com",
+            "portal.example.com",
             ".example.com",
             "auth.example.com",
             ".sso.example.com",
@@ -369,7 +413,7 @@ mod tests {
         db.close().await?;
         let cookies = read_profile(
             dir.path(),
-            "billing.example.com",
+            "portal.example.com",
             Zeroizing::new(b"fixture".to_vec()),
         )
         .await?;
@@ -384,7 +428,7 @@ mod tests {
                 ".example.com",
                 ".sso.example.com",
                 "auth.example.com",
-                "billing.example.com",
+                "portal.example.com",
             ]
         );
         assert!(
@@ -392,6 +436,72 @@ mod tests {
                 .iter()
                 .all(|cookie| cookie.secure && cookie.http_only)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extracts_subdomain_and_cross_root_sso_cookies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, mut db) = fixture(24).await?;
+        let key = derive_key(b"fixture");
+        for host in [
+            "chatgpt.com",
+            "auth.openai.com",
+            ".openai.com",
+            "evil-openai.com",
+            ".unrelated.com",
+        ] {
+            insert(
+                &mut db,
+                host,
+                encrypt_fixture("test-secret", host, 24, &key),
+                0,
+                false,
+            )
+            .await?;
+        }
+        db.close().await?;
+        let cookies = read_profile(
+            dir.path(),
+            "chatgpt.com",
+            Zeroizing::new(b"fixture".to_vec()),
+        )
+        .await?;
+        let mut domains: Vec<&str> = cookies
+            .iter()
+            .map(|cookie| cookie.domain.as_str())
+            .collect();
+        domains.sort_unstable();
+        assert_eq!(
+            domains,
+            vec![".openai.com", "auth.openai.com", "chatgpt.com",]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extracts_same_root_subdomain_cookies() -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, mut db) = fixture(24).await?;
+        let key = derive_key(b"fixture");
+        for host in ["claude.ai", "auth.claude.ai", "evilclaude.ai"] {
+            insert(
+                &mut db,
+                host,
+                encrypt_fixture("test-secret", host, 24, &key),
+                0,
+                false,
+            )
+            .await?;
+        }
+        db.close().await?;
+        let cookies =
+            read_profile(dir.path(), "claude.ai", Zeroizing::new(b"fixture".to_vec())).await?;
+        let mut domains: Vec<&str> = cookies
+            .iter()
+            .map(|cookie| cookie.domain.as_str())
+            .collect();
+        domains.sort_unstable();
+        assert_eq!(domains, vec!["auth.claude.ai", "claude.ai",]);
         Ok(())
     }
 
@@ -474,7 +584,7 @@ mod tests {
         let key = derive_key(b"fixture");
         for host in [
             ".example.com",
-            "billing.example.com",
+            "portal.example.com",
             "evil-example.com",
             ".unrelated.com",
         ] {
@@ -497,7 +607,7 @@ mod tests {
         .await?;
         let cookies = read_profile(
             dir.path(),
-            "billing.example.com",
+            "portal.example.com",
             Zeroizing::new(b"fixture".to_vec()),
         )
         .await?;

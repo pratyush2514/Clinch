@@ -1,9 +1,14 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
+mod intent_resolver;
 mod runner;
 mod store;
 mod task;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
+pub use intent_resolver::{
+    CommandMatch, ParsedIntent, ephemeral_name, extract_identifier, parse_intent_structured,
+    resolve_command,
+};
 use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use runner::{
     SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError, StepOutcome,
@@ -37,14 +42,14 @@ pub enum EngineError {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InvoiceRequest {
+pub struct TaskRequest {
     pub workflow: String,
     pub portal_url: Url,
-    pub billing_selector: Option<String>,
-    pub invoice_selector: String,
+    pub link_selector: Option<String>,
+    pub download_selector: String,
 }
 
-impl InvoiceRequest {
+impl TaskRequest {
     fn validate_identity(&self) -> Result<(), EngineError> {
         if self.workflow.is_empty()
             || self.workflow.len() > 64
@@ -69,26 +74,26 @@ impl InvoiceRequest {
             })
         };
         let first_selector = self
-            .billing_selector
+            .link_selector
             .as_deref()
-            .unwrap_or(&self.invoice_selector);
+            .unwrap_or(&self.download_selector);
         let mut steps = vec![MacroStep {
             action: Action::Navigate {
                 url: self.portal_url.clone(),
             },
             wait: wait(first_selector),
         }];
-        if let Some(selector) = &self.billing_selector {
+        if let Some(selector) = &self.link_selector {
             steps.push(MacroStep {
                 action: Action::Click {
                     selector: selector.clone(),
                 },
-                wait: wait(&self.invoice_selector),
+                wait: wait(&self.download_selector),
             });
         }
         steps.push(MacroStep {
             action: Action::DownloadLinks {
-                selector: self.invoice_selector.clone(),
+                selector: self.download_selector.clone(),
             },
             wait: None,
         });
@@ -182,7 +187,7 @@ impl Engine {
         action: Action,
         emit: &std::sync::Mutex<&mut (impl FnMut(TaskEvent) + Send)>,
     ) -> bool {
-        // Navigation and invoice downloads retain their existing contract; interactive actions require consent.
+        // Navigation and file downloads retain their existing contract; interactive actions require consent.
         if matches!(
             action,
             Action::Navigate { .. } | Action::DownloadLinks { .. }
@@ -251,7 +256,7 @@ impl Engine {
     }
 
     async fn prepare(
-        request: &InvoiceRequest,
+        request: &TaskRequest,
         root: &Path,
     ) -> Result<(Plan, RunMode, std::path::PathBuf), EngineError> {
         request.validate_identity()?;
@@ -276,16 +281,16 @@ impl Engine {
     /// Determine the validated workflow mode before choosing a browser configuration.
     /// # Errors
     /// Rejects invalid requests and corrupt or mismatched saved macros.
-    pub async fn run_mode(request: &InvoiceRequest, root: &Path) -> Result<RunMode, EngineError> {
+    pub async fn run_mode(request: &TaskRequest, root: &Path) -> Result<RunMode, EngineError> {
         Ok(Self::prepare(request, root).await?.1)
     }
 
     /// Plan/record on first run, load/replay on subsequent runs. A corrupt macro fails closed.
     /// # Errors
     /// Returns invalid input, macro publication, or durable checkpoint failures.
-    pub async fn harvest(
+    pub async fn run_task(
         &self,
-        request: &InvoiceRequest,
+        request: &TaskRequest,
         browser: &ManagedBrowser,
         root: &Path,
         mut emit: impl FnMut(TaskEvent) + Send,
@@ -387,11 +392,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let pool = playbook_store::initialize(&dir.path().join("gate.db")).await?;
         let engine = Engine::new(pool.clone()).await?;
-        let request = InvoiceRequest {
+        let request = TaskRequest {
             workflow: "gate".into(),
             portal_url: Url::parse("https://example.com")?,
-            billing_selector: None,
-            invoice_selector: "a.invoice".into(),
+            link_selector: None,
+            download_selector: "a.report".into(),
         };
         let mut task = Task::new("gate".into(), request.plan()?, RunMode::Record);
         task.id = TaskId(42);
@@ -430,23 +435,22 @@ mod tests {
     }
 
     #[test]
-    fn invoice_plans_reject_paths_and_invalid_selectors() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut request = InvoiceRequest {
-            workflow: "bills".into(),
-            portal_url: Url::parse("https://example.com/billing")?,
-            billing_selector: None,
-            invoice_selector: "a.invoice".into(),
+    fn task_plans_reject_paths_and_invalid_selectors() -> Result<(), Box<dyn std::error::Error>> {
+        let mut request = TaskRequest {
+            workflow: "reports".into(),
+            portal_url: Url::parse("https://example.com/files")?,
+            link_selector: None,
+            download_selector: "a.report".into(),
         };
         assert_eq!(request.plan()?.steps.len(), 2);
-        for workflow in ["../bills", "C:\\bills", "bills/name", "", "."] {
+        for workflow in ["../reports", "C:\\reports", "reports/name", "", "."] {
             request.workflow = workflow.into();
             assert!(request.plan().is_err());
         }
-        request.workflow = "bills".into();
-        request.billing_selector = Some(String::new());
+        request.workflow = "reports".into();
+        request.link_selector = Some(String::new());
         assert!(request.plan().is_err());
-        request.billing_selector = None;
+        request.link_selector = None;
         request.portal_url = Url::parse("https://user:secret@example.com/")?;
         assert!(request.plan().is_err());
         Ok(())

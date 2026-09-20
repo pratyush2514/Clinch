@@ -16,6 +16,12 @@ header strong { font-size: 28px; letter-spacing: -1.5px; }
 .subtitle { font-size: 12px; margin-left: 20px; color: #76796c; }
 kbd { color: #777; margin-left: 22px; }
 .stage { display: flex; justify-content: space-between; padding: 18px 36px; color: #727568; font-size: 10px; letter-spacing: 1.5px; border-bottom: 1px solid #deded5; }
+.command-bar { padding: 18px 36px; border-bottom: 1px solid #deded5; }
+.command-bar fieldset { border: 0; margin: 0; padding: 0; min-width: 0; display: flex; gap: 10px; }
+.command-bar fieldset input { flex: 1; margin-top: 0; }
+.command-bar ol { margin: 16px 0 0; }
+.command-bar .gate-card { margin-top: 16px; }
+.command-bar .status { margin: 16px 0 0; }
 .workspace { min-height: calc(100vh - 178px); }
 .pane { padding: 36px; }
 .eyebrow { font-size: 10px; letter-spacing: 1.5px; color: #767b6a; font-weight: 600; }
@@ -40,11 +46,11 @@ ol { list-style: none; padding: 0; margin: 24px 0; }
 li { display: flex; gap: 16px; font-size: 12px; line-height: 1.6; padding: 14px 0; border-bottom: 1px solid #e0e1d7; }
 li span { color: #898f78; }
 .gate-card { border: 1px solid #d9dacf; padding: 24px; margin-top: 34px; border-radius: 6px; }
-.invoice-task { border-top: 1px solid #deded5; padding-top: 24px; }
+.task-workspace { border-top: 1px solid #deded5; padding-top: 24px; }
 .workflow-form { border-top: 1px solid #deded5; padding-top: 24px; margin-top: 24px; }
 .workflow-form pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; background: #eeeFE7; padding: 15px; border-radius: 6px; }
-.invoice-task fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
-.invoice-task label { margin-bottom: 16px; }
+.task-workspace fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.task-workspace label { margin-bottom: 16px; }
 .run-result { margin-top: 24px; }
 .run-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 11px; }
 .run-result small { display: block; color: #737a66; margin-top: 3px; }
@@ -63,8 +69,8 @@ dialog::backdrop, [cmdk-overlay] { background: #1a201766; position: fixed; inset
 .browser-viewport img { display: block; width: 100%; height: 100%; }
 .browser-viewport p { padding: 16px; }
 .browser-highlight { position: absolute; pointer-events: none; border: 2px solid #748b17; background: #b8d84426; box-sizing: border-box; }
-.invoice-task dialog { margin: auto 24px auto auto; width: min(480px, calc(45vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
-.invoice-task dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-workspace dialog { margin: auto 24px auto auto; width: min(480px, calc(45vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
+.task-workspace dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .element-picker { margin: -8px 0 16px; }
 .element-picker .actions { margin-bottom: 8px; }
 .auth-panel { border: 1px solid #b9c4a3; background: #f2f5e9; border-radius: 6px; padding: 20px; margin-top: 20px; }

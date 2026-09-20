@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Command } from "cmdk";
-import InvoiceTask, { type Highlight } from "./InvoiceTask";
-import WorkflowForm from "./components/WorkflowForm";
+import TaskWorkspace, { type Highlight } from "./TaskWorkspace";
+import CommandBar from "./components/CommandBar";
 import BrowserViewport from "./BrowserViewport";
 import AuthPanel, { type AuthPanelState } from "./AuthPanel";
 
@@ -17,7 +17,7 @@ function message(error: unknown): string {
     if (error.code === "browser_unavailable") return "Could not open Chromium. Check CLINCH_CHROMIUM_PATH, then close and retry.";
     if (error.code === "busy") return "An operation is already in progress.";
     if (error.code === "storage_unavailable") return "Local storage is unavailable. Check app data permissions.";
-    if (error.code === "session_required") return "Connect this portal and finish signing in in the managed browser before running invoices.";
+    if (error.code === "session_required") return "Connect this portal and finish signing in in the managed browser before running tasks.";
     if (error.code === "workflow_failed") return "The workflow could not finish. Check its saved macro and the latest task checkpoint; no automatic retry was attempted.";
     if (error.code === "picker_unavailable") return "Element picking needs the visible managed Chromium window. Replays run headless — click Sync session to reopen it, then pick again.";
     if ("message" in error && typeof error.message === "string") return error.message;
@@ -118,15 +118,16 @@ export default function App() {
     <header><div><strong>Clinch<span className="dot">.</span></strong><span className="subtitle">Local action studio</span></div>
       <button onClick={() => setCommandOpen(true)}>Commands <kbd>⌘ K</kbd></button></header>
     <div className="stage"><span>PHASE 0 / STEPS 3–4</span><span>{ready ? "SQLite ready · WAL" : "Desktop shell preview"}</span></div>
+    <CommandBar ready={ready} busy={busy} portal={portal} report={report} errorMessage={message} />
     <Group orientation="horizontal" className="workspace">
       <Panel defaultSize="55%" minSize="35%">
         <section className="pane">
           <div className="eyebrow">01 / BROWSER SESSION</div>
           <h1>Your session.<br />Your machine.</h1>
-          <p>Connect one billing portal using your local browser session, or sign in directly in Clinch’s own profile.</p>
+          <p>Connect one portal using your local browser session, or sign in directly in Clinch’s own profile.</p>
           <BrowserViewport ready={ready} highlight={highlight} />
           <form onSubmit={event => { event.preventDefault(); void connect(false); }}>
-            <label>Portal URL<input type="url" required placeholder="https://billing.example.com" value={portal} onChange={event => { setPortal(event.target.value); setConsent(false); }} /></label>
+            <label>Portal URL<input type="url" required placeholder="https://portal.example.com" value={portal} onChange={event => { setPortal(event.target.value); setConsent(false); }} /></label>
             <div className="fields"><label>Source browser<select value={browser} onChange={event => { setBrowser(event.target.value); setConsent(false); }}><option value="chrome">Google Chrome</option><option value="brave">Brave</option><option value="edge">Microsoft Edge</option></select></label>
               <label>Profile folder<input value={profile} onChange={event => { setProfile(event.target.value); setConsent(false); }} placeholder="Default" /></label></div>
             <label className="consent"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />
@@ -148,13 +149,12 @@ export default function App() {
         <section className="pane activity"><div className="eyebrow">02 / WORKSPACE</div><h2>Session activity</h2>
           <p role="status" aria-live="polite" className="status">{status}</p>
           <ol>{events.map((event, index) => <li key={index}><span>{String(index + 1).padStart(2, "0")}</span>{event}</li>)}</ol>
-          <InvoiceTask onHighlight={setHighlight} ready={ready} busy={busy} portal={portal} setBusy={setBusy} report={report} errorMessage={message} />
-          <WorkflowForm ready={ready} busy={busy} portal={portal} report={report} errorMessage={message} />
+          <TaskWorkspace onHighlight={setHighlight} ready={ready} busy={busy} portal={portal} setBusy={setBusy} report={report} errorMessage={message} />
           <div className="gate-card"><div className="eyebrow">SENTINEL GATE</div><h3>A human decision.</h3><p>Clicks, typing, and form submissions pause here for your approval. Review Details keeps the task paused; Reject stops execution.</p></div>
         </section>
       </Panel>
     </Group>
-    <footer>LOCAL FIRST <span>Invoice Harvester · Native CDP record / replay</span></footer>
+    <footer>LOCAL FIRST <span>Native CDP record / replay</span></footer>
     <Command.Dialog open={commandOpen} onOpenChange={setCommandOpen} label="Clinch commands">
       <Command.Input placeholder="Find a command…" /><Command.List><Command.Empty>No matching commands.</Command.Empty>
 

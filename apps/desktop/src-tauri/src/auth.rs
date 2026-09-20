@@ -2,8 +2,9 @@
 //! Embedded auth-panel state: in-app re-authentication without an external
 //! OS browser window.
 //!
-//! When CDP classifies a portal landing as [`AuthSignal::LoginRedirect`] or
-//! [`AuthSignal::OriginMismatch`], the desktop layer raises this panel instead
+//! When CDP classifies a portal landing as [`AuthSignal::LoginRedirect`],
+//! [`AuthSignal::SsoChallenge`], or [`AuthSignal::OriginMismatch`], the
+//! desktop layer raises this panel instead
 //! of launching the user's daily browser. The user completes login/2FA in the
 //! app-owned managed Chromium window (surfaced in-app via the mirrored
 //! viewport); completing the panel verifies the origin, records a WAL
@@ -19,7 +20,11 @@ use url::Url;
 pub enum ReauthReason {
     /// Same origin but the path looks like `/login` / 2FA.
     LoginRedirect,
-    /// The portal bounced to a foreign origin (SSO / expired session).
+    /// Landed on a known identity-provider origin mid-SSO. Still foreign,
+    /// still unconnected — but expected, not a hijack signal. Completing the
+    /// panel here keeps failing closed until the provider redirects back.
+    SsoChallenge,
+    /// The portal bounced to a foreign origin (expired session, unknown hop).
     OriginMismatch,
     /// Opened proactively by the user from the React workspace.
     Manual,
@@ -49,6 +54,7 @@ pub fn reason_for_signal(signal: &browser_driver::AuthSignal) -> Option<ReauthRe
     match signal {
         browser_driver::AuthSignal::Authenticated => None,
         browser_driver::AuthSignal::LoginRedirect { .. } => Some(ReauthReason::LoginRedirect),
+        browser_driver::AuthSignal::SsoChallenge { .. } => Some(ReauthReason::SsoChallenge),
         browser_driver::AuthSignal::OriginMismatch { .. } => Some(ReauthReason::OriginMismatch),
     }
 }
@@ -70,16 +76,22 @@ mod tests {
             Some(ReauthReason::LoginRedirect)
         );
         assert_eq!(
+            reason_for_signal(&browser_driver::AuthSignal::SsoChallenge {
+                url: "https://auth.openai.com/authorize".into()
+            }),
+            Some(ReauthReason::SsoChallenge)
+        );
+        assert_eq!(
             reason_for_signal(&browser_driver::AuthSignal::OriginMismatch {
                 current: "https://y/".into()
             }),
             Some(ReauthReason::OriginMismatch)
         );
         let panel = AuthPanel::new(
-            &Url::parse("https://billing.example.com/")?,
+            &Url::parse("https://portal.example.com/")?,
             ReauthReason::Manual,
         );
-        assert!(serde_json::to_string(&panel)?.contains("billing.example.com"));
+        assert!(serde_json::to_string(&panel)?.contains("portal.example.com"));
         Ok(())
     }
 }

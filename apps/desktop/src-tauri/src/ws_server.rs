@@ -46,12 +46,17 @@ const MAX_VALUE_LEN: usize = 16 * 1024;
 const MAX_NAME_LEN: usize = 256;
 const MAX_UA_LEN: usize = 512;
 
-/// Cross-root SSO secondaries the suffix rule cannot derive. Must mirror
-/// `KNOWN_SSO_SECONDARIES` in `packages/extension-bridge/background.js`;
+/// Ancestor suffixes plus curated cross-root secondaries for `host`.
+/// Scope rules live in `session-sync` (shared with cookie extraction);
+/// the only addition here is subdomains of the exact portal host. Must still
+/// mirror `KNOWN_SSO_SECONDARIES` in `packages/extension-bridge/background.js`;
 /// the desktop filter below is authoritative, the extension's only shrinks
-/// the payload. Extend here (and there) when adding providers.
-const KNOWN_SSO_SECONDARIES: &[(&str, &[&str])] =
-    &[("chatgpt.com", &["openai.com", "auth.openai.com"])];
+/// the payload. Extend the shared table when adding providers.
+fn scope_roots(host: &str) -> Vec<String> {
+    let mut roots = session_sync::ancestor_roots(host);
+    roots.extend(session_sync::sso_secondaries(host));
+    roots
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -69,29 +74,6 @@ pub enum BridgeError {
     Invalid,
     #[error("The companion bridge is unavailable")]
     Unavailable,
-}
-
-/// Ancestor suffixes plus curated cross-root secondaries for `host`.
-fn scope_roots(host: &str) -> Vec<String> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let labels: Vec<&str> = host.split('.').collect();
-    let mut roots = Vec::new();
-    for start in 1..labels.len().saturating_sub(1) {
-        roots.push(labels[start..].join("."));
-    }
-    let mut table = |key: &str| {
-        if let Some((_, secondaries)) = KNOWN_SSO_SECONDARIES
-            .iter()
-            .find(|(portal, _)| *portal == key)
-        {
-            roots.extend(secondaries.iter().map(ToString::to_string));
-        }
-    };
-    table(&host);
-    if let Some((_, parent)) = host.split_once('.') {
-        table(parent);
-    }
-    roots
 }
 
 /// Whether a cookie domain may ride along with a `host` sync: the host
@@ -592,9 +574,9 @@ mod tests {
             assert!(!in_scope(domain, "chatgpt.com"), "{domain}");
         }
         // Generic suffix rule without any curated entry.
-        assert!(in_scope("auth.example.com", "billing.example.com"));
-        assert!(in_scope(".sso.example.com", "billing.example.com"));
-        assert!(!in_scope("evil-example.com", "billing.example.com"));
+        assert!(in_scope("auth.example.com", "portal.example.com"));
+        assert!(in_scope(".sso.example.com", "portal.example.com"));
+        assert!(!in_scope("evil-example.com", "portal.example.com"));
     }
 
     #[test]

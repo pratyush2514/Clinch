@@ -291,18 +291,18 @@ mod tests {
     fn binding_payload_roundtrip_and_validation() -> Result<(), Box<dyn std::error::Error>> {
         let picked = PickedElement {
             tag: "a".into(),
-            selectors: vec!["[data-testid=\"invoice-link\"]".into(), "a.invoice".into()],
+            selectors: vec!["[data-testid=\"report-link\"]".into(), "a.report".into()],
             rect: PickerRect {
                 x: 8.0,
                 y: 16.0,
                 width: 120.0,
                 height: 24.0,
             },
-            text: "Download invoice".into(),
+            text: "Download report".into(),
         };
         let payload = serde_json::to_string(&picked)?;
         assert_eq!(parse_binding_payload(&payload)?, picked);
-        assert_eq!(picked.primary(), Some("[data-testid=\"invoice-link\"]"));
+        assert_eq!(picked.primary(), Some("[data-testid=\"report-link\"]"));
         Ok(())
     }
 
@@ -356,13 +356,13 @@ mod tests {
         let ranked = rank_selectors_from_attrs(
             "BUTTON",
             Some("submit-btn"),
-            Some("invoice-submit"),
-            Some("Submit invoice"),
+            Some("report-submit"),
+            Some("Submit report"),
             &["primary-btn".into(), "extra".into()],
             Some("submit"),
         );
-        assert_eq!(ranked[0], "[data-testid=\"invoice-submit\"]");
-        assert_eq!(ranked[1], "[aria-label=\"Submit invoice\"]");
+        assert_eq!(ranked[0], "[data-testid=\"report-submit\"]");
+        assert_eq!(ranked[1], "[aria-label=\"Submit report\"]");
         assert_eq!(ranked[2], "#submit-btn");
         assert!(ranked[3].starts_with("button."));
         assert!(ranked[3].contains("[type=\"submit\"]"));

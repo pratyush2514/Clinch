@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Highlight } from "./InvoiceTask";
+import type { Highlight } from "./TaskWorkspace";
 type Frame = { data: string; width: number; height: number };
 export default function BrowserViewport({ ready, highlight }: { ready: boolean; highlight: Highlight | null }) {
   const [frame, setFrame] = useState<Frame | null>(null);

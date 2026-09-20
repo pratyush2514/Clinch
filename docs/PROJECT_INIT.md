@@ -37,13 +37,16 @@ autonomous-studio/
 
 ## 3. Milestone Plan
 
-| Phase | Goal | Exit Criteria |
-|---|---|---|
-| 0. Spike | Prove the core loop on Invoice Harvester | Session sync (+ fallback) working; macro records on run 1, replays on run 2, on 5 real portals |
-| 1. MVP | Ship all 3 anchor Playbooks | Job Application Engine, Invoice Harvester, Deal Radar all functional; dual-pane UI, Cmd+K, Sentinel Gate hard floor on Job Application Engine |
-| 2. Reliability | Harden self-healing, add scheduling | Macro-reuse-rate and cookie-sync-success-rate metrics live; golden-path suite passing on every engine/model update |
-| 3. Team Layer | Shared Playbooks, roles, audit export | First team of 3+ using shared Playbooks with approval delegation |
-| 4. Native Reach | Accessibility API spike | Feasibility validated on 2–3 target native apps before committing to full build |
+| Phase | Goal | Exit Criteria | Status (see `STATUS.md`) |
+|---|---|---|---|
+| 0. Spike | Prove the core loop on Invoice Harvester | Session sync (+ fallback) working; macro records on run 1, replays on run 2, on 5 real portals | Engine done; 5-portal validation open |
+| 1. MVP | Ship all 3 anchor Playbooks | Job Application Engine, Invoice Harvester, Deal Radar all functional; dual-pane UI, Cmd+K, Sentinel Gate hard floor on Job Application Engine | Partial: Invoice flow only; Job/Deal unstarted |
+| B1. Session hardening | Zero-touch sync on real machines | Edge/AES-GCM/DPAPI, shadow-copy reads, hydration, wildcard SSO, UA mirror, Brave default, App-Bound diagnostics | Implemented, unit + fixture proven |
+| B2. Dynamic discovery | Selectors optional | AX tree, Set-of-Marks, semantic executor, picker fix | Implemented, live-Chromium proven |
+| B3. Playbooks end-to-end | Save, run, command | Schema + v1 migration, persistence, runner, approvals, builder, command bar | Implemented, approval-gated |
+| 2. Reliability | Harden self-healing, add scheduling | Macro-reuse-rate and cookie-sync-success-rate metrics live; golden-path suite passing on every engine/model update | Not started |
+| 3. Team Layer | Shared Playbooks, roles, audit export | First team of 3+ using shared Playbooks with approval delegation | Not started |
+| 4. Native Reach | Accessibility API spike | Feasibility validated on 2–3 target native apps before committing to full build | Not started |
 
 ## 4. Immediate Next Steps (Week 1)
 

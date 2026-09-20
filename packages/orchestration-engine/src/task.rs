@@ -233,13 +233,13 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InvoiceRequest;
+    use crate::TaskRequest;
     #[test]
     fn transitions_reject_skipping_repeating_and_false_completion() -> Result<(), EngineError> {
-        let request: InvoiceRequest = serde_json::from_str(
-            r#"{"workflow":"bills","portalUrl":"https://example.com","billingSelector":null,"invoiceSelector":"a.invoice"}"#,
+        let request: TaskRequest = serde_json::from_str(
+            r#"{"workflow":"reports","portalUrl":"https://example.com","linkSelector":null,"downloadSelector":"a.report"}"#,
         )?;
-        let mut task = Task::new("bills".into(), request.plan()?, RunMode::Record);
+        let mut task = Task::new("reports".into(), request.plan()?, RunMode::Record);
         assert!(task.start_step(1).is_err());
         assert!(task.finish().is_err());
         assert!(task.start_step(99).is_err());

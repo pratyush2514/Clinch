@@ -2,7 +2,7 @@
 //! Opt-in real Chromium/CDP test. The server and cookie are synthetic and local-only.
 use browser_driver::{Action, ManagedBrowser};
 use macro_engine::{Macro, RepairStage};
-use orchestration_engine::{Engine, InvoiceRequest, RunMode, StepState, TaskState};
+use orchestration_engine::{Engine, RunMode, StepState, TaskRequest, TaskState};
 use session_sync::{Cookie, CookieSameSite};
 use std::{
     path::Path,
@@ -64,42 +64,42 @@ impl Fixture {
                         "Content-Type: text/html\r\n",
                         "<h1>Sign in</h1>",
                     )
-                } else if request.starts_with("GET /invoice.pdf ") {
+                } else if request.starts_with("GET /report.pdf ") {
                     counter.fetch_add(1, Ordering::SeqCst);
                     (
                         "200 OK",
-                        "Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=invoice.pdf\r\n",
-                        "%PDF-1.4\nClinch local invoice fixture\n%%EOF\n",
+                        "Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\n",
+                        "%PDF-1.4\nClinch local file fixture\n%%EOF\n",
                     )
                 } else if request.starts_with("GET /blobs ") {
                     (
                         "200 OK",
                         "Content-Type: text/html\r\n",
-                        r"<!doctype html><title>Blob invoices</title>
-                        <a class='blob-invoice' id='direct' download='invoice'>Direct blob</a>
-                        <a class='blob-invoice' href='/invoice.pdf' id='generated'>Generate blob</a>
+                        r"<!doctype html><title>Blob files</title>
+                        <a class='blob-file' id='direct' download='report'>Direct blob</a>
+                        <a class='blob-file' href='/report.pdf' id='generated'>Generate blob</a>
                         <script>
                         const pdf = new Blob(['%PDF-1.4\nClinch blob fixture\n%%EOF'], {type:'application/pdf'});
                         document.querySelector('#direct').href = URL.createObjectURL(pdf);
                         document.querySelector('#generated').onclick = event => {
                             event.preventDefault();
                             const link = document.createElement('a');
-                            link.href = URL.createObjectURL(pdf); link.download = 'invoice';
+                            link.href = URL.createObjectURL(pdf); link.download = 'report';
                             document.body.appendChild(link); link.click(); link.remove();
                         };
                         </script>",
                     )
-                } else if request.starts_with("GET /billing ") {
+                } else if request.starts_with("GET /archive ") {
                     (
                         "200 OK",
                         "Content-Type: text/html\r\n",
-                        "<!doctype html><title>Clinch billing fixture</title><a class='invoice' href='/invoice.pdf'>Download invoice</a><input type='search' id='filter' oninput=\"this.dataset.applied = this.value === '2026-09' ? 'yes' : 'no'\"><input type='password' id='secret'><div id='hidden' hidden>Hidden</div>",
+                        "<!doctype html><title>Clinch files fixture</title><a class='report' href='/report.pdf'>Download report</a><input type='search' id='filter' oninput=\"this.dataset.applied = this.value === '2026-09' ? 'yes' : 'no'\"><input type='password' id='secret'><div id='hidden' hidden>Hidden</div>",
                     )
                 } else {
                     (
                         "200 OK",
                         "Content-Type: text/html\r\n",
-                        "<!doctype html><title>Clinch portal fixture</title><a id='billing' href='/billing'>Invoice history</a>",
+                        "<!doctype html><title>Clinch portal fixture</title><a id='archive' href='/archive'>File archive</a>",
                     )
                 };
                 let response = format!(
@@ -123,7 +123,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; opens an isolated Chromium and local synthetic billing portal"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; opens an isolated Chromium and local synthetic file portal"]
 async fn records_replays_downloads_and_flags_only_the_broken_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
@@ -137,15 +137,15 @@ async fn records_replays_downloads_and_flags_only_the_broken_step()
     inject_fixture_session(&browser).await?;
     let pool = playbook_store::initialize(&directory.path().join("clinch.db")).await?;
     let engine = Engine::new(pool.clone()).await?;
-    let request = InvoiceRequest {
+    let request = TaskRequest {
         workflow: "fixture".into(),
         portal_url: fixture.url.clone(),
-        billing_selector: Some("#billing".into()),
-        invoice_selector: "a.invoice".into(),
+        link_selector: Some("#archive".into()),
+        download_selector: "a.report".into(),
     };
     let mut events = Vec::new();
     let first = engine
-        .harvest(&request, &browser, directory.path(), |event| {
+        .run_task(&request, &browser, directory.path(), |event| {
             if let Some(gate) = &event.approval {
                 assert!(engine.decide(gate.task_id, gate.step_index, true).is_ok());
             }
@@ -160,7 +160,7 @@ async fn records_replays_downloads_and_flags_only_the_broken_step()
         event
             .highlight
             .as_ref()
-            .is_some_and(|target| target.selector == "a.invoice")
+            .is_some_and(|target| target.selector == "a.report")
     }));
     assert!(
         events
@@ -181,11 +181,11 @@ async fn records_replays_downloads_and_flags_only_the_broken_step()
     assert!(!String::from_utf8_lossy(&macro_bytes).contains("local_test"));
     // Intentionally unusable planning inputs: Run 2 must use only the recorded plan.
     let mut replay_request = request.clone();
-    replay_request.invoice_selector.clear();
-    replay_request.billing_selector = Some(String::new());
+    replay_request.download_selector.clear();
+    replay_request.link_selector = Some(String::new());
     assert!(matches!(
         engine
-            .harvest(&replay_request, &browser, directory.path(), |_| {})
+            .run_task(&replay_request, &browser, directory.path(), |_| {})
             .await,
         Err(orchestration_engine::EngineError::HeadlessRequired)
     ));
@@ -194,7 +194,7 @@ async fn records_replays_downloads_and_flags_only_the_broken_step()
         .map_err(|error| format!("Headless restart: {error}"))?;
     let start = Instant::now();
     let second = engine
-        .harvest(&replay_request, &browser, directory.path(), |event| {
+        .run_task(&replay_request, &browser, directory.path(), |event| {
             if let Some(gate) = event.approval {
                 assert!(engine.decide(gate.task_id, gate.step_index, true).is_ok());
             }
@@ -255,7 +255,7 @@ async fn verify_blob_downloads(
     let result = browser
         .execute_action(
             &Action::DownloadLinks {
-                selector: "a.blob-invoice".into(),
+                selector: "a.blob-file".into(),
             },
             origin,
             &output,
@@ -374,7 +374,7 @@ async fn verify_actions(
 
 async fn verify_repairs(
     engine: &Engine,
-    request: &InvoiceRequest,
+    request: &TaskRequest,
     browser: &ManagedBrowser,
     root: &Path,
     fixture: &Fixture,
@@ -386,7 +386,7 @@ async fn verify_repairs(
     };
     recorded.save(&macro_path).await?;
     let broken = engine
-        .harvest(request, browser, root, |event| {
+        .run_task(request, browser, root, |event| {
             if let Some(gate) = event.approval {
                 assert!(engine.decide(gate.task_id, gate.step_index, true).is_ok());
             }
@@ -410,7 +410,7 @@ async fn verify_repairs(
     });
     recorded.save(&macro_path).await?;
     let wait_failed = engine
-        .harvest(request, browser, root, |event| {
+        .run_task(request, browser, root, |event| {
             if let Some(gate) = event.approval {
                 assert!(engine.decide(gate.task_id, gate.step_index, true).is_ok());
             }

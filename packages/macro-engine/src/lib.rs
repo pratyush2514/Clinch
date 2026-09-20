@@ -5,7 +5,8 @@ use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
 pub use executor::{
-    IntentError, IntentOutcome, ResolvedIntent, SemanticIntent, execute_intent, resolve_intent,
+    IntentError, IntentOutcome, ResolvedIntent, SemanticIntent, execute_intent,
+    grounding_diagnostic, resolve_intent,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
@@ -467,7 +468,7 @@ mod tests {
         for target in [
             "https://other.example/",
             "javascript:alert(1)",
-            "file:///tmp/invoice",
+            "file:///tmp/report",
             "https://user:password@example.com/",
         ] {
             let recording = Macro {
@@ -491,10 +492,10 @@ mod tests {
             origin,
             steps: vec![MacroStep {
                 action: Action::DownloadLinks {
-                    selector: "a.invoice".into(),
+                    selector: "a.report".into(),
                 },
                 wait: Some(WaitCondition {
-                    selector: "a.invoice".into(),
+                    selector: "a.report".into(),
                     timeout_ms: 0,
                 }),
             }],
@@ -522,7 +523,7 @@ mod tests {
         );
         recorder.record_completed(&MacroStep {
             action: Action::DownloadLinks {
-                selector: "a.invoice".into(),
+                selector: "a.report".into(),
             },
             wait: None,
         })?;

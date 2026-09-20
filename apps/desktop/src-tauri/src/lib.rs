@@ -4,8 +4,8 @@ mod service;
 mod ws_server;
 use auth::AuthPanel;
 use service::{
-    AppError, AppService, ApprovalPreview, BridgeStatus, IntentPreview, PickerStatus,
-    SessionStatus, StorageStatus,
+    AppError, AppService, ApprovalPreview, BridgeStatus, DispatchOutcome, IntentPreview,
+    PickerStatus, PocMetrics, SessionStatus, StorageStatus,
 };
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
@@ -38,6 +38,18 @@ async fn task_decision(
     state: tauri::State<'_, AppService>,
 ) -> Result<(), AppError> {
     state.decide_task(id, index, approved).await
+}
+#[tauri::command]
+async fn dispatch_natural_command(
+    prompt: String,
+    progress: tauri::ipc::Channel<service::PlaybookEvent>,
+    state: tauri::State<'_, AppService>,
+) -> Result<DispatchOutcome, AppError> {
+    state
+        .dispatch_natural_command(prompt, |event| {
+            let _ = progress.send(event);
+        })
+        .await
 }
 #[tauri::command]
 async fn browser_viewport(
@@ -167,13 +179,17 @@ fn decide_playbook(
     state.decide_playbook(run_id, index, approved)
 }
 #[tauri::command]
-async fn harvest_invoices(
-    request: orchestration_engine::InvoiceRequest,
+async fn get_poc_metrics(state: tauri::State<'_, AppService>) -> Result<PocMetrics, AppError> {
+    state.poc_metrics().await
+}
+#[tauri::command]
+async fn run_task(
+    request: orchestration_engine::TaskRequest,
     progress: tauri::ipc::Channel<orchestration_engine::TaskEvent>,
     state: tauri::State<'_, AppService>,
 ) -> Result<orchestration_engine::Task, AppError> {
     state
-        .harvest(&request, |event| {
+        .run_task(&request, |event| {
             // If the view closes, execution still checkpoints; get_task restores its durable result.
             let _ = progress.send(event);
         })
@@ -227,7 +243,9 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         list_playbooks,
         execute_playbook,
         decide_playbook,
-        harvest_invoices,
+        dispatch_natural_command,
+        get_poc_metrics,
+        run_task,
         get_task,
         preview_approval,
         resolve_approval
@@ -284,8 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn invoice_channel_command_requires_connected_session() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn task_channel_command_requires_connected_session() -> Result<(), Box<dyn std::error::Error>> {
         let app = with_commands(mock_builder())
             .manage(AppService::new(
                 std::path::PathBuf::new(),
@@ -295,12 +312,12 @@ mod tests {
         let webview =
             tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
         let request = InvokeRequest {
-            cmd: "harvest_invoices".into(),
+            cmd: "run_task".into(),
             callback: CallbackFn(0),
             error: CallbackFn(1),
             url: url::Url::parse("http://tauri.localhost")?,
             body: InvokeBody::Json(serde_json::json!({
-                "request": {"workflow":"bills", "portalUrl":"https://example.com/billing", "billingSelector":null, "invoiceSelector":"a.invoice"},
+                "request": {"workflow":"reports", "portalUrl":"https://example.com/files", "linkSelector":null, "downloadSelector":"a.report"},
                 "progress":"__CHANNEL__:7"
             })),
             headers: tauri::http::HeaderMap::new(),

@@ -6,7 +6,7 @@
 //! the live AX tree and click through the backend node — no selector is ever
 //! constructed. Both paths honor the same highlight-then-act ordering as
 //! first-run execution, and both require explicit approval for anything
-//! beyond navigation and invoice downloads.
+//! beyond navigation and file downloads.
 
 use browser_driver::{Action, ActionOutput, BrowserError, Highlight, ManagedBrowser};
 use macro_engine::SemanticIntent;
@@ -15,8 +15,10 @@ use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StepError {
-    #[error("No live control matches this intent")]
-    NoMatch,
+    /// Grounding failure carrying the engine's step-log diagnostic: target
+    /// queries plus every evaluated candidate and its score.
+    #[error("{0}")]
+    NoMatch(String),
     #[error("Local approval was not granted")]
     ApprovalRequired,
     #[error("A recorded selector needs targeted repair")]
@@ -128,7 +130,7 @@ where
             let outcome = macro_engine::execute_intent(browser, origin, intent)
                 .await
                 .map_err(|error| match error {
-                    macro_engine::IntentError::NoMatch => StepError::NoMatch,
+                    macro_engine::IntentError::NoMatch(reason) => StepError::NoMatch(reason),
                     macro_engine::IntentError::Browser(error) => StepError::Browser(error),
                 })?;
             highlight(outcome.highlight.clone());
@@ -186,7 +188,9 @@ fn terminal_status(error: &StepError) -> SequenceStatus {
     match error {
         StepError::NeedsRepair(_) => SequenceStatus::NeedsRepair,
         StepError::ApprovalRequired => SequenceStatus::Denied,
-        StepError::NoMatch | StepError::Browser(_) | StepError::Invalid => SequenceStatus::Failed,
+        StepError::NoMatch(_) | StepError::Browser(_) | StepError::Invalid => {
+            SequenceStatus::Failed
+        }
     }
 }
 
@@ -287,7 +291,10 @@ mod tests {
             terminal_status(&StepError::ApprovalRequired),
             SequenceStatus::Denied
         );
-        assert_eq!(terminal_status(&StepError::NoMatch), SequenceStatus::Failed);
+        assert_eq!(
+            terminal_status(&StepError::NoMatch(String::new())),
+            SequenceStatus::Failed
+        );
         assert_eq!(terminal_status(&StepError::Invalid), SequenceStatus::Failed);
         assert_eq!(
             terminal_status(&StepError::Browser(BrowserError::Timeout)),

@@ -74,7 +74,7 @@ impl LaunchOptions {
     }
 
     /// Background macro replay. No OS window may spawn on this path —
-    /// enforced by `Engine::harvest` (`HeadlessRequired`) and asserted by
+    /// enforced by `Engine::run_task` (`HeadlessRequired`) and asserted by
     /// the `headless_replay_*` integration tests.
     #[must_use]
     pub fn replay() -> Self {

@@ -52,7 +52,7 @@ async fn repairs_atomically_and_executes_once() -> Result<(), Box<dyn std::error
         origin: origin.clone(),
         steps: vec![MacroStep {
             action: Action::Fill {
-                selector: "#billing #old-filter".into(),
+                selector: "#archive #old-filter".into(),
                 value: "September".into(),
             },
             wait: None,
@@ -78,7 +78,7 @@ async fn repairs_atomically_and_executes_once() -> Result<(), Box<dyn std::error
     );
     assert_eq!(tokio::fs::read(&path).await?, original);
     let provider = Mock {
-        selector: "#billing #new-filter",
+        selector: "#archive #new-filter",
         calls: AtomicUsize::new(0),
     };
     let approvals = AtomicUsize::new(0);
@@ -103,7 +103,7 @@ async fn repairs_atomically_and_executes_once() -> Result<(), Box<dyn std::error
     assert_eq!(Macro::load(&path).await?, recording);
     assert_eq!(
         recording.steps[0].action.selector(),
-        Some("#billing #new-filter")
+        Some("#archive #new-filter")
     );
     assert_eq!(
         std::fs::read_dir(dir.path())?
@@ -134,7 +134,7 @@ async fn assert_wait_repair(
     output: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     recording.steps[0].wait = Some(WaitCondition {
-        selector: "#billing #old-filter".into(),
+        selector: "#archive #old-filter".into(),
         timeout_ms: 1,
     });
     recording.save(path).await?;
@@ -176,7 +176,7 @@ async fn fixture() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn std::er
             tokio::spawn(async move {
                 let mut buf = [0; 4096];
                 let _ = socket.read(&mut buf).await;
-                let html = "<!doctype html><section id='billing'><input id='new-filter' type='search' value='SECRET' oninput=\"this.dataset.count=String(Number(this.dataset.count||0)+1)\"><input type='password' value='SECRET'><script>/*SECRET*/</script><form id='send' onsubmit=\"event.preventDefault();this.dataset.sent='yes'\"><button>Submit fixture</button></form></section>";
+                let html = "<!doctype html><section id='archive'><input id='new-filter' type='search' value='SECRET' oninput=\"this.dataset.count=String(Number(this.dataset.count||0)+1)\"><input type='password' value='SECRET'><script>/*SECRET*/</script><form id='send' onsubmit=\"event.preventDefault();this.dataset.sent='yes'\"><button>Submit fixture</button></form></section>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
                     html.len()

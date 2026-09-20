@@ -7,14 +7,14 @@ import local_repair_adapter as adapter
 
 
 class AdapterTests(unittest.TestCase):
-    context = {"selector": "#billing .old", "html": '<div id="billing"><a class="new"></a></div>', "bounds": [0, 0, 100, 40]}
+    context = {"selector": "#archive .old", "html": '<div id="archive"><a class="new"></a></div>', "bounds": [0, 0, 100, 40]}
 
     def generate(self, envelope):
         return patch("urllib.request.OpenerDirector.open", return_value=io.BytesIO(json.dumps(envelope).encode()))
 
     def test_local_request_and_candidate(self):
-        with self.generate({"done": True, "response": '{"selector":"#billing .new"}'}) as send:
-            self.assertEqual(adapter.repair(self.context, "local-model"), {"selector": "#billing .new"})
+        with self.generate({"done": True, "response": '{"selector":"#archive .new"}'}) as send:
+            self.assertEqual(adapter.repair(self.context, "local-model"), {"selector": "#archive .new"})
             request = send.call_args.args[0]
             self.assertEqual(request.full_url, adapter.ENDPOINT)
             payload = json.loads(request.data)

@@ -125,6 +125,69 @@ impl PlaybookStore {
             })
             .collect()
     }
+
+    /// Journal a started run. Telemetry lives beside execution, never inside
+    /// it: callers record start, run, then record finish. Unknown ids on
+    /// finish are ignored — a restarted app must not crash on stale rows.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn record_run_start(
+        &self,
+        id: &str,
+        playbook_id: Option<&str>,
+        kind: RunKind,
+        total_steps: usize,
+    ) -> Result<(), StoreError> {
+        let total_steps = i64::try_from(total_steps)
+            .map_err(|_| StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
+        sqlx::query(
+            "INSERT INTO runs(id, playbook_id, kind, status, total_steps) VALUES(?, ?, ?, 'running', ?)",
+        )
+        .bind(id)
+        .bind(playbook_id)
+        .bind(kind.as_str())
+        .bind(total_steps)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Close a journaled run with its terminal status. `completed_at` is
+    /// stamped by `SQLite`, so writer clocks never skew the timeline.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn record_run_finish(
+        &self,
+        id: &str,
+        status: &str,
+        completed_steps: usize,
+    ) -> Result<(), StoreError> {
+        let completed_steps = i64::try_from(completed_steps)
+            .map_err(|_| StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
+        sqlx::query(
+            "UPDATE runs SET status = ?, completed_steps = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(status)
+        .bind(completed_steps)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Run totals grouped by status for POC metrics.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn run_stats(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        Ok(
+            sqlx::query_as("SELECT status, COUNT(*) FROM runs GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
 }
 
 /// Open the single application pool in WAL mode. Stores metadata only.
@@ -154,23 +217,50 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     )
     .execute(&pool)
     .await?;
+    // Run journal for POC metrics (reuse rates, sync outcomes). Additive and
+    // idempotent like every table here: existing databases gain it on next
+    // open, no ALTER or data migration involved. `completed_at` stays NULL
+    // while a run is in flight, so crashes read as interrupted, not silent.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, playbook_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL, total_steps INTEGER NOT NULL, completed_steps INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT)",
+    )
+    .execute(&pool)
+    .await?;
     Ok(pool)
+}
+
+/// Whether a journaled run came from a stored playbook or an ad-hoc intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    Saved,
+    Ephemeral,
+}
+
+impl RunKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Saved => "saved",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PlaybookStore;
+    use super::{PlaybookStore, RunKind};
     use crate::schema::{Playbook, Step};
     use macro_engine::SemanticIntent;
 
-    fn bills_playbook() -> Result<Playbook, Box<dyn std::error::Error>> {
+    fn reports_playbook() -> Result<Playbook, Box<dyn std::error::Error>> {
         Ok(Playbook::new(
-            "bills".into(),
-            url::Url::parse("https://billing.example.com/")?,
+            "reports".into(),
+            url::Url::parse("https://portal.example.com/")?,
             vec![Step::Semantic {
                 intent: SemanticIntent {
                     role: "button".into(),
                     label_query: "Pay now".into(),
+                    container_query: None,
                 },
             }],
         )?)
@@ -185,15 +275,15 @@ mod tests {
     #[tokio::test]
     async fn save_load_and_list_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = store().await?;
-        let playbook = bills_playbook()?;
+        let playbook = reports_playbook()?;
         let id = store.save_playbook(&playbook).await?;
         let revived = store.load_playbook(&id).await?;
         assert_eq!(revived, playbook);
         let listed = store.list_playbooks().await?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
-        assert_eq!(listed[0].name, "bills");
-        assert_eq!(listed[0].portal_url, "https://billing.example.com/");
+        assert_eq!(listed[0].name, "reports");
+        assert_eq!(listed[0].portal_url, "https://portal.example.com/");
         assert_eq!(listed[0].step_count, 1);
         assert!(!listed[0].updated_at.is_empty());
         Ok(())
@@ -202,15 +292,45 @@ mod tests {
     #[tokio::test]
     async fn save_is_idempotent_per_name() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = store().await?;
-        let id = store.save_playbook(&bills_playbook()?).await?;
+        let id = store.save_playbook(&reports_playbook()?).await?;
         // Re-saving the same name replaces the row instead of duplicating it.
-        let mut updated = bills_playbook()?;
+        let mut updated = reports_playbook()?;
         updated.steps.push(updated.steps[0].clone());
         let same_id = store.save_playbook(&updated).await?;
         assert_eq!(same_id, id);
         let listed = store.list_playbooks().await?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].step_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_journal_tracks_start_to_terminal_state() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, store) = store().await?;
+        let id = store.save_playbook(&reports_playbook()?).await?;
+        store
+            .record_run_start("run-1", Some(&id), RunKind::Saved, 3)
+            .await?;
+        // In-flight runs read back as running with no completion timestamp.
+        let stats = store.run_stats().await?;
+        assert_eq!(stats, vec![("running".to_owned(), 1)]);
+        store.record_run_finish("run-1", "completed", 3).await?;
+        let stats = store.run_stats().await?;
+        assert_eq!(stats, vec![("completed".to_owned(), 1)]);
+        // Unknown ids on finish are ignored, never an error.
+        store.record_run_finish("no-such-run", "failed", 0).await?;
+        // Ephemeral runs carry no playbook row.
+        store
+            .record_run_start("run-2", None, RunKind::Ephemeral, 1)
+            .await?;
+        store.record_run_finish("run-2", "failed", 0).await?;
+        let mut stats = store.run_stats().await?;
+        stats.sort_unstable();
+        assert_eq!(
+            stats,
+            vec![("completed".to_owned(), 1), ("failed".to_owned(), 1),]
+        );
         Ok(())
     }
 
@@ -226,12 +346,12 @@ mod tests {
             store.load_playbook("not-an-id").await,
             Err(super::StoreError::NotFound)
         ));
-        let mut bad = bills_playbook()?;
+        let mut bad = reports_playbook()?;
         bad.name.clear();
         assert!(store.save_playbook(&bad).await.is_err());
         assert!(store.list_playbooks().await?.is_empty());
         // A tampered row fails the listing closed instead of hiding a workflow.
-        sqlx::query("INSERT INTO playbooks(name, portal_url, steps_json) VALUES('tampered', 'https://billing.example.com/', 'not-json')")
+        sqlx::query("INSERT INTO playbooks(name, portal_url, steps_json) VALUES('tampered', 'https://portal.example.com/', 'not-json')")
             .execute(&store.pool)
             .await?;
         assert!(store.list_playbooks().await.is_err());

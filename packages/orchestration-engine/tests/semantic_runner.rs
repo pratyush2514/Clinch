@@ -15,8 +15,8 @@ use std::{
 };
 use url::Url;
 
-const HOME_HTML: &str = "<!doctype html><html><body><a id=\"billing\" href=\"/billing\">Invoice history</a><button data-testid=\"pay-btn\">Pay now</button><script>document.querySelector('button').addEventListener('click', function(){document.body.setAttribute('data-clicked','yes');});</script></body></html>";
-const BILLING_HTML: &str = "<!doctype html><html><body><a class=\"invoice\" href=\"/invoice.pdf\">Download invoice</a></body></html>";
+const HOME_HTML: &str = "<!doctype html><html><body><a id=\"archive\" href=\"/archive\">File archive</a><button data-testid=\"pay-btn\">Pay now</button><script>document.querySelector('button').addEventListener('click', function(){document.body.setAttribute('data-clicked','yes');});</script></body></html>";
+const ARCHIVE_HTML: &str = "<!doctype html><html><body><a class=\"report\" href=\"/report.pdf\">Download report</a></body></html>";
 
 async fn fixture_portal() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
 {
@@ -31,8 +31,8 @@ async fn fixture_portal() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn 
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut head = [0; 4096];
                 let _ = socket.read(&mut head).await;
-                let body = if head.starts_with(b"GET /billing ") {
-                    BILLING_HTML
+                let body = if head.starts_with(b"GET /archive ") {
+                    ARCHIVE_HTML
                 } else {
                     HOME_HTML
                 };
@@ -90,10 +90,10 @@ async fn stop(harness: Harness) {
 fn legacy_click() -> Step {
     Step::LegacySelector {
         action: Action::Click {
-            selector: "#billing".into(),
+            selector: "#archive".into(),
         },
         wait: Some(WaitCondition {
-            selector: "a.invoice".into(),
+            selector: "a.report".into(),
             timeout_ms: 5_000,
         }),
     }
@@ -104,6 +104,7 @@ fn pay_intent() -> Step {
         intent: SemanticIntent {
             role: "button".into(),
             label_query: "Pay now".into(),
+            container_query: None,
         },
     }
 }
@@ -136,7 +137,7 @@ async fn dispatch_replays_legacy_steps() -> Result<(), Box<dyn std::error::Error
     assert!(
         highlights
             .lock()
-            .is_ok_and(|guard| guard.iter().any(|selector| selector == "#billing"))
+            .is_ok_and(|guard| guard.iter().any(|selector| selector == "#archive"))
     );
     stop(harness).await;
     Ok(())
@@ -207,6 +208,7 @@ async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         intent: SemanticIntent {
             role: "button".into(),
             label_query: "No such control anywhere".into(),
+            container_query: None,
         },
     };
     let result = execute_step(
@@ -220,7 +222,7 @@ async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         |_, _| async { true },
     )
     .await;
-    assert!(matches!(result, Err(StepError::NoMatch)));
+    assert!(matches!(result, Err(StepError::NoMatch(_))));
     let broken = Step::LegacySelector {
         action: Action::Click {
             selector: "#no-longer-exists".into(),

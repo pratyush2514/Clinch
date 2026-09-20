@@ -11,7 +11,7 @@ mod user_agent;
 pub use local_storage::{StorageItem, build_hydration_script, read_local_storage};
 pub use paths::{cookie_db_candidates, local_base, resolve_profile_dir, user_data_dir};
 pub use profile::{BrowserSource, SyncRequest, ValidatedRequest, validate_portal};
-pub use reader::{Cookie, CookieSameSite, read_profile};
+pub use reader::{Cookie, CookieSameSite, ancestor_roots, read_profile, sso_secondaries};
 pub use service::{FallbackReason, PreparedSync, prepare};
 pub use user_agent::{build_user_agent, source_user_agent};
 

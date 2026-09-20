@@ -1,12 +1,14 @@
-# Clinch — Phase 0, Steps 1–4
+# Clinch — Local Action Studio (post–Phase A)
 
-Implements the desktop/session-sync scaffold and Phase A Invoice Harvester: checkpointed Task → Plan → Step execution, versioned CDP macros, deterministic replay, bounded local selector repair, Sentinel approvals, and a mirrored viewport. First-run planning uses a configured script. No ATS forms or scheduling.
+Implements the desktop/session-sync scaffold and the generic task runner: checkpointed Task → Plan → Step execution, versioned CDP macros, deterministic replay, bounded local selector repair, Sentinel approvals, and a mirrored viewport. First-run planning uses a configured script. No ATS forms or scheduling.
+
+Since then: hardened session sync (Edge, AES-256-GCM, Windows DPAPI with App-Bound detection, per-OS paths, shadow-copy reads, LocalStorage hydration, wildcard SSO cookies, UA mirroring, Brave-on-Windows default), headless-first replay with an embedded re-auth panel, a visual element picker, a loopback extension bridge (`packages/extension-bridge`), AX-tree + Set-of-Marks dynamic discovery, versioned Playbook schema with v1 migration, a step runner with approvals, persisted playbooks with save/list/run commands, a workflow builder, and a natural-language command bar. Current ledger: `docs/STATUS.md`.
 
 See [Phase A final integration](docs/PHASE_A_FINAL_INTEGRATION.md) for the Python/Ollama adapter setup, launch commands, and live-portal manual walkthrough.
 
 ## Run
 
-Prerequisites: Rust stable with the platform C/C++ build tools, Node 24, and an installed Chrome/Chromium executable. The product targets macOS; Windows builds support development and manual-login fallback, **not Windows cookie decryption**.
+Prerequisites: Rust stable with the platform C/C++ build tools, Node 24, and an installed Chrome/Chromium executable. The product targets macOS; Windows builds support development, manual-login fallback, and DPAPI cookie import (Brave recommended — Chrome 127+ seals its key with App-Bound encryption third-party apps cannot unwrap).
 
 ```sh
 npm ci
@@ -22,17 +24,18 @@ The desktop app initializes `clinch.db` in its platform app-data directory throu
 ```text
 Cargo.toml
 apps/desktop/                 React + TypeScript + Vite + Tailwind
-  src/                        Resizable shell, consent/fallback UI, dummy gate
-  src-tauri/                  Thin Tauri v2 commands and service wiring
+  src/                        Resizable shell, session UI, task workspace, workflow builder, command bar
+  src-tauri/                  Tauri v2 commands, service wiring, loopback extension bridge
 packages/
-  orchestration-engine/       Task state, SQLite checkpoints, Invoice Harvester
-  browser-driver/             Managed child + chromiumoxide CDP bridge
-  macro-engine/               Versioned JSON record/replay, selector repair flags
-  session-sync/               Consent, profile reader, decryption, fallback
-  filesystem-tool/            Reserved boundary
-  credential-vault/           keyring-core + macOS Keychain adapter
-  playbook-store/             SQLite WAL initialization; schemas deferred
+  orchestration-engine/       Task state, SQLite checkpoints, step runner, NL intent resolver
+  browser-driver/             Managed child + chromiumoxide CDP bridge, AX tree, Set-of-Marks, picker
+  macro-engine/               Versioned JSON record/replay, selector repair flags, semantic executor
+  session-sync/               Consent, per-OS paths, cookie + LocalStorage extraction, decryption, UA
+  filesystem-tool/            GUID download finalization without trusting server filenames
+  credential-vault/           keyring-core + macOS Keychain adapter, Windows DPAPI + App-Bound detection
+  playbook-store/             SQLite WAL initialization, versioned Playbook schema + persistence
   llm-provider/               Bounded local selector-repair adapter process
+  extension-bridge/           MV3 companion extension (plain JS, workspace-excluded)
 ```
 
 Dependency direction:
@@ -42,20 +45,22 @@ desktop -> session-sync -> credential-vault
 desktop -> browser-driver -> session-sync (cookie contract)
 desktop -> playbook-store -> sqlx/SQLite
 desktop -> orchestration-engine -> macro-engine -> browser-driver
+desktop -> orchestration-engine -> playbook-store (run + resolve)
+playbook-store -> macro-engine + browser-driver (Step schema types)
 orchestration-engine -> sqlx (shared application pool)
 browser-driver -> chromiumoxide -> native CDP WebSocket
 ```
 
 The filesystem-tool boundary remains reserved. UI uses `react-resizable-panels` and `cmdk`; task progress streams through a typed Tauri `Channel`, with no frontend polling.
 
-## Run the Invoice Harvester
+## Run a task
 
-1. Enter a stable HTTPS billing page URL (no query or fragment), then sync the session or sign in manually. Finish any login/2FA in the managed Chromium window.
-2. In **Invoice Harvester**, choose a workflow name and the CSS selector for invoice download links. If the starting page has a link to invoice history, supply that link's selector too.
-3. Click **Run Invoice Harvester**. The first successful run records its script into `macros/<workflow>.json` under app data. Reusing that workflow and URL loads the saved macro; new selector fields do not overwrite it.
+1. Enter a stable HTTPS portal page URL (no query or fragment), then sync the session or sign in manually. Finish any login/2FA in the managed Chromium window.
+2. In the **task workspace**, choose a workflow name and the CSS selector for download links. If the starting page has an intermediate same-origin link, supply that link's selector too.
+3. Click **Run Task**. The first successful run records its script into `macros/<workflow>.json` under app data. Reusing that workflow and URL loads the saved macro; new selector fields do not overwrite it.
 4. The step list reports live state, timings, DOM targets, and local download paths. Downloads are scoped to `downloads/<task-id>/`, use Chromium GUID filenames, and require a completed CDP download event plus a nonempty local file.
 
-The Phase A vocabulary is intentionally narrow: same-origin navigation links, non-secret filter inputs, and invoice download links (at most 25 per download step). Buttons that generate PDFs, new-tab downloads, cross-origin/CDN downloads, nested frames, and shadow DOM require additional adapters. No generic script evaluation, credential entry, or form submission is exposed through macros.
+The task vocabulary is intentionally narrow: same-origin navigation links, non-secret filter inputs, and file download links (at most 25 per download step). Buttons that generate PDFs, new-tab downloads, cross-origin/CDN downloads, nested frames, and shadow DOM require additional adapters. No generic script evaluation, credential entry, or form submission is exposed through macros.
 
 Task snapshots and append-only `task_checkpoints` are committed in SQLite WAL before dispatch and after each step. Macro publication is atomic and occurs only after all steps succeed. On restart, unfinished tasks become `interrupted`; uncertain actions are never retried automatically. Missing/ambiguous/invalid/invisible selectors yield a targeted repair request containing the step index, selector, reason, and target-versus-wait stage. Automatic LLM repair and resume are outside these steps. Failed/partial downloads may leave files in that run's directory; inspect it before starting a fresh run.
 
