@@ -101,6 +101,47 @@ impl PlaybookStore {
         Ok(playbook)
     }
 
+    /// Adopt an approved drift proposal for one semantic step: the previous
+    /// intent JSON lands in `signature_history` first (rollback by replay),
+    /// then the step takes the new signature and the whole playbook
+    /// re-validates before the upsert. Explicit-approval only — drift
+    /// detection itself never writes; unknown ids, out-of-range steps,
+    /// legacy steps, and invalid replacements all fail closed.
+    ///
+    /// # Errors
+    /// Returns not-found, invalid-definition, serialization, or database
+    /// errors.
+    pub async fn update_playbook_signature(
+        &self,
+        playbook_id: &str,
+        step_index: usize,
+        new_signature: &macro_engine::SemanticIntent,
+    ) -> Result<(), StoreError> {
+        let mut playbook = self.load_playbook(playbook_id).await?;
+        let step = playbook
+            .steps
+            .get_mut(step_index)
+            .ok_or(StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
+        let crate::schema::Step::Semantic { intent } = step else {
+            return Err(StoreError::Invalid(crate::schema::SchemaError::Invalid));
+        };
+        let previous_json = serde_json::to_string(&intent)?;
+        *intent = new_signature.clone();
+        playbook.validate()?;
+        let step_index = i64::try_from(step_index)
+            .map_err(|_| StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
+        sqlx::query(
+            "INSERT INTO signature_history(playbook_id, step_index, previous_json) VALUES(?, ?, ?)",
+        )
+        .bind(playbook_id)
+        .bind(step_index)
+        .bind(&previous_json)
+        .execute(&self.pool)
+        .await?;
+        self.save_playbook(&playbook).await?;
+        Ok(())
+    }
+
     /// Newest-first summaries for the workflow list. A single corrupt row
     /// fails the listing closed rather than silently hiding a workflow.
     ///
@@ -226,6 +267,14 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     )
     .execute(&pool)
     .await?;
+    // Signature history for approved self-healing: every adopted signature
+    // pushes its predecessor here first, so any drift update rolls back by
+    // replaying the latest row. Same additive story — no migration.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS signature_history (id INTEGER PRIMARY KEY AUTOINCREMENT, playbook_id TEXT NOT NULL, step_index INTEGER NOT NULL, previous_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await?;
     Ok(pool)
 }
 
@@ -261,6 +310,9 @@ mod tests {
                     role: "button".into(),
                     label_query: "Pay now".into(),
                     container_query: None,
+                    raw_prompt: String::new(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             }],
         )?)
@@ -286,6 +338,107 @@ mod tests {
         assert_eq!(listed[0].portal_url, "https://portal.example.com/");
         assert_eq!(listed[0].step_count, 1);
         assert!(!listed[0].updated_at.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signature_drift_emits_repair_event_without_db_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use browser_driver::AxElement;
+        use macro_engine::{ResolveOutcome, SemanticIntent};
+        let dir = tempfile::tempdir()?;
+        let pool = super::initialize(&dir.path().join("drift.db")).await?;
+        let store = PlaybookStore::new(pool.clone());
+        // Saved intent labels the control "Pay now"; the live portal shows
+        // "Pay Now!" — same control, drifted signature.
+        let id = store
+            .save_playbook(&Playbook::new(
+                "drift".into(),
+                url::Url::parse("https://portal.example.com/")?,
+                vec![Step::Semantic {
+                    intent: SemanticIntent {
+                        role: "button".into(),
+                        label_query: "Pay now".into(),
+                        container_query: None,
+                        raw_prompt: String::new(),
+                        ordinal_index: None,
+                        is_last: false,
+                    },
+                }],
+            )?)
+            .await?;
+        let live = vec![AxElement {
+            backend_node_id: 1,
+            role: "button".into(),
+            name: "Pay Now!".into(),
+            description: String::new(),
+            container_text: Vec::new(),
+        }];
+        let stored = store.load_playbook(&id).await?;
+        let crate::schema::Step::Semantic { intent } = &stored.steps[0] else {
+            panic!("semantic step stored");
+        };
+        // The drift path returns its repair event and touches nothing.
+        let ResolveOutcome::Drift { detail, .. } = macro_engine::resolve_with_drift(&live, intent)
+        else {
+            panic!("drift detected, not silence");
+        };
+        assert!(
+            detail.old_signature.contains("pay now"),
+            "{}",
+            detail.old_signature
+        );
+        assert!(
+            detail.new_signature.contains("pay now!"),
+            "{}",
+            detail.new_signature
+        );
+        assert_eq!(store.load_playbook(&id).await?.steps, stored.steps);
+        // Explicit approval adopts the proposal; the predecessor lands in
+        // history first for rollback.
+        let mut approved = intent.clone();
+        approved.label_query = "Pay Now!".into();
+        store.update_playbook_signature(&id, 0, &approved).await?;
+        let revived = store.load_playbook(&id).await?;
+        let crate::schema::Step::Semantic { intent: updated } = &revived.steps[0] else {
+            panic!("semantic step kept");
+        };
+        assert_eq!(updated.label_query, "Pay Now!");
+        let history: Vec<(String,)> =
+            sqlx::query_as("SELECT previous_json FROM signature_history WHERE playbook_id = ?")
+                .bind(&id)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(history.len(), 1);
+        assert!(history[0].0.contains("Pay now"), "{}", history[0].0);
+        // Unknown ids, out-of-range steps, and oversized replacements fail
+        // closed without writing history.
+        assert!(
+            store
+                .update_playbook_signature("9999", 0, &approved)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .update_playbook_signature(&id, 7, &approved)
+                .await
+                .is_err()
+        );
+        let mut invalid = approved.clone();
+        invalid.label_query = String::new();
+        assert!(
+            store
+                .update_playbook_signature(&id, 0, &invalid)
+                .await
+                .is_err()
+        );
+        let history: Vec<(String,)> =
+            sqlx::query_as("SELECT previous_json FROM signature_history WHERE playbook_id = ?")
+                .bind(&id)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(history.len(), 1);
         Ok(())
     }
 

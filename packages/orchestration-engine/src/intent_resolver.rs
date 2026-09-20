@@ -122,6 +122,333 @@ fn strip_id_label(run: &str) -> &str {
     run.get(start..).unwrap_or(run)
 }
 
+/// Rank table over the ordinal vocabulary already present in
+/// `NON_IDENTIFYING` — no new word lists. Words (`first`) and numerals
+/// (`1st`) share ranks; only the bare `last` is positional-by-time and
+/// handled separately below.
+const ORDINAL_RANKS: &[(&str, usize)] = &[
+    ("first", 0),
+    ("1st", 0),
+    ("second", 1),
+    ("2nd", 1),
+    ("third", 2),
+    ("3rd", 2),
+    ("fourth", 3),
+    ("4th", 3),
+    ("fifth", 4),
+    ("5th", 4),
+    ("sixth", 5),
+    ("6th", 5),
+    ("seventh", 6),
+    ("7th", 6),
+    ("eighth", 7),
+    ("8th", 7),
+    ("ninth", 8),
+    ("9th", 8),
+    ("tenth", 9),
+    ("10th", 9),
+];
+
+/// Time-unit words (a subset of `NON_IDENTIFYING`) that flip a bare `last`
+/// from positional to temporal: `last invoice` selects the final row, while
+/// `receipt for last week` carries no position at all.
+const TIME_QUALIFIERS: &[&str] = &[
+    "week",
+    "month",
+    "year",
+    "day",
+    "today",
+    "yesterday",
+    "tomorrow",
+    "ago",
+];
+
+/// Positional selection buried in a prompt: an explicit rank
+/// (`second`/`2nd` → 1) plus whether a bare, non-temporal `last` selects the
+/// final candidate. Ordinal words never reach labels or scopes (filtered by
+/// `NON_IDENTIFYING`), so this is purely additive — prompts without ordinals
+/// resolve exactly as before.
+fn parse_ordinal(prompt: &str) -> (Option<usize>, bool) {
+    let words: Vec<String> = prompt
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut index = None;
+    for word in &words {
+        if let Some((_, rank)) = ORDINAL_RANKS.iter().find(|(token, _)| token == word) {
+            index = Some(*rank);
+            break;
+        }
+    }
+    let has_last = words.iter().any(|word| word == "last");
+    let has_time = words
+        .iter()
+        .any(|word| TIME_QUALIFIERS.contains(&word.as_str()));
+    let is_last = index.is_none() && has_last && !has_time;
+    (index, is_last)
+}
+
+/// Dynamic value class for template extraction. Detection uses only the
+/// existing character-shape scanners plus quoted spans — no model, no new
+/// word lists beyond a tiny currency-code set documented below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariableKind {
+    Id,
+    Amount,
+    Date,
+    Entity,
+}
+
+/// One inferred template variable: its placeholder name, class, default
+/// value (the observed span), inferred field type, and a UI label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedVariable {
+    pub name: String,
+    pub kind: VariableKind,
+    pub default_value: String,
+    pub field_type: &'static str,
+    pub ui_label: String,
+}
+
+/// Prompt with dynamic spans replaced by placeholders, plus the variable
+/// schema in first-appearance order (deterministic, unlike a hash map).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariableExtraction {
+    pub template: String,
+    pub variables: Vec<ExtractedVariable>,
+}
+
+/// ISO-style currency codes for bare `120 EUR` amounts (`$`-amounts ride
+/// the existing amount scanner). Major settlement currencies only.
+const CURRENCY_CODES: &[&str] = &["eur", "usd", "gbp", "inr"];
+
+/// Upper bound on extracted variables per call: prompts are short, and the
+/// cap keeps pathological inputs bounded.
+const MAX_VARIABLES: usize = 8;
+
+/// Structured numeric runs that read as dates (`2026-09-20`, `20/09/2026`)
+/// rather than amounts: two-plus all-numeric groups joined by `-` or `/`.
+fn is_calendar_span(run: &str) -> bool {
+    let groups: Vec<&str> = run
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    groups.len() >= 2
+        && groups.iter().all(|part| part.chars().all(char::is_numeric))
+        && run.contains(['-', '/'])
+}
+
+/// Find every non-overlapping span matching `find_first` left to right.
+/// `find_first` returns the first span in its input (like the existing
+/// shape scanners); positions advance past each hit via substring search,
+/// which is boundary-safe because matches are always `&str` slices.
+fn collect_spans(text: &str, find_first: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while spans.len() < MAX_VARIABLES {
+        let Some(span) = find_first(rest) else {
+            break;
+        };
+        let Some(offset) = rest.find(span.as_str()) else {
+            break;
+        };
+        spans.push(span.clone());
+        rest = rest.get(offset + span.len()..).unwrap_or("");
+    }
+    spans
+}
+
+/// Bare `120 EUR`-style amounts: ASCII digits (with `,`/`.`) plus one space
+/// plus a currency code, case-insensitive.
+fn find_code_amount(text: &str) -> Option<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for pair in words.windows(2) {
+        let (amount, code) = (pair[0], pair[1]);
+        let code = code.trim_matches(|c: char| !c.is_alphanumeric());
+        if !CURRENCY_CODES.contains(&code.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let digits = amount.trim_matches(|c: char| !c.is_alphanumeric());
+        if digits.is_empty()
+            || !digits
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            || !digits.chars().any(char::is_numeric)
+        {
+            continue;
+        }
+        let span = format!("{digits} {code}");
+        if text.contains(&span) {
+            return Some(span);
+        }
+        let span = format!("{amount} {code}");
+        if text.contains(&span) {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// Double-quoted entities (`"subheader.lol"`), shortest pairs first via
+/// left-to-right scan. Empty quotes and multi-line spans never qualify.
+fn find_quoted(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < bytes.len() && bytes[end] != b'"' && bytes[end] != b'\n' {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'"' && end > index + 1 {
+            if let Some(span) = text.get(index..=end)
+                && span.len() <= 66
+            {
+                return Some(span.to_owned());
+            }
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+/// Extract invisible dynamic variables from the uttered prompt first, then
+/// grounded surroundings: template slots cover prompt spans, while the
+/// schema additionally records matching spans observed in the label and
+/// container (untemplated, usable as prefill evidence). Reuses the existing
+/// shape scanners, so no new pattern vocabulary beyond currency codes.
+#[must_use]
+pub fn extract_dynamic_variables(
+    prompt: &str,
+    grounded_label: &str,
+    container_text: &str,
+) -> VariableExtraction {
+    // (span, kind) in scan order: amounts before ids so `$45.00` wins over
+    // its bare `45.00` run; calendar runs classify as dates, the rest as ids.
+    let mut found: Vec<(String, VariableKind)> = Vec::new();
+    let mut push = |span: String, kind: VariableKind| {
+        if found.len() < MAX_VARIABLES
+            && !found.iter().any(|(seen, _)| seen == &span)
+            && !found
+                .iter()
+                .any(|(seen, _)| span.len() < seen.len() && seen.contains(span.as_str()))
+        {
+            found.push((span, kind));
+        }
+    };
+    for span in collect_spans(prompt, extract_amount) {
+        push(span, VariableKind::Amount);
+    }
+    for span in collect_spans(prompt, find_code_amount) {
+        push(span, VariableKind::Amount);
+    }
+    for span in collect_spans(prompt, extract_identifier) {
+        if is_calendar_span(&span) {
+            push(span, VariableKind::Date);
+        } else {
+            push(span, VariableKind::Id);
+        }
+    }
+    if let Some(span) = extract_month_day(prompt) {
+        push(span, VariableKind::Date);
+    }
+    for span in collect_spans(prompt, find_quoted) {
+        push(span, VariableKind::Entity);
+    }
+    // Grounded surroundings: only spans already shaped above, merged without
+    // duplicating the template slots.
+    for text in [grounded_label, container_text] {
+        for span in collect_spans(text, extract_identifier) {
+            if prompt.contains(span.as_str()) {
+                continue;
+            }
+            if is_calendar_span(&span) {
+                push(span, VariableKind::Date);
+            } else {
+                push(span, VariableKind::Id);
+            }
+        }
+    }
+    let variables = name_spans(prompt, &found);
+    // Longest spans first so `$45.00` templates before a bare `45.00` could;
+    // spans already swallowed check out via containment and are skipped.
+    let mut template = prompt.to_owned();
+    let mut ordered: Vec<(String, String)> = found
+        .iter()
+        .zip(variables.iter())
+        .map(|((span, _), variable)| (span.clone(), variable.name.clone()))
+        .collect();
+    ordered.sort_by_key(|slot| std::cmp::Reverse(slot.0.len()));
+    for (span, name) in ordered {
+        if template.contains(span.as_str()) {
+            template = template.replace(span.as_str(), &format!("{{{{{name}}}}}"));
+        }
+    }
+    VariableExtraction {
+        template,
+        variables,
+    }
+}
+
+/// Name collected spans with placeholder, type, and UI metadata. The first
+/// ID becomes `invoice_id` when the prompt mentions invoices, else `id`;
+/// repeats take numeric suffixes. Pure naming — no scanning here.
+fn name_spans(prompt: &str, found: &[(String, VariableKind)]) -> Vec<ExtractedVariable> {
+    let invoiced = prompt.to_ascii_lowercase().contains("invoice");
+    let mut counters = [0_usize; 4];
+    let mut variables = Vec::new();
+    for (span, kind) in found {
+        let slot = slot_for(*kind, &mut counters, invoiced);
+        variables.push(ExtractedVariable {
+            name: slot.0,
+            kind: *kind,
+            default_value: span.clone(),
+            field_type: slot.2,
+            ui_label: slot.1,
+        });
+    }
+    variables
+}
+
+/// Placeholder, UI label, and field type for the next span of one kind.
+/// Counter advances here so naming stays in one place.
+fn slot_for(
+    kind: VariableKind,
+    counters: &mut [usize; 4],
+    invoiced: bool,
+) -> (String, String, &'static str) {
+    let cell = match kind {
+        VariableKind::Id => &mut counters[0],
+        VariableKind::Amount => &mut counters[1],
+        VariableKind::Date => &mut counters[2],
+        VariableKind::Entity => &mut counters[3],
+    };
+    *cell += 1;
+    let count = *cell;
+    let (base, label, field_type) = match kind {
+        VariableKind::Id if invoiced => ("invoice_id", "Invoice ID", "text"),
+        VariableKind::Id => ("id", "ID", "text"),
+        VariableKind::Amount => ("amount", "Amount", "number"),
+        VariableKind::Date => ("date", "Date", "date"),
+        VariableKind::Entity => ("entity_name", "Entity name", "text"),
+    };
+    if count <= 1 {
+        (base.to_owned(), label.to_owned(), field_type)
+    } else {
+        (
+            format!("{base}_{count}"),
+            format!("{label} {count}"),
+            field_type,
+        )
+    }
+}
+
 /// Structured intent extracted from a free-form prompt: the primary action
 /// label plus key target identifiers, dates, amounts, or text snippets
 /// normalized for container matching. Produced by the AI pass when a provider
@@ -499,6 +826,85 @@ pub enum CommandMatch {
 /// flow: recordings have no parameter slots, so replay would silently run
 /// the wrong target set. Identified prompts always take the dynamic path.
 ///
+/// Split a composite prompt on multi-action connectors (`and`, `then`,
+/// `, then`, case-insensitive) into ordered non-empty segments. Matching is
+/// longest-separator-first so `", then "` never leaves a stray comma, and
+/// byte ranges come from an ASCII-lowercased mirror (length-preserving), so
+/// slicing the original is always boundary-safe.
+fn split_conjunctions(prompt: &str) -> Vec<&str> {
+    // Longest separator first: `", then "` must win over `" then "` so no
+    // stray comma survives on the left segment.
+    const SEPARATORS: &[&[char]] = &[
+        &[',', ' ', 't', 'h', 'e', 'n', ' '],
+        &[' ', 't', 'h', 'e', 'n', ' '],
+        &[' ', 'a', 'n', 'd', ' '],
+    ];
+    let bytes: Vec<(usize, char)> = prompt.char_indices().collect();
+    let lower: Vec<char> = bytes
+        .iter()
+        .map(|(_, character)| character.to_ascii_lowercase())
+        .collect();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < lower.len() {
+        let mut matched = 0;
+        for separator in SEPARATORS {
+            if lower[index..].starts_with(separator) {
+                matched = separator.len();
+                break;
+            }
+        }
+        if matched > 0 {
+            push_segment(prompt, &bytes, start, index, &mut segments);
+            index += matched;
+            start = index;
+        } else {
+            index += 1;
+        }
+    }
+    push_segment(prompt, &bytes, start, index, &mut segments);
+    segments
+}
+
+/// Push `chars[start..end]` trimmed, skipping empties (leading/trailing or
+/// doubled connectors contribute nothing).
+fn push_segment<'a>(
+    prompt: &'a str,
+    bytes: &[(usize, char)],
+    start: usize,
+    end: usize,
+    segments: &mut Vec<&'a str>,
+) {
+    if start >= end {
+        return;
+    }
+    let from = bytes.get(start).map_or(prompt.len(), |(offset, _)| *offset);
+    let to = bytes.get(end).map_or(prompt.len(), |(offset, _)| *offset);
+    let segment = prompt.get(from..to).unwrap_or("").trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+}
+
+/// Decompose a composite prompt into an ordered step sequence, resolving
+/// each segment through [`resolve_command`]. Single-action prompts yield a
+/// single-element vec, so this is a strict generalization of the
+/// single-step path — which stays untouched (dispatch still consumes one
+/// [`CommandMatch`); sequencing execution across these steps is future
+/// runner work, not a behavior change here.
+#[must_use]
+pub fn decompose_command(
+    prompt: &str,
+    connected_origin: Option<&url::Url>,
+    saved: &[PlaybookSummary],
+) -> Vec<CommandMatch> {
+    split_conjunctions(prompt)
+        .into_iter()
+        .filter_map(|segment| resolve_command(segment, connected_origin, saved))
+        .collect()
+}
+
 /// `connected_origin` is presence-checked only — callers supply the portal
 /// for session scoping and execution.
 #[must_use]
@@ -571,11 +977,23 @@ pub fn resolve_command(
         |id| prompt.replacen(id.as_str(), "", 1),
     );
     let role_keywords = content_tokens(&cleaned);
+    // Pass-through: the raw conversational prompt travels verbatim (bounded)
+    // so sub-token coverage grounds against the live DOM labels as the
+    // dictionary. Inference above stays — saved-playbook token routing, role
+    // inference, previews, and ephemeral names all need the stripped
+    // label/scope forms, and the coverage path itself uses zero dictionaries.
+    // Ordinals ride along the same way (deterministic for both AI and
+    // fallback paths): position words never pollute labels or scopes.
+    let raw_prompt: String = prompt.chars().take(2000).collect();
+    let (ordinal_index, is_last) = parse_ordinal(prompt);
     Some(CommandMatch::Ephemeral {
         intent: SemanticIntent {
             role: role_for(&role_keywords).to_owned(),
             label_query: parsed.label_query,
             container_query: parsed.container_query,
+            raw_prompt,
+            ordinal_index,
+            is_last,
         },
     })
 }
@@ -651,6 +1069,9 @@ mod tests {
                     role: "link".into(),
                     label_query: "com".into(),
                     container_query: None,
+                    raw_prompt: "com".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
@@ -670,6 +1091,9 @@ mod tests {
                     role: "link".into(),
                     label_query: "report".into(),
                     container_query: Some("0LWQXDWW".into()),
+                    raw_prompt: "download github report 0LWQXDWW".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
@@ -697,6 +1121,9 @@ mod tests {
                         role: role.into(),
                         label_query: label.into(),
                         container_query: None,
+                        raw_prompt: prompt.into(),
+                        ordinal_index: None,
+                        is_last: false,
                     },
                 }),
                 "{prompt}"
@@ -773,10 +1200,56 @@ mod tests {
                     role: "link".into(),
                     label_query: "invoice".into(),
                     container_query: Some("0LWQXDWW".into()),
+                    raw_prompt: "download invoice for ID:0LWQXDWW".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn variable_extractor_detects_ids_and_amounts_cleanly() {
+        // Grounded scenario: the ID appears in both prompt and container but
+        // templates exactly once; the schema carries type and UI metadata.
+        let extraction = extract_dynamic_variables(
+            "download invoice for 1TUEWZUA",
+            "Download invoice",
+            "Invoice 1TUEWZUA",
+        );
+        assert_eq!(extraction.template, "download invoice for {{invoice_id}}");
+        assert_eq!(extraction.variables.len(), 1);
+        let variable = &extraction.variables[0];
+        assert_eq!(variable.name, "invoice_id");
+        assert_eq!(variable.kind, VariableKind::Id);
+        assert_eq!(variable.default_value, "1TUEWZUA");
+        assert_eq!(variable.field_type, "text");
+        assert_eq!(variable.ui_label, "Invoice ID");
+        // Amounts, dates, and quoted entities classify distinctly.
+        let extraction =
+            extract_dynamic_variables("pay $45.00 on Sep 17 for \"subheader.lol\"", "", "");
+        assert_eq!(
+            extraction.template,
+            "pay {{amount}} on {{date}} for {{entity_name}}"
+        );
+        let kinds: Vec<VariableKind> = extraction
+            .variables
+            .iter()
+            .map(|variable| variable.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                VariableKind::Amount,
+                VariableKind::Date,
+                VariableKind::Entity
+            ]
+        );
+        // Plain prompts stay literal with an empty schema.
+        let extraction = extract_dynamic_variables("toggle dark mode", "", "");
+        assert_eq!(extraction.template, "toggle dark mode");
+        assert!(extraction.variables.is_empty());
     }
 
     #[test]
@@ -790,6 +1263,9 @@ mod tests {
                     role: "link".into(),
                     label_query: "report".into(),
                     container_query: Some("0LWQXDWW".into()),
+                    raw_prompt: "download report for ID 0LWQXDWW".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
@@ -801,6 +1277,9 @@ mod tests {
                     role: "link".into(),
                     label_query: "0LWQXDWW".into(),
                     container_query: Some("0LWQXDWW".into()),
+                    raw_prompt: "0LWQXDWW".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
@@ -812,6 +1291,9 @@ mod tests {
                     role: "link".into(),
                     label_query: "mode".into(),
                     container_query: None,
+                    raw_prompt: "toggle dark mode".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
@@ -831,6 +1313,9 @@ mod tests {
                         role: "link".into(),
                         label_query: "x".into(),
                         container_query: None,
+                        raw_prompt: String::new(),
+                        ordinal_index: None,
+                        is_last: false,
                     },
                 }],
             )?;
@@ -885,9 +1370,136 @@ mod tests {
                     role: "link".into(),
                     label_query: "invoice".into(),
                     container_query: Some("0lwqxdww".into()),
+                    raw_prompt: "download invoice for ID 0lwqxdww".into(),
+                    ordinal_index: None,
+                    is_last: false,
                 },
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn navigation_verbs_isolate_target_labels() -> Result<(), url::ParseError> {
+        // Verb isolation lives in the deterministic fallback (there is no
+        // LLM system prompt in-tree: the provider speaks the JSON contract
+        // and the fallback must already separate verbs from targets, since
+        // it runs whenever the provider is unset). Navigation verbs never
+        // leak into the label; the role carries the click/navigate action
+        // (`link` here — `SemanticIntent` has no separate action field, and
+        // labels normalize to lowercase for case-insensitive matching).
+        let portal = portal()?;
+        for (prompt, label) in [
+            ("open the Analytics", "analytics"),
+            ("open the Deployments", "deployments"),
+        ] {
+            assert_eq!(
+                resolve_command(prompt, Some(&portal), &[]),
+                Some(CommandMatch::Ephemeral {
+                    intent: SemanticIntent {
+                        role: "link".into(),
+                        label_query: label.into(),
+                        container_query: None,
+                        raw_prompt: prompt.into(),
+                        ordinal_index: None,
+                        is_last: false,
+                    },
+                }),
+                "{prompt}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinals_parse_to_positions_without_polluting_labels() -> Result<(), url::ParseError> {
+        // Rank words reuse the existing ordinal vocabulary; a bare `last`
+        // beside time words stays temporal (no position).
+        assert_eq!(
+            parse_ordinal("download the second invoice"),
+            (Some(1), false)
+        );
+        assert_eq!(parse_ordinal("click the 2nd button"), (Some(1), false));
+        assert_eq!(parse_ordinal("open the first report"), (Some(0), false));
+        assert_eq!(parse_ordinal("open the last invoice"), (None, true));
+        assert_eq!(
+            parse_ordinal("get the receipt for last week"),
+            (None, false)
+        );
+        assert_eq!(parse_ordinal("toggle dark mode"), (None, false));
+        // End to end: position rides the ephemeral intent, label stays clean.
+        let portal = portal()?;
+        assert_eq!(
+            resolve_command("download the second invoice", Some(&portal), &[]),
+            Some(CommandMatch::Ephemeral {
+                intent: SemanticIntent {
+                    role: "link".into(),
+                    label_query: "invoice".into(),
+                    container_query: None,
+                    raw_prompt: "download the second invoice".into(),
+                    ordinal_index: Some(1),
+                    is_last: false,
+                },
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_prompt_decomposes_into_sequential_steps() -> Result<(), url::ParseError> {
+        let portal = portal()?;
+        // Two connectors, two ordered ephemeral intents; each segment keeps
+        // its own label, raw prompt, and position data.
+        let steps = decompose_command("open settings and turn off dark mode", Some(&portal), &[]);
+        assert_eq!(
+            steps,
+            vec![
+                CommandMatch::Ephemeral {
+                    intent: SemanticIntent {
+                        role: "link".into(),
+                        label_query: "settings".into(),
+                        container_query: None,
+                        raw_prompt: "open settings".into(),
+                        ordinal_index: None,
+                        is_last: false,
+                    },
+                },
+                CommandMatch::Ephemeral {
+                    intent: SemanticIntent {
+                        role: "link".into(),
+                        label_query: "mode".into(),
+                        container_query: None,
+                        raw_prompt: "turn off dark mode".into(),
+                        ordinal_index: None,
+                        is_last: false,
+                    },
+                },
+            ]
+        );
+        // Comma-then splits without leaving punctuation on either side, and
+        // single-action prompts stay single-element.
+        let steps = decompose_command("open settings, then turn off dark mode", Some(&portal), &[]);
+        assert_eq!(steps.len(), 2);
+        // Case-insensitive connectors split identically; only the pass-through
+        // raw text keeps its original casing.
+        let loud = decompose_command("OPEN SETTINGS AND TURN OFF DARK MODE", Some(&portal), &[]);
+        let shape = |steps: &[CommandMatch]| -> Vec<String> {
+            steps
+                .iter()
+                .map(|step| match step {
+                    CommandMatch::Saved { id } => format!("saved:{id}"),
+                    CommandMatch::Ephemeral { intent } => {
+                        format!("{}:{}", intent.role, intent.label_query)
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(shape(&steps), shape(&loud));
+        assert_eq!(
+            decompose_command("toggle dark mode", Some(&portal), &[]).len(),
+            1
+        );
+        assert!(decompose_command("", Some(&portal), &[]).is_empty());
         Ok(())
     }
 

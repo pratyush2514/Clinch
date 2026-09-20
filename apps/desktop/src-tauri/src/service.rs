@@ -757,6 +757,9 @@ impl AppService {
             role,
             label_query: label,
             container_query: None,
+            raw_prompt: String::new(),
+            ordinal_index: None,
+            is_last: false,
         };
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         let portal = self
@@ -1484,6 +1487,9 @@ mod tests {
                             role: "button".into(),
                             label_query: "Pay".into(),
                             container_query: None,
+                            raw_prompt: String::new(),
+                            ordinal_index: None,
+                            is_last: false,
                         },
                     }],
                 )

@@ -5,8 +5,9 @@ use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
 pub use executor::{
-    IntentError, IntentOutcome, ResolvedIntent, SemanticIntent, execute_intent,
-    grounding_diagnostic, resolve_intent,
+    DriftDetail, FastReplayMetrics, IntentError, IntentOutcome, RESOLVE_COST_USD, ResolveOutcome,
+    ResolvedIntent, SemanticIntent, execute_intent, grounding_diagnostic, resolve_fast,
+    resolve_intent, resolve_with_drift,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};

@@ -14,8 +14,13 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Interactive AX roles surfaced to planners.
-const INTERACTIVE_ROLES: &[&str] = &["button", "link", "textbox", "combobox", "menuitem"];
+/// Interactive AX roles surfaced to planners, normalized to lowercase at
+/// discovery (`Tab` → `tab`). Roles stay plain strings — the equivalent of
+/// an `AxRole` enum without churning the serialized `AxElement` wire shape
+/// (`deny_unknown_fields` payloads, previews, TS types) for zero behavior
+/// gain. `tab` covers tabbed navigation; its `tablist` parent bounds
+/// context (see `CONTAINER_ROLES`), it never needs its own entry here.
+const INTERACTIVE_ROLES: &[&str] = &["button", "link", "textbox", "combobox", "menuitem", "tab"];
 /// Upper bound on returned elements; CDP document order keeps the visible
 /// controls first, so truncation drops deep hidden subtrees, not the page.
 const MAX_ELEMENTS: usize = 300;
@@ -147,8 +152,9 @@ fn container_text(
     /// the row/card/item shares this container, so sibling-cell leaf text
     /// (IDs, amounts, dates) reaches each of its buttons. ARIA semantics
     /// reported by the tree — grouping markup such as `fieldset` surfaces
-    /// here as `group`, so no separate entry exists for those spellings.
-    const CONTAINER_ROLES: &[&str] = &["row", "listitem", "article", "group", "tr"];
+    /// here as `group`, and tab strips surface as `tablist`, so no separate
+    /// entries exist for those spellings.
+    const CONTAINER_ROLES: &[&str] = &["row", "listitem", "article", "group", "tr", "tablist"];
     /// Cell-level AX roles (plus Chrome's `cell`/header spellings). A
     /// button's own cell never holds its siblings' evidence, so these stay
     /// transparent while climbing: the walk passes through them toward the
@@ -443,6 +449,58 @@ mod tests {
         assert_eq!(elements[0].backend_node_id, 11);
         assert_eq!(elements[0].role, "button");
         assert_eq!(elements[0].name, "Sign in");
+        Ok(())
+    }
+
+    #[test]
+    fn tab_and_tablist_roles_map_cleanly() -> Result<(), Box<dyn std::error::Error>> {
+        // Capitalized CDP roles normalize to lowercase strings; tabs surface
+        // as interactive controls while the tablist bounds their context.
+        let nodes = vec![
+            linked(
+                "strip",
+                Some("tablist"),
+                Some("Views"),
+                None,
+                &["t1", "t2"],
+                false,
+                None,
+            )?,
+            linked(
+                "t1",
+                Some("Tab"),
+                Some("Analytics"),
+                Some("strip"),
+                &[],
+                false,
+                Some(51),
+            )?,
+            linked(
+                "t2",
+                Some("tab"),
+                Some("Deployments"),
+                Some("strip"),
+                &[],
+                false,
+                Some(52),
+            )?,
+        ];
+        let elements = interactive_elements(&nodes);
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].role, "tab");
+        assert_eq!(elements[0].name, "Analytics");
+        assert_eq!(elements[1].role, "tab");
+        // The shared tablist name plus sibling tab text reach each tab, the
+        // same sibling-attachment rows rely on; distinct tab labels still
+        // disambiguate downstream.
+        assert_eq!(
+            elements[0].container_text,
+            vec!["Views".to_owned(), "Deployments".to_owned()]
+        );
+        assert_eq!(
+            elements[1].container_text,
+            vec!["Views".to_owned(), "Analytics".to_owned()]
+        );
         Ok(())
     }
 

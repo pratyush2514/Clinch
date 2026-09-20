@@ -48,6 +48,9 @@ async fn intent_executes_without_selectors() -> Result<(), Box<dyn std::error::E
                 role: "button".into(),
                 label_query: "Pay now".into(),
                 container_query: None,
+                raw_prompt: String::new(),
+                ordinal_index: None,
+                is_last: false,
             },
         ),
     )
@@ -103,6 +106,9 @@ async fn container_context_disambiguates_duplicate_buttons()
                 role: "button".into(),
                 label_query: "statement".into(),
                 container_query: None,
+                raw_prompt: String::new(),
+                ordinal_index: None,
+                is_last: false,
             },
         ),
     )
@@ -161,6 +167,9 @@ async fn container_query_vetoes_out_of_scope_controls_live()
                 role: "button".into(),
                 label_query: "download".into(),
                 container_query: Some("settings".into()),
+                raw_prompt: String::new(),
+                ordinal_index: None,
+                is_last: false,
             },
         ),
     )

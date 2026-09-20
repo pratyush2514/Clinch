@@ -105,6 +105,9 @@ fn pay_intent() -> Step {
             role: "button".into(),
             label_query: "Pay now".into(),
             container_query: None,
+            raw_prompt: String::new(),
+            ordinal_index: None,
+            is_last: false,
         },
     }
 }
@@ -209,6 +212,9 @@ async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
             role: "button".into(),
             label_query: "No such control anywhere".into(),
             container_query: None,
+            raw_prompt: String::new(),
+            ordinal_index: None,
+            is_last: false,
         },
     };
     let result = execute_step(

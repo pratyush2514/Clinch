@@ -198,6 +198,9 @@ mod tests {
                 role: "button".into(),
                 label_query: "Pay".into(),
                 container_query: None,
+                raw_prompt: String::new(),
+                ordinal_index: None,
+                is_last: false,
             },
         }
     }

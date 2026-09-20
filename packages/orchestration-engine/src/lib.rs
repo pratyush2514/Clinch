@@ -6,8 +6,9 @@ mod store;
 mod task;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use intent_resolver::{
-    CommandMatch, ParsedIntent, ephemeral_name, extract_identifier, parse_intent_structured,
-    resolve_command,
+    CommandMatch, ExtractedVariable, ParsedIntent, VariableExtraction, VariableKind,
+    decompose_command, ephemeral_name, extract_dynamic_variables, extract_identifier,
+    parse_intent_structured, resolve_command,
 };
 use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use runner::{
