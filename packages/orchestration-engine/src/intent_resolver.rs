@@ -26,14 +26,14 @@ const STOPWORDS: &[&str] = &[
 const URL_NOISE: &[&str] = &["https", "http", "www", "com", "org", "net", "io", "dev"];
 
 /// Lowercase alphanumeric tokens of length two or more.
-fn tokens(text: &str) -> Vec<String> {
+pub(crate) fn tokens(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|part| part.len() > 1)
         .map(str::to_ascii_lowercase)
         .collect()
 }
 
-fn content_tokens(text: &str) -> Vec<String> {
+pub(crate) fn content_tokens(text: &str) -> Vec<String> {
     tokens(text)
         .into_iter()
         .filter(|token| !STOPWORDS.contains(&token.as_str()))
@@ -518,13 +518,30 @@ const STATUS_WORDS: &[&str] = &[
     "due",
 ];
 
+/// Collection words marking plural intent (`all invoices`). Like ordinals,
+/// they describe *which* matches, not *what* to click, so they stay out of
+/// labels too (`"download all"` labels `download`). Detection reads the same
+/// list via [`PLURAL_MARKERS`]; nothing here is new vocabulary.
+pub(crate) const PLURAL_MARKERS: &[&str] = &["all", "every", "each"];
+
+/// Whether the prompt asks for every matching control rather than one.
+/// Exact token match only (`overall` never counts as `all`).
+fn parse_plural(prompt: &str) -> bool {
+    tokens(prompt)
+        .iter()
+        .any(|token| PLURAL_MARKERS.contains(&token.as_str()))
+}
+
 /// Tokens that must never become a label or veto a container: ordinals and
 /// positional words (`second`), relative-time words (`last week`), generic
 /// list words, prepositions, month names, and pure numbers. They describe
 /// *which* match, not *what* to click, so filtering them keeps free-form
 /// prompts (`"second invoice"`, `"receipt for last week"`) matching instead
 /// of failing closed on words the DOM never contains.
-const NON_IDENTIFYING: &[&str] = &[
+pub(crate) const NON_IDENTIFYING: &[&str] = &[
+    "all",
+    "every",
+    "each",
     "first",
     "second",
     "third",
@@ -677,6 +694,42 @@ fn label_keywords(prompt: &str) -> Vec<String> {
         .into_iter()
         .filter(|token| !is_non_identifying(token.as_str()))
         .collect()
+}
+
+/// Singular stem for anchor matching: one trailing `s` off longer tokens,
+/// never `ss`. Mirrors the executor's plural tolerance; over-stripping is
+/// harmless downstream because matching is substring-based (`analytic`
+/// still sits inside `Analytics`), while under-stripping would miss
+/// (`invoices` never contains `invoice`).
+fn singular_stem(token: &str) -> String {
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        token[..token.len() - 1].to_owned()
+    } else {
+        token.to_owned()
+    }
+}
+
+/// Primary target noun: the last identifying keyword of the
+/// identifier-stripped prompt — the same stream the label comes from —
+/// stemmed (`download all my invoices` → `invoice`), skipping the
+/// connected portal's own host tokens (`download all my invoices from
+/// github` still anchors `invoice`, never the `github` trailer — the same
+/// host/plumbing split the saved path uses). Collection modifiers never
+/// survive filtering, so the noun is always the content word — never `all`.
+/// `None` when stripping leaves no keywords (a lone identifier scopes by
+/// container instead and needs no anchor).
+fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Option<String> {
+    let host_tokens: Vec<String> = connected_origin.map_or_else(Vec::new, |origin| {
+        content_tokens(origin.as_str())
+            .into_iter()
+            .filter(|token| !URL_NOISE.contains(&token.as_str()))
+            .collect()
+    });
+    label_keywords(prompt)
+        .into_iter()
+        .rev()
+        .find(|token| !host_tokens.contains(token))
+        .map(|token| singular_stem(token.as_str()))
 }
 
 /// Deterministic structured fallback: instant, offline, no model call.
@@ -947,11 +1000,18 @@ pub fn resolve_command(
     // the prompt target-specific. A prompt holding nothing but a scope still
     // runs: the scope doubles as a last-resort label.
     let quick = deterministic_parse(prompt);
+    // Plural prompts never replay a static saved flow either: a one-click
+    // recording cannot honor "all/every/each", and replay would silently act
+    // once instead of batching. Like identifiers, plurality forces the
+    // dynamic path even when a name matches — still no model call, so saved
+    // replays stay instant.
+    let plural = parse_plural(prompt);
     // A specific scope with a static saved flow always takes the dynamic path
     // even when a name matches.
-    if quick
-        .as_ref()
-        .is_none_or(|parsed| parsed.container_query.is_none())
+    if !plural
+        && quick
+            .as_ref()
+            .is_none_or(|parsed| parsed.container_query.is_none())
         && let Some((playbook, _)) = best
     {
         return Some(CommandMatch::Saved {
@@ -963,8 +1023,10 @@ pub fn resolve_command(
     // back instantly; saved replays above never waited on a model.
     let parsed = parse_intent_structured(prompt)?;
     // The provider may find a scope the cheap pass missed: re-check saved so
-    // a newly-scoped prompt cannot slip into a static replay.
-    if parsed.container_query.is_none()
+    // a newly-scoped prompt cannot slip into a static replay. Plurality was
+    // already decided above and holds here too.
+    if !plural
+        && parsed.container_query.is_none()
         && let Some((playbook, _)) = best
     {
         return Some(CommandMatch::Saved {
@@ -986,6 +1048,7 @@ pub fn resolve_command(
     // fallback paths): position words never pollute labels or scopes.
     let raw_prompt: String = prompt.chars().take(2000).collect();
     let (ordinal_index, is_last) = parse_ordinal(prompt);
+    let primary_target_noun = extract_primary_noun(&cleaned, connected_origin);
     Some(CommandMatch::Ephemeral {
         intent: SemanticIntent {
             role: role_for(&role_keywords).to_owned(),
@@ -994,6 +1057,9 @@ pub fn resolve_command(
             raw_prompt,
             ordinal_index,
             is_last,
+            is_plural: parse_plural(prompt),
+            entry_url: None,
+            primary_target_noun,
         },
     })
 }
@@ -1072,6 +1138,9 @@ mod tests {
                     raw_prompt: "com".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("com".into()),
                 },
             })
         );
@@ -1094,6 +1163,9 @@ mod tests {
                     raw_prompt: "download github report 0LWQXDWW".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("report".into()),
                 },
             })
         );
@@ -1109,11 +1181,11 @@ mod tests {
     fn ephemeral_intents_infer_role_and_label() -> Result<(), url::ParseError> {
         let portal = portal()?;
         let cases = [
-            ("fill expense report", "textbox", "report"),
-            ("click pay now", "button", "pay"),
-            ("open dashboard", "link", "dashboard"),
+            ("fill expense report", "textbox", "report", "report"),
+            ("click pay now", "button", "pay", "pay"),
+            ("open dashboard", "link", "dashboard", "dashboard"),
         ];
-        for (prompt, role, label) in cases {
+        for (prompt, role, label, noun) in cases {
             assert_eq!(
                 resolve_command(prompt, Some(&portal), &[]),
                 Some(CommandMatch::Ephemeral {
@@ -1124,6 +1196,9 @@ mod tests {
                         raw_prompt: prompt.into(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: Some(noun.into()),
                     },
                 }),
                 "{prompt}"
@@ -1203,6 +1278,9 @@ mod tests {
                     raw_prompt: "download invoice for ID:0LWQXDWW".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("invoice".into()),
                 },
             })
         );
@@ -1266,6 +1344,9 @@ mod tests {
                     raw_prompt: "download report for ID 0LWQXDWW".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("report".into()),
                 },
             })
         );
@@ -1280,6 +1361,9 @@ mod tests {
                     raw_prompt: "0LWQXDWW".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: None,
                 },
             })
         );
@@ -1294,6 +1378,9 @@ mod tests {
                     raw_prompt: "toggle dark mode".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("mode".into()),
                 },
             })
         );
@@ -1316,6 +1403,9 @@ mod tests {
                         raw_prompt: String::new(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: None,
                     },
                 }],
             )?;
@@ -1373,6 +1463,9 @@ mod tests {
                     raw_prompt: "download invoice for ID 0lwqxdww".into(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("invoice".into()),
                 },
             })
         );
@@ -1389,9 +1482,9 @@ mod tests {
         // (`link` here — `SemanticIntent` has no separate action field, and
         // labels normalize to lowercase for case-insensitive matching).
         let portal = portal()?;
-        for (prompt, label) in [
-            ("open the Analytics", "analytics"),
-            ("open the Deployments", "deployments"),
+        for (prompt, label, noun) in [
+            ("open the Analytics", "analytics", "analytic"),
+            ("open the Deployments", "deployments", "deployment"),
         ] {
             assert_eq!(
                 resolve_command(prompt, Some(&portal), &[]),
@@ -1403,6 +1496,9 @@ mod tests {
                         raw_prompt: prompt.into(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: Some(noun.into()),
                     },
                 }),
                 "{prompt}"
@@ -1439,6 +1535,9 @@ mod tests {
                     raw_prompt: "download the second invoice".into(),
                     ordinal_index: Some(1),
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: Some("invoice".into()),
                 },
             })
         );
@@ -1462,6 +1561,9 @@ mod tests {
                         raw_prompt: "open settings".into(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: Some("setting".into()),
                     },
                 },
                 CommandMatch::Ephemeral {
@@ -1472,6 +1574,9 @@ mod tests {
                         raw_prompt: "turn off dark mode".into(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: Some("mode".into()),
                     },
                 },
             ]
@@ -1500,6 +1605,102 @@ mod tests {
             1
         );
         assert!(decompose_command("", Some(&portal), &[]).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plural_intent_extracted_on_all_keyword() -> Result<(), url::ParseError> {
+        // Collection markers ride the intent without polluting the label:
+        // `all`/`every`/`each` set the flag, everything else stays singular.
+        assert!(parse_plural("download all invoices"));
+        assert!(parse_plural("get every receipt"));
+        assert!(parse_plural("open each statement"));
+        assert!(!parse_plural("download invoice"));
+        assert!(!parse_plural("toggle dark mode"));
+        assert!(!parse_plural("overall summary"));
+        let portal = portal()?;
+        assert_eq!(
+            resolve_command("download all invoices", Some(&portal), &[]),
+            Some(CommandMatch::Ephemeral {
+                intent: SemanticIntent {
+                    role: "link".into(),
+                    label_query: "invoices".into(),
+                    container_query: None,
+                    raw_prompt: "download all invoices".into(),
+                    ordinal_index: None,
+                    is_last: false,
+                    is_plural: true,
+                    entry_url: None,
+                    primary_target_noun: Some("invoice".into()),
+                },
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plural_prompts_skip_single_step_saved_replays() -> Result<(), url::ParseError> {
+        let portal = portal()?;
+        let saved = vec![saved("1", "download-invoices", "https://github.com/")];
+        // Token overlap alone would replay — but plurality forces the dynamic
+        // batch path, since a one-click recording cannot honor "all".
+        let matched = resolve_command(
+            "download all my invoices from github",
+            Some(&portal),
+            &saved,
+        );
+        let Some(CommandMatch::Ephemeral { intent }) = matched else {
+            panic!("plural prompt bypasses the saved replay");
+        };
+        assert!(intent.is_plural);
+        // The singular twin still replays the recording untouched.
+        assert_eq!(
+            resolve_command("download invoice from github", Some(&portal), &saved),
+            Some(CommandMatch::Saved { id: "1".into() })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn primary_noun_strips_modifiers_and_singularizes() -> Result<(), url::ParseError> {
+        // Modifiers never survive: the anchor is always the content word in
+        // stem form. Lone identifiers carry no anchor at all.
+        assert_eq!(
+            extract_primary_noun("download all my invoices", None).as_deref(),
+            Some("invoice")
+        );
+        assert_eq!(
+            extract_primary_noun("open the Analytics", None).as_deref(),
+            Some("analytic")
+        );
+        // Trailing portal words yield to the object noun when the portal is
+        // connected — the host/plumbing split the saved path already uses.
+        let portal = portal()?;
+        assert_eq!(
+            extract_primary_noun("download all my invoices from github", Some(&portal)).as_deref(),
+            Some("invoice")
+        );
+        // Identifier-stripped streams only: a lone identifier arrives
+        // empty after cleaning, exactly as `resolve_command` passes it.
+        assert_eq!(extract_primary_noun("", None), None);
+        assert_eq!(extract_primary_noun("the", None), None);
+        // End to end: the ephemeral intent carries the anchor.
+        assert_eq!(
+            resolve_command("download all my invoices", Some(&portal), &[]),
+            Some(CommandMatch::Ephemeral {
+                intent: SemanticIntent {
+                    role: "link".into(),
+                    label_query: "invoices".into(),
+                    container_query: None,
+                    raw_prompt: "download all my invoices".into(),
+                    ordinal_index: None,
+                    is_last: false,
+                    is_plural: true,
+                    entry_url: None,
+                    primary_target_noun: Some("invoice".into()),
+                },
+            })
+        );
         Ok(())
     }
 

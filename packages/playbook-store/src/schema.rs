@@ -201,6 +201,9 @@ mod tests {
                 raw_prompt: String::new(),
                 ordinal_index: None,
                 is_last: false,
+                is_plural: false,
+                entry_url: None,
+                primary_target_noun: None,
             },
         }
     }

@@ -108,6 +108,9 @@ fn pay_intent() -> Step {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         },
     }
 }
@@ -215,6 +218,9 @@ async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         },
     };
     let result = execute_step(

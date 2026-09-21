@@ -266,6 +266,20 @@ impl ManagedBrowser {
         Ok(())
     }
 
+    /// Read the live target's current URL, if the page reports a parseable
+    /// one. Additive accessor for navigation pre-conditions elsewhere;
+    /// never navigates, never fails closed on drift — callers decide.
+    ///
+    /// # Errors
+    /// Reports connection failure or timeout.
+    pub async fn current_url(&self) -> Result<Option<Url>, BrowserError> {
+        let current = tokio::time::timeout(IO_TIMEOUT, self.page.url())
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        Ok(current.and_then(|url| Url::parse(&url).ok()))
+    }
+
     /// Open the portal for session verification or manual login.
     ///
     /// # Errors

@@ -51,6 +51,9 @@ async fn intent_executes_without_selectors() -> Result<(), Box<dyn std::error::E
                 raw_prompt: String::new(),
                 ordinal_index: None,
                 is_last: false,
+                is_plural: false,
+                entry_url: None,
+                primary_target_noun: None,
             },
         ),
     )
@@ -109,6 +112,9 @@ async fn container_context_disambiguates_duplicate_buttons()
                 raw_prompt: String::new(),
                 ordinal_index: None,
                 is_last: false,
+                is_plural: false,
+                entry_url: None,
+                primary_target_noun: None,
             },
         ),
     )
@@ -170,6 +176,9 @@ async fn container_query_vetoes_out_of_scope_controls_live()
                 raw_prompt: String::new(),
                 ordinal_index: None,
                 is_last: false,
+                is_plural: false,
+                entry_url: None,
+                primary_target_noun: None,
             },
         ),
     )

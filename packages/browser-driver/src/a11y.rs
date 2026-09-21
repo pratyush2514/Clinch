@@ -42,6 +42,13 @@ const MAX_CONTAINER_ITEM_LEN: usize = 100;
 /// fuzzy across items, so lowercased prompts (`0lwqxdww`) and split
 /// attributes (`$4.00` / `Declined` / `June 12`) resolve without any
 /// normalization here.
+///
+/// `landmark` names the nearest landmark-role ancestor (`navigation`,
+/// `banner`, `contentinfo`, `complementary`) when the climb passes one, so
+/// batch collection can tell page chrome apart from data rows. `None`
+/// otherwise. Single-intent grounding ignores it — nav links stay
+/// resolvable on their own.
+/// `LANDMARK_ROLES` is shared with `macro-engine`'s batch exclusion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AxElement {
@@ -50,7 +57,16 @@ pub struct AxElement {
     pub name: String,
     pub description: String,
     pub container_text: Vec<String>,
+    /// Added after `container_text`: `#[serde(default)]` keeps older
+    /// snapshots and payloads parsing with no landmark recorded.
+    #[serde(default)]
+    pub landmark: Option<String>,
 }
+
+/// ARIA landmark roles that mark page chrome (nav, header, footer,
+/// sidebar equivalents). Recorded — never used to bound the rollup itself.
+pub(crate) const LANDMARK_ROLES: &[&str] =
+    &["navigation", "banner", "contentinfo", "complementary"];
 
 /// Extract display text from an AX value. Accepts both the plain-string shape
 /// (`{"type":"string","value":"Sign in"}`) and the wrapped shape some roles
@@ -113,6 +129,7 @@ pub fn interactive_elements(nodes: &[AxNode]) -> Vec<AxElement> {
             ax_text(node.name.as_ref()).as_deref().unwrap_or(""),
             MAX_NAME_LEN,
         );
+        let (container_text, landmark) = container_text(position, nodes, &index, &name);
         elements.push(AxElement {
             backend_node_id: *backend.inner(),
             role,
@@ -121,7 +138,8 @@ pub fn interactive_elements(nodes: &[AxNode]) -> Vec<AxElement> {
                 ax_text(node.description.as_ref()).as_deref().unwrap_or(""),
                 MAX_DESCRIPTION_LEN,
             ),
-            container_text: container_text(position, nodes, &index, &name),
+            container_text,
+            landmark,
         });
     }
     elements
@@ -141,12 +159,15 @@ pub fn interactive_elements(nodes: &[AxNode]) -> Vec<AxElement> {
 /// whitespace runs collapse, edges trim) but case is preserved: matching
 /// lowercases downstream in `macro-engine` and the semantic list displays
 /// the portal's own casing.
+/// Surroundings plus the nearest landmark ancestor, if the climb passes
+/// one. Landmarks never bound the rollup — they only label where the
+/// element lives, for batch chrome filtering downstream.
 fn container_text(
     position: usize,
     nodes: &[AxNode],
     index: &std::collections::HashMap<String, usize>,
     self_name: &str,
-) -> Vec<String> {
+) -> (Vec<String>, Option<String>) {
     use std::borrow::Borrow;
     /// Row-level AX roles that bound a disambiguation set: every control in
     /// the row/card/item shares this container, so sibling-cell leaf text
@@ -168,6 +189,7 @@ fn container_text(
     let mut container = position;
     let mut row_container: Option<usize> = None;
     let mut cell_container: Option<usize> = None;
+    let mut landmark: Option<String> = None;
     for _ in 0..MAX_CLIMB {
         let Some(parent_id) = nodes[container].parent_id.as_ref() else {
             break;
@@ -186,6 +208,9 @@ fn container_text(
             if cell_container.is_none() && CELL_ROLES.contains(&role.as_str()) {
                 cell_container = Some(container);
             }
+            if landmark.is_none() && LANDMARK_ROLES.contains(&role.as_str()) {
+                landmark = Some(role);
+            }
         }
     }
     if let Some(row) = row_container {
@@ -194,7 +219,7 @@ fn container_text(
         container = cell;
     }
     if container == position {
-        return Vec::new();
+        return (Vec::new(), landmark);
     }
     let excluded = subtree_positions(position, nodes, index);
     let mut context = Vec::new();
@@ -234,7 +259,7 @@ fn container_text(
         children.reverse();
         stack.extend(children);
     }
-    context
+    (context, landmark)
 }
 
 /// Shape raw DOM `innerText` into container snippets with the same bounds
@@ -1001,6 +1026,50 @@ mod tests {
     }
 
     #[test]
+    fn landmark_ancestor_is_recorded_without_bounding_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A nav link and a row button: the climb records `navigation` on the
+        // link without letting landmarks bound either rollup.
+        let nodes = vec![
+            linked(
+                "nav",
+                Some("navigation"),
+                Some("Primary"),
+                None,
+                &["l1"],
+                false,
+                None,
+            )?,
+            linked(
+                "l1",
+                Some("link"),
+                Some("Downloads"),
+                Some("nav"),
+                &[],
+                false,
+                Some(61),
+            )?,
+            linked("row", Some("row"), None, None, &["c1"], false, None)?,
+            linked("c1", None, None, Some("row"), &["b1"], false, None)?,
+            linked(
+                "b1",
+                Some("button"),
+                Some("Download"),
+                Some("c1"),
+                &[],
+                false,
+                Some(62),
+            )?,
+        ];
+        let elements = interactive_elements(&nodes);
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].landmark.as_deref(), Some("navigation"));
+        assert_eq!(elements[0].container_text, vec!["Primary".to_owned()]);
+        assert_eq!(elements[1].landmark, None);
+        Ok(())
+    }
+
+    #[test]
     fn semantic_list_is_compact_and_indexed() {
         let elements = vec![
             AxElement {
@@ -1009,6 +1078,7 @@ mod tests {
                 name: "Sign in".into(),
                 description: String::new(),
                 container_text: Vec::new(),
+                landmark: None,
             },
             AxElement {
                 backend_node_id: 2,
@@ -1016,6 +1086,7 @@ mod tests {
                 name: String::new(),
                 description: "Email address".into(),
                 container_text: Vec::new(),
+                landmark: None,
             },
             AxElement {
                 backend_node_id: 3,
@@ -1023,6 +1094,7 @@ mod tests {
                 name: "Download".into(),
                 description: String::new(),
                 container_text: vec!["Statements".into(), "Statement #42".into()],
+                landmark: None,
             },
         ];
         let list = render_semantic_list(&elements);

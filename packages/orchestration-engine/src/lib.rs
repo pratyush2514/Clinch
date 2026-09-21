@@ -1,16 +1,25 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
+mod entity_resolver;
 mod intent_resolver;
+mod portal_routes;
+mod route_proposer;
 mod runner;
 mod store;
 mod task;
+mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
+pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
 pub use intent_resolver::{
     CommandMatch, ExtractedVariable, ParsedIntent, VariableExtraction, VariableKind,
     decompose_command, ephemeral_name, extract_dynamic_variables, extract_identifier,
     parse_intent_structured, resolve_command,
 };
-use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
+pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
+pub use portal_routes::portal_route;
+pub use route_proposer::{
+    LlmUrlProposer, ResolutionContext, ResolvedRoute, RouteSource, resolve_entry_url,
+};
 pub use runner::{
     SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError, StepOutcome,
     execute_step, run_playbook_sequence,
@@ -20,6 +29,7 @@ use sqlx::SqlitePool;
 use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
+pub use url_policy::{UrlRejected, validate_proposed_url};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

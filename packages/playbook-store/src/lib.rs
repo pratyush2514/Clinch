@@ -142,6 +142,51 @@ impl PlaybookStore {
         Ok(())
     }
 
+    /// Set a playbook's navigation pre-condition: runs must hold this URL
+    /// before grounding. Validates shape (absolute `http(s)` with a host)
+    /// and playbook existence first; unknown ids and malformed URLs fail
+    /// closed without writing.
+    ///
+    /// # Errors
+    /// Returns not-found, invalid-definition, or database errors.
+    pub async fn set_entry_url(
+        &self,
+        playbook_id: &str,
+        entry_url: &str,
+    ) -> Result<(), StoreError> {
+        let valid = entry_url.len() <= 2048
+            && url::Url::parse(entry_url).is_ok_and(|url| {
+                matches!(url.scheme(), "https" | "http") && url.host_str().is_some()
+            });
+        if !valid {
+            return Err(StoreError::Invalid(crate::schema::SchemaError::Invalid));
+        }
+        self.load_playbook(playbook_id).await?;
+        sqlx::query(
+            "INSERT INTO entry_urls(playbook_id, entry_url, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(playbook_id) DO UPDATE SET entry_url=excluded.entry_url, updated_at=CURRENT_TIMESTAMP",
+        )
+        .bind(playbook_id)
+        .bind(entry_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read a playbook's navigation pre-condition, if one was set. Unknown
+    /// ids read back as unset rather than erroring: no constraint either way.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn entry_url(&self, playbook_id: &str) -> Result<Option<String>, StoreError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT entry_url FROM entry_urls WHERE playbook_id = ?")
+                .bind(playbook_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(url,)| url))
+    }
+
     /// Newest-first summaries for the workflow list. A single corrupt row
     /// fails the listing closed rather than silently hiding a workflow.
     ///
@@ -275,6 +320,14 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     )
     .execute(&pool)
     .await?;
+    // Per-playbook navigation pre-conditions: the entry URL a run must hold
+    // before grounding. Keyed by playbook row id, upserted on set, absent
+    // when unset — steps without entries resolve exactly as before.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS entry_urls (playbook_id TEXT PRIMARY KEY, entry_url TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await?;
     Ok(pool)
 }
 
@@ -313,6 +366,9 @@ mod tests {
                     raw_prompt: String::new(),
                     ordinal_index: None,
                     is_last: false,
+                    is_plural: false,
+                    entry_url: None,
+                    primary_target_noun: None,
                 },
             }],
         )?)
@@ -363,6 +419,9 @@ mod tests {
                         raw_prompt: String::new(),
                         ordinal_index: None,
                         is_last: false,
+                        is_plural: false,
+                        entry_url: None,
+                        primary_target_noun: None,
                     },
                 }],
             )?)
@@ -373,6 +432,7 @@ mod tests {
             name: "Pay Now!".into(),
             description: String::new(),
             container_text: Vec::new(),
+            landmark: None,
         }];
         let stored = store.load_playbook(&id).await?;
         let crate::schema::Step::Semantic { intent } = &stored.steps[0] else {
@@ -439,6 +499,51 @@ mod tests {
                 .fetch_all(&pool)
                 .await?;
         assert_eq!(history.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn entry_url_round_trips_validated_preconditions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, store) = store().await?;
+        let id = store.save_playbook(&reports_playbook()?).await?;
+        // Unset reads back as no constraint.
+        assert_eq!(store.entry_url(&id).await?, None);
+        assert_eq!(store.entry_url("9999").await?, None);
+        // Valid entries persist and upsert.
+        store
+            .set_entry_url(&id, "https://portal.example.com/invoices")
+            .await?;
+        assert_eq!(
+            store.entry_url(&id).await?.as_deref(),
+            Some("https://portal.example.com/invoices")
+        );
+        store
+            .set_entry_url(&id, "https://portal.example.com/settings")
+            .await?;
+        assert_eq!(
+            store.entry_url(&id).await?.as_deref(),
+            Some("https://portal.example.com/settings")
+        );
+        // Malformed URLs and unknown playbooks fail closed; the stored
+        // entry survives every rejection.
+        assert!(store.set_entry_url(&id, "not a url").await.is_err());
+        assert!(
+            store
+                .set_entry_url(&id, "ftp://portal.example.com/x")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .set_entry_url("9999", "https://portal.example.com/")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.entry_url(&id).await?.as_deref(),
+            Some("https://portal.example.com/settings")
+        );
         Ok(())
     }
 

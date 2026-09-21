@@ -44,6 +44,26 @@ pub struct SemanticIntent {
     /// eligible candidate. Explicit `ordinal_index` wins if both are set.
     #[serde(default)]
     pub is_last: bool,
+    /// Collection intent (`all invoices`): resolve and act on every
+    /// eligible candidate instead of the top scorer, capped at
+    /// [`MAX_BATCH_CLICKS`]. `#[serde(default)]` keeps older payloads
+    /// single-shot.
+    #[serde(default)]
+    pub is_plural: bool,
+    /// Navigation pre-condition: when present, execution moves the target
+    /// to this URL (same portal — origin checks still apply) before
+    /// snapshotting. `None` skips the extra round-trip entirely.
+    /// `#[serde(default)]` keeps older payloads as-is.
+    #[serde(default)]
+    pub entry_url: Option<String>,
+    /// Primary target noun stem (`invoice` for `download all my invoices`):
+    /// batch candidates must mention it in visible text or surroundings.
+    /// Modifiers alone (`all`) never qualify, so header links like
+    /// `All issues` cannot join an invoice batch. `None` disables the gate
+    /// (lone identifiers scope by container instead). `#[serde(default)]`
+    /// keeps older payloads ungated.
+    #[serde(default)]
+    pub primary_target_noun: Option<String>,
 }
 
 /// Upper bound on the pass-through prompt: long prose must ground, never
@@ -54,10 +74,14 @@ impl SemanticIntent {
     /// Shared bounds so schema validation and execution agree on what a
     /// runnable intent looks like. `pub` for the playbook schema only.
     ///
+    /// Upper bound on entry URLs: portal paths, never data dumps.
+    const MAX_ENTRY_URL_LEN: usize = 2048;
+
     /// # Errors
     /// Returns [`browser_driver::BrowserError::InvalidAction`] for empty or
-    /// oversized roles, queries, and container scopes, or an oversized raw
-    /// prompt (empty raw prompts stay valid: older payloads carry none).
+    /// oversized roles, queries, and container scopes, an oversized raw
+    /// prompt (empty raw prompts stay valid: older payloads carry none), or
+    /// a malformed entry URL.
     pub fn validate(&self) -> Result<(String, String), browser_driver::BrowserError> {
         let role = normalize(&self.role);
         let query = normalize(&self.label_query);
@@ -73,7 +97,24 @@ impl SemanticIntent {
         if self.raw_prompt.len() > MAX_RAW_PROMPT_LEN {
             return Err(browser_driver::BrowserError::InvalidAction);
         }
+        if let Some(entry) = self.entry_url.as_ref() {
+            Self::validate_entry_url(entry)?;
+        }
         Ok((role, query))
+    }
+
+    /// Entry URLs must be absolute `http(s)` portal addresses with a host:
+    /// same shape the playbook schema demands of origins.
+    fn validate_entry_url(entry: &str) -> Result<(), browser_driver::BrowserError> {
+        let valid = entry.len() <= Self::MAX_ENTRY_URL_LEN
+            && url::Url::parse(entry).is_ok_and(|url| {
+                matches!(url.scheme(), "https" | "http") && url.host_str().is_some()
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(browser_driver::BrowserError::InvalidAction)
+        }
     }
 
     /// Normalized container scope, if any. Empty-after-trim and oversized
@@ -599,6 +640,9 @@ pub enum ResolveOutcome {
         resolved: ResolvedIntent,
         detail: DriftDetail,
     },
+    /// Plural collection: every eligible candidate in document order,
+    /// capped at [`MAX_BATCH_CLICKS`]. Produced only by [`resolve_batch`].
+    BatchMatch(Vec<AxElement>),
     NoMatch(String),
 }
 
@@ -646,6 +690,146 @@ pub fn resolve_with_drift(elements: &[AxElement], intent: &SemanticIntent) -> Re
     ResolveOutcome::Drift { resolved, detail }
 }
 
+/// Default cap on sequential batch clicks: runaway-loop protection for
+/// plural intents. Bounds a bounded post-pass, never the snapshot itself.
+pub const MAX_BATCH_CLICKS: usize = 30;
+/// DOM settling pause between batch clicks, letting each action's mutations
+/// land before the next control is acted on. Skipped after the final click.
+const BATCH_SETTLE_MS: u64 = 100;
+
+/// Landmark roles excluded from plural batches: page chrome (nav, header,
+/// footer, sidebar equivalents) never holds the repeating data rows a batch
+/// acts on. Mirrors the `LANDMARK_ROLES` set in `browser-driver::a11y`
+/// (duplicated, not imported, so each side's set can evolve alone);
+/// single-intent resolution ignores landmarks entirely, so nav links stay
+/// resolvable on their own.
+const BATCH_LANDMARK_EXCLUSIONS: &[&str] =
+    &["navigation", "banner", "contentinfo", "complementary"];
+
+/// Whether a candidate lives inside page chrome: batch data collection
+/// skips it no matter its score, so one matching sidebar link can never
+/// join — or lead — a table batch and navigate the run away mid-sequence.
+fn is_page_chrome(element: &AxElement) -> bool {
+    element
+        .landmark
+        .as_deref()
+        .is_some_and(|role| BATCH_LANDMARK_EXCLUSIONS.contains(&role))
+}
+
+/// Whether a candidate mentions the intent's primary noun stem anywhere
+/// human-visible: name, description, or surroundings, case-insensitively.
+/// Substring matching keeps stemmed anchors (`invoice`) covering inflected
+/// text (`Invoices`, `INV-001` carries no noun and relies on scope
+/// instead). Single-intent resolution never consults the anchor — fuzzy
+/// tolerance there is a feature, not a bug.
+fn mentions_noun(element: &AxElement, noun: &str) -> bool {
+    let stem = noun.trim().to_lowercase();
+    if stem.is_empty() {
+        return true;
+    }
+    normalize(&element.name).contains(&stem)
+        || normalize(&element.description).contains(&stem)
+        || joined_container(element).contains(&stem)
+}
+
+/// Collect every eligible data candidate in document order for plural
+/// intents, capped at [`MAX_BATCH_CLICKS`]. Ordinal selection does not
+/// apply here — `is_plural` asked for all of them. Page-chrome controls
+/// are excluded before scoring, and empty fields fail closed with the
+/// standard diagnostic instead of an empty batch.
+#[must_use]
+pub fn resolve_batch(elements: &[AxElement], intent: &SemanticIntent) -> ResolveOutcome {
+    let Ok((role, query)) = intent.validate() else {
+        return ResolveOutcome::NoMatch(grounding_diagnostic(elements, intent));
+    };
+    let container = intent.container();
+    let focus = container.as_deref().unwrap_or(&query);
+    // Anchor nouns arrive pre-trimmed from the resolver; an empty anchor
+    // means no gate, like a missing one.
+    let anchor = intent
+        .primary_target_noun
+        .as_deref()
+        .filter(|noun| !noun.trim().is_empty());
+    let mut batch = Vec::new();
+    for element in elements {
+        if batch.len() >= MAX_BATCH_CLICKS {
+            break;
+        }
+        if is_page_chrome(element) {
+            continue;
+        }
+        if !role_admits(&role, &element.role) {
+            continue;
+        }
+        if let Some(noun) = anchor
+            && !mentions_noun(element, noun)
+        {
+            continue;
+        }
+        let (_, total) = total_score(&query, Some(focus), &intent.raw_prompt, element);
+        if total < MIN_EXECUTION_SCORE {
+            continue;
+        }
+        batch.push(element.clone());
+    }
+    if batch.is_empty() {
+        ResolveOutcome::NoMatch(grounding_diagnostic(elements, intent))
+    } else {
+        ResolveOutcome::BatchMatch(batch)
+    }
+}
+
+/// Pure route-mismatch decision for entry pre-conditions: literal URL
+/// inequality, so any drift — path, query, or trailing-slash normalization
+/// aside — navigates rather than grounding on the wrong page.
+#[must_use]
+pub fn entry_url_mismatched(current: &url::Url, entry: &url::Url) -> bool {
+    current != entry
+}
+
+/// Enforce the navigation pre-condition before grounding: when the live page
+/// differs from the intent's entry URL, navigate there first (`goto` awaits
+/// page load). An unreadable current URL also navigates — landing on known
+/// state is the safe move. Same-portal moves keep origin checks green;
+/// anything else fails closed on the subsequent check. Returns whether
+/// navigation fired.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on current-URL or navigation failures.
+pub async fn ensure_at_entry_url(
+    browser: &ManagedBrowser,
+    entry: &url::Url,
+) -> Result<bool, IntentError> {
+    let current = browser.current_url().await?;
+    if current
+        .as_ref()
+        .is_some_and(|url| !entry_url_mismatched(url, entry))
+    {
+        return Ok(false);
+    }
+    browser.navigate(entry).await?;
+    Ok(true)
+}
+
+/// Move to the intent's entry URL when one is stated and mismatched.
+/// Intents without an entry skip the extra round-trip entirely.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] for a malformed entry URL and
+/// [`IntentError::Browser`] on navigation failures.
+async fn ensure_entry(
+    browser: &ManagedBrowser,
+    intent: &SemanticIntent,
+) -> Result<(), IntentError> {
+    let Some(entry) = intent.entry_url.as_deref() else {
+        return Ok(());
+    };
+    let entry = url::Url::parse(entry)
+        .map_err(|_| IntentError::NoMatch(format!("invalid entry_url: '{entry}'")))?;
+    ensure_at_entry_url(browser, &entry).await?;
+    Ok(())
+}
+
 /// Execute one intent: snapshot, resolve, badge, click. The badge stays
 /// visible on success as evidence of what was acted on; failures clear it so
 /// no stale overlay survives.
@@ -659,11 +843,129 @@ pub async fn execute_intent(
     origin: &url::Url,
     intent: &SemanticIntent,
 ) -> Result<IntentOutcome, IntentError> {
+    ensure_entry(browser, intent).await?;
     browser.check_origin(origin).await?;
     let elements = browser.ax_snapshot(origin).await?;
     let resolved = resolve_intent(&elements, intent)
         .ok_or_else(|| IntentError::NoMatch(grounding_diagnostic(&elements, intent)))?;
-    let highlight = browser.node_rect(resolved.element.backend_node_id).await?;
+    click_element(browser, &resolved.element).await
+}
+
+/// Batch terminal states: every click landed, or the run stopped early at
+/// the first page that drifted off the entry route. Partial progress is
+/// data, not an error — the caller maps it to its own outcome shape.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecuteOutcome {
+    Completed(Vec<IntentOutcome>),
+    HaltedEarly {
+        reason: &'static str,
+        clicks_completed: usize,
+        failed_candidate_index: usize,
+        failed_candidate_label: String,
+        diverged_url: String,
+    },
+}
+
+/// Whether the live page left the batch route: origin or path differ.
+/// Query strings and hash fragments never count as drift, and `blob:` /
+/// `data:` targets (download handoffs) are exempt — the next click then
+/// fails naturally on its own rect instead.
+fn url_drifted(initial: &url::Url, now: &url::Url) -> bool {
+    if matches!(now.scheme(), "blob" | "data") {
+        return false;
+    }
+    initial.scheme() != now.scheme()
+        || initial.host_str() != now.host_str()
+        || initial.port_or_known_default() != now.port_or_known_default()
+        || initial.path() != now.path()
+}
+
+/// Build the halt payload for a drifted batch: completed count, failing
+/// index, the control's visible label, and the diverged URL (kept
+/// in-memory for recovery UI — never logged, since URLs can carry tokens).
+fn halted_early(
+    clicks_completed: usize,
+    index: usize,
+    element: &AxElement,
+    diverged: &url::Url,
+) -> ExecuteOutcome {
+    ExecuteOutcome::HaltedEarly {
+        reason: "UrlDriftDetected",
+        clicks_completed,
+        failed_candidate_index: index,
+        failed_candidate_label: element.name.clone(),
+        diverged_url: diverged.as_str().to_owned(),
+    }
+}
+
+/// Execute a plural intent: snapshot once, then badge and click every
+/// collected candidate in document order with a settling pause between
+/// actions. Refusing non-plural intents fail-closed: batch-clicking a
+/// single-target intent would act on controls the user never asked for.
+///
+/// Before every click after the first, the live URL is compared against
+/// the route held at batch start: origin or path drift aborts the rest
+/// immediately with [`ExecuteOutcome::HaltedEarly`] instead of acting on a
+/// foreign page. Unreadable URLs fail closed the same way a CDP failure
+/// does.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the intent is not plural, nothing
+/// resolves, or the intent is malformed, and [`IntentError::Browser`] on
+/// CDP failure (marks cleared, like the single path).
+pub async fn execute_batch(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    intent: &SemanticIntent,
+) -> Result<ExecuteOutcome, IntentError> {
+    if !intent.is_plural {
+        return Err(IntentError::NoMatch(
+            "plural execution requires is_plural; refusing batch click".to_owned(),
+        ));
+    }
+    ensure_entry(browser, intent).await?;
+    browser.check_origin(origin).await?;
+    let elements = browser.ax_snapshot(origin).await?;
+    let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, intent) else {
+        return Err(IntentError::NoMatch(grounding_diagnostic(
+            &elements, intent,
+        )));
+    };
+    let initial = browser
+        .current_url()
+        .await?
+        .ok_or(browser_driver::BrowserError::WrongOrigin)?;
+    let mut outcomes = Vec::with_capacity(batch.len());
+    for (index, element) in batch.iter().enumerate() {
+        if index > 0 {
+            let now = browser
+                .current_url()
+                .await?
+                .ok_or(browser_driver::BrowserError::WrongOrigin)?;
+            if url_drifted(&initial, &now) {
+                return Ok(halted_early(outcomes.len(), index, element, &now));
+            }
+        }
+        outcomes.push(click_element(browser, element).await?);
+        if outcomes.len() < batch.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(BATCH_SETTLE_MS)).await;
+        }
+    }
+    Ok(ExecuteOutcome::Completed(outcomes))
+}
+
+/// Badge one resolved element and click it: rect resolution, visible mark,
+/// press. Shared by single and batch paths so both act identically; the
+/// badge stays visible on success as evidence, failures clear it so no
+/// stale overlay survives.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn click_element(
+    browser: &ManagedBrowser,
+    element: &AxElement,
+) -> Result<IntentOutcome, IntentError> {
+    let highlight = browser.node_rect(element.backend_node_id).await?;
     let mark = Mark {
         index: 0,
         x: highlight.x,
@@ -690,6 +992,7 @@ mod tests {
             name: name.into(),
             description: String::new(),
             container_text: Vec::new(),
+            landmark: None,
         }
     }
 
@@ -703,6 +1006,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         }
     }
 
@@ -714,6 +1020,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         }
     }
 
@@ -726,6 +1035,9 @@ mod tests {
             raw_prompt: raw.into(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         }
     }
 
@@ -738,6 +1050,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: index,
             is_last: last,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         }
     }
 
@@ -907,6 +1222,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         };
         assert!(grounding_diagnostic(&elements, &broken).contains("malformed"));
     }
@@ -921,6 +1239,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         };
         assert!(empty.validate().is_err());
         assert!(resolve_intent(&elements, &empty).is_none());
@@ -931,6 +1252,9 @@ mod tests {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         };
         assert!(huge.validate().is_err());
         assert!(resolve_intent(&elements, &huge).is_none());
@@ -941,6 +1265,9 @@ mod tests {
             raw_prompt: "x".repeat(2001),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         };
         assert!(huge_raw.validate().is_err());
         assert!(resolve_intent(&elements, &huge_raw).is_none());
@@ -1299,6 +1626,190 @@ mod tests {
         // Bit-exact zero: the cost is assigned, never computed.
         assert_eq!(metrics.cost_usd.to_bits(), RESOLVE_COST_USD.to_bits());
         assert_eq!(RESOLVE_COST_USD.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn batch_execution_collects_and_returns_all_threshold_matches() {
+        // Three identical controls, one plural intent: all three come back
+        // in document order, capped rather than vetoed. A non-plural intent
+        // refuses the batch path fail-closed.
+        let rows = vec![
+            AxElement {
+                backend_node_id: 131,
+                ..element("button", "Download")
+            },
+            AxElement {
+                backend_node_id: 132,
+                ..element("button", "Download")
+            },
+            AxElement {
+                backend_node_id: 133,
+                ..element("button", "Download")
+            },
+        ];
+        let mut plural = intent("button", "download");
+        plural.is_plural = true;
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&rows, &plural) else {
+            panic!("plural intent batches every match")
+        };
+        assert_eq!(
+            batch
+                .iter()
+                .map(|element| element.backend_node_id)
+                .collect::<Vec<_>>(),
+            vec![131, 132, 133]
+        );
+        assert!(batch.len() <= MAX_BATCH_CLICKS);
+        let single = intent("button", "download");
+        assert!(matches!(
+            resolve_batch(&[], &single),
+            ResolveOutcome::NoMatch(_)
+        ));
+    }
+
+    #[test]
+    fn entry_url_triggers_navigation_if_route_mismatched() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Pure route decision: identical URLs stay put, any drift navigates.
+        // Live firing (`goto` + load wait) needs Chromium, so the async
+        // helper stays compile-checked while this locks the contract.
+        let here = url::Url::parse("https://portal.example.com/invoices")?;
+        let same = url::Url::parse("https://portal.example.com/invoices")?;
+        let away = url::Url::parse("https://portal.example.com/settings")?;
+        assert!(!entry_url_mismatched(&here, &same));
+        assert!(entry_url_mismatched(&here, &away));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_batch_ignores_sidebar_navigation_links() {
+        // Three table-row controls plus three sidebar links with identical
+        // labels: the batch must hold exactly the data rows. Sidebar links
+        // carry container text too, so only the landmark — never emptiness —
+        // may exclude them.
+        let table = ["INV-001", "INV-002", "INV-003"];
+        let mut elements = Vec::new();
+        for (index, id) in table.iter().enumerate() {
+            elements.push(AxElement {
+                backend_node_id: i64::try_from(index + 1).unwrap_or(1),
+                container_text: vec![(*id).into()],
+                landmark: None,
+                ..element("link", "Download")
+            });
+        }
+        for (index, name) in ["Docs", "Billing", "Home"].iter().enumerate() {
+            elements.push(AxElement {
+                backend_node_id: i64::try_from(index + 11).unwrap_or(11),
+                container_text: vec!["Primary".into(), (*name).into()],
+                landmark: Some("navigation".into()),
+                ..element("link", "Download")
+            });
+        }
+        let mut plural = intent("link", "download");
+        plural.is_plural = true;
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, &plural) else {
+            panic!("table rows batch together")
+        };
+        assert_eq!(
+            batch
+                .iter()
+                .map(|element| element.backend_node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn drift_guard_allows_query_param_and_blob_changes() -> Result<(), Box<dyn std::error::Error>> {
+        let entry = url::Url::parse("https://portal.example.com/invoices")?;
+        // Query strings, hash fragments, and trailing-slash normalization
+        // are not drift.
+        for same in [
+            "https://portal.example.com/invoices?sort=date",
+            "https://portal.example.com/invoices#row-3",
+            "https://portal.example.com/invoices?sort=date#row-3",
+        ] {
+            assert!(!url_drifted(&entry, &url::Url::parse(same)?), "{same}");
+        }
+        // Download handoffs never count as drift either.
+        assert!(!url_drifted(
+            &entry,
+            &url::Url::parse("blob:https://portal.example.com/1")?
+        ));
+        // Origin and path changes do.
+        for moved in [
+            "https://portal.example.com/settings",
+            "https://other.example.com/invoices",
+            "http://portal.example.com/invoices",
+        ] {
+            assert!(url_drifted(&entry, &url::Url::parse(moved)?), "{moved}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn drift_guard_halts_and_reports_failed_candidate_details_on_path_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The halt payload names the failing control and the diverged page;
+        // the live loop that builds it stays behind Chromium-gated try paths.
+        let diverged = url::Url::parse("https://portal.example.com/settings")?;
+        let outcome = halted_early(2, 2, &element("button", "Download"), &diverged);
+        let ExecuteOutcome::HaltedEarly {
+            reason,
+            clicks_completed,
+            failed_candidate_index,
+            failed_candidate_label,
+            diverged_url,
+        } = outcome
+        else {
+            panic!("halt payload builds");
+        };
+        assert_eq!(reason, "UrlDriftDetected");
+        assert_eq!(clicks_completed, 2);
+        assert_eq!(failed_candidate_index, 2);
+        assert_eq!(failed_candidate_label, "Download");
+        assert_eq!(diverged_url, "https://portal.example.com/settings");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_batch_requires_primary_noun_and_filters_modifier_only_matches() {
+        // Modifier-only matches (`All issues` via `all`) score on coverage
+        // alone; the noun anchor (`invoice`) keeps them out while row
+        // controls — named or merely surrounded — stay in.
+        let elements = vec![
+            element("link", "All issues"),
+            element("link", "All pull requests"),
+            element("link", "Download invoice 1"),
+            AxElement {
+                backend_node_id: 4,
+                container_text: vec!["INV-002".into()],
+                ..element("link", "Download invoice 2")
+            },
+        ];
+        let mut intent = prose_intent("link", "invoices", None, "download all my invoices");
+        intent.is_plural = true;
+        intent.primary_target_noun = Some("invoice".into());
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, &intent) else {
+            panic!("invoice rows batch together")
+        };
+        // Exactly the two invoice controls; modifier-only matches stay out.
+        assert_eq!(
+            batch
+                .iter()
+                .map(|element| element.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "Download invoice 1".to_owned(),
+                "Download invoice 2".to_owned()
+            ]
+        );
+        // Without the anchor the modifier matches would flood back in.
+        intent.primary_target_noun = None;
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, &intent) else {
+            panic!("ungated batch collects")
+        };
+        assert_eq!(batch.len(), 4);
     }
 
     #[test]

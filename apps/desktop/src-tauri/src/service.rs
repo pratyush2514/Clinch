@@ -91,6 +91,61 @@ pub struct PlaybookApproval {
     step_index: usize,
     kind: &'static str,
     summary: String,
+    /// Itemized batch candidates for the gate card. Empty on single-step
+    /// approvals. In-memory and IPC-bound to the local desktop UI only —
+    /// never written to stdout, log files, or telemetry streams.
+    candidates: Vec<CandidatePreview>,
+}
+
+/// One queued control for the Sentinel Gate card: position, visible label,
+/// role, whether it lives inside page chrome, and a text fingerprint of
+/// its surroundings (`None` when it carries no container text). Roles and
+/// landmark flags come straight from the AX snapshot; there are no DOM
+/// tags anywhere in this pipeline, so `container` is words, not markup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidatePreview {
+    pub index: usize,
+    pub label: String,
+    pub role: String,
+    pub is_landmark: bool,
+    pub container: Option<String>,
+}
+
+/// Gate-card content: what the approval asks plus itemized candidates.
+/// Bundled so the approval helper stays within the argument budget.
+struct ApprovalContent {
+    kind: &'static str,
+    summary: String,
+    candidates: Vec<CandidatePreview>,
+}
+
+/// Per-snippet budget for container fingerprints: enough to recognize a
+/// row, short enough to keep gate payloads small.
+const MAX_PREVIEW_CONTAINER_LEN: usize = 120;
+
+/// Shape resolved batch candidates into gate-card previews in document
+/// order. Pure mapping — the live approval path below only forwards it.
+fn candidate_previews(candidates: &[browser_driver::AxElement]) -> Vec<CandidatePreview> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, element)| {
+            let fingerprint: String = element
+                .container_text
+                .join(" ")
+                .chars()
+                .take(MAX_PREVIEW_CONTAINER_LEN)
+                .collect();
+            CandidatePreview {
+                index,
+                label: element.name.clone(),
+                role: element.role.clone(),
+                is_landmark: element.landmark.is_some(),
+                container: (!fingerprint.trim().is_empty()).then_some(fingerprint),
+            }
+        })
+        .collect()
 }
 
 /// Progress plus approval requests for one playbook run, streamed over a
@@ -119,6 +174,30 @@ struct PendingPlaybookGate {
 struct RunScope {
     kind: playbook_store::RunKind,
     playbook_id: Option<String>,
+}
+
+/// Which execution lane a resolved command takes. Plural ephemeral intents
+/// batch across every matching control; everything else keeps its existing
+/// single-step path. Pure routing so the browserless suite can prove the
+/// plural prompt never truncates to one click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchLane {
+    Saved,
+    Single,
+    Batch,
+}
+
+/// Route one resolved command: the plural flag alone selects the batch
+/// lane — saved single-step replays never reach it because the resolver
+/// already forces plural prompts ephemeral.
+fn dispatch_lane(matched: &orchestration_engine::CommandMatch) -> DispatchLane {
+    match matched {
+        orchestration_engine::CommandMatch::Saved { .. } => DispatchLane::Saved,
+        orchestration_engine::CommandMatch::Ephemeral { intent } if intent.is_plural => {
+            DispatchLane::Batch
+        }
+        orchestration_engine::CommandMatch::Ephemeral { .. } => DispatchLane::Single,
+    }
 }
 
 /// What a natural-language command ran: which workflow (stored or
@@ -760,6 +839,9 @@ impl AppService {
             raw_prompt: String::new(),
             ordinal_index: None,
             is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: None,
         };
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         let portal = self
@@ -934,8 +1016,7 @@ impl AppService {
         run_id: u64,
         step_index: usize,
         total_steps: usize,
-        kind: &'static str,
-        summary: String,
+        content: ApprovalContent,
         emit: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
     ) -> bool {
         let (reply, receive) = oneshot::channel();
@@ -961,8 +1042,9 @@ impl AppService {
                 approval: Some(PlaybookApproval {
                     run_id,
                     step_index,
-                    kind,
-                    summary,
+                    kind: content.kind,
+                    summary: content.summary,
+                    candidates: content.candidates,
                 }),
             });
         }
@@ -1026,9 +1108,11 @@ impl AppService {
         .await
     }
 
-    /// Route a free-form command to a saved playbook (or a single-step
-    /// ephemeral intent against the connected portal) and run it with the
-    /// same approvals and streaming as stored playbooks.
+    /// Route a free-form command to a saved playbook, a single-step
+    /// ephemeral intent, or a plural batch across every matching control,
+    /// and run it with the same approvals and streaming as stored playbooks.
+    /// Plural prompts bypass saved single-step replays at resolution time,
+    /// so they always land in the batch lane below instead of clicking once.
     pub async fn dispatch_natural_command(
         &self,
         prompt: String,
@@ -1054,61 +1138,418 @@ impl AppService {
             None => Err(AppError::InvalidInput(
                 "No saved workflow matches, and no portal is connected for an ad-hoc intent. Connect a portal or save a workflow first.",
             )),
-            Some(orchestration_engine::CommandMatch::Saved { id }) => {
-                let playbook = self.playbooks().await?.load_playbook(&id).await.map_err(
-                    |error| match error {
-                        playbook_store::StoreError::NotFound => {
-                            AppError::InvalidInput("Unknown playbook.")
-                        }
-                        _ => AppError::StorageUnavailable,
-                    },
-                )?;
-                let name = playbook.name.clone();
-                let result = self
-                    .run_steps(
-                        playbook.origin.clone(),
-                        &playbook.steps,
-                        RunScope {
-                            kind: playbook_store::RunKind::Saved,
-                            playbook_id: Some(id),
-                        },
-                        emit,
-                    )
-                    .await?;
-                Ok(DispatchOutcome {
-                    kind: "saved",
+            Some(matched) => match dispatch_lane(&matched) {
+                DispatchLane::Saved => {
+                    let orchestration_engine::CommandMatch::Saved { id } = matched else {
+                        return Err(AppError::Internal);
+                    };
+                    self.dispatch_saved(id, emit).await
+                }
+                DispatchLane::Single => {
+                    let portal = connected.ok_or(AppError::SessionRequired)?;
+                    let orchestration_engine::CommandMatch::Ephemeral { intent } = matched else {
+                        return Err(AppError::Internal);
+                    };
+                    self.dispatch_single_ephemeral(portal, prompt, intent, emit)
+                        .await
+                }
+                DispatchLane::Batch => {
+                    let portal = connected.ok_or(AppError::SessionRequired)?;
+                    let orchestration_engine::CommandMatch::Ephemeral { intent } = matched else {
+                        return Err(AppError::Internal);
+                    };
+                    self.dispatch_plural_batch(portal, prompt, intent, emit)
+                        .await
+                }
+            },
+        }
+    }
+
+    /// Run a stored playbook by row id with the shared run machinery.
+    async fn dispatch_saved(
+        &self,
+        id: String,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        let playbook =
+            self.playbooks()
+                .await?
+                .load_playbook(&id)
+                .await
+                .map_err(|error| match error {
+                    playbook_store::StoreError::NotFound => {
+                        AppError::InvalidInput("Unknown playbook.")
+                    }
+                    _ => AppError::StorageUnavailable,
+                })?;
+        let name = playbook.name.clone();
+        let result = self
+            .run_steps(
+                playbook.origin.clone(),
+                &playbook.steps,
+                RunScope {
+                    kind: playbook_store::RunKind::Saved,
+                    playbook_id: Some(id),
+                },
+                emit,
+            )
+            .await?;
+        Ok(DispatchOutcome {
+            kind: "saved",
+            name,
+            result,
+            steps: playbook.steps.clone(),
+        })
+    }
+
+    /// Cold-path entry resolution: when the intent carries no entry, ask
+    /// the tiered proposer (account entity → route table → configured LLM
+    /// only) and adopt validated proposals. Logs host plus path — never
+    /// query strings — to session activity before any downstream navigation
+    /// occurs. No-op when an entry is already present.
+    async fn propose_entry_url(&self, prompt: &str, intent: &mut macro_engine::SemanticIntent) {
+        if intent.entry_url.is_some() {
+            return;
+        }
+        // Production wires no account directory (no stored credential backs
+        // one) and no LLM adapter: only the curated table tier can fire.
+        let ctx = orchestration_engine::ResolutionContext {
+            account_dir: None,
+            llm: None,
+        };
+        if let Some(route) =
+            orchestration_engine::resolve_entry_url(prompt, &intent.label_query, &ctx)
+        {
+            let _ = self
+                .record(&format!(
+                    "route_proposed:{}{} source:{:?}",
+                    route.url.host_str().unwrap_or("?"),
+                    route.url.path(),
+                    route.source
+                ))
+                .await;
+            intent.entry_url = Some(route.url.as_str().to_owned());
+        }
+    }
+
+    /// Run one ad-hoc semantic intent as a single-step ephemeral playbook.
+    async fn dispatch_single_ephemeral(
+        &self,
+        portal: url::Url,
+        prompt: String,
+        mut intent: macro_engine::SemanticIntent,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        self.propose_entry_url(&prompt, &mut intent).await;
+        let name = orchestration_engine::ephemeral_name(&prompt);
+        let playbook = playbook_store::Playbook::new(
+            name.clone(),
+            portal.clone(),
+            vec![playbook_store::Step::Semantic { intent }],
+        )
+        .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        let result = self
+            .run_steps(
+                portal,
+                &playbook.steps,
+                RunScope {
+                    kind: playbook_store::RunKind::Ephemeral,
+                    playbook_id: None,
+                },
+                emit,
+            )
+            .await?;
+        Ok(DispatchOutcome {
+            kind: "ephemeral",
+            name,
+            result,
+            steps: playbook.steps.clone(),
+        })
+    }
+
+    /// Run a plural intent across every matching control: snapshot once for
+    /// a candidate count, take one batch approval naming that count, then
+    /// execute the batch. Approval precedes every click (never after), the
+    /// operation semaphore is shared with single runs, and journaling
+    /// mirrors `run_steps` fail-open telemetry. No candidate match means no
+    /// approval prompt — the run fails closed instead.
+    async fn dispatch_plural_batch(
+        &self,
+        portal: url::Url,
+        prompt: String,
+        mut intent: macro_engine::SemanticIntent,
+        mut emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        self.propose_entry_url(&prompt, &mut intent).await;
+        let (browser, run_id, journal_id, journal) = self.begin_batch_run(&portal).await?;
+        let name = orchestration_engine::ephemeral_name(&prompt);
+        let steps = vec![playbook_store::Step::Semantic {
+            intent: intent.clone(),
+        }];
+        let events = std::sync::Mutex::new(&mut emit);
+        // Read-only snapshot first: the approval names the real candidate
+        // count, and empty fields fail closed before any gate is raised.
+        // A single entry-URL retry covers wrong-page starts: navigate once,
+        // re-snapshot once, then stop. No approval gate ever opens on zero
+        // candidates.
+        let mut candidates = Self::snapshot_batch_candidates(&browser, &portal, &intent).await;
+        if candidates.is_none() {
+            candidates = Self::retry_batch_on_entry(&browser, &portal, &intent).await;
+        }
+        let Some(candidates) = candidates else {
+            Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", 0).await;
+            let _ = self.record("batch:denied:ZeroCandidatesFound").await;
+            return Ok(Self::batch_outcome(
+                name,
+                steps,
+                orchestration_engine::SequenceStatus::Failed,
+                0,
+                Some(0),
+            ));
+        };
+        let approved = self
+            .approve_batch(run_id, &candidates, &intent, &prompt, &events)
+            .await;
+        if !approved {
+            Self::finish_batch_run(journal.as_ref(), &journal_id, "denied", 0).await;
+            let _ = self.record("batch:denied:UserRejected").await;
+            Self::emit_batch_phase(
+                &events,
+                run_id,
+                orchestration_engine::SequencePhase::Blocked,
+            );
+            return Ok(Self::batch_outcome(
+                name,
+                steps,
+                orchestration_engine::SequenceStatus::Denied,
+                0,
+                Some(0),
+            ));
+        }
+        match macro_engine::execute_batch(&browser, &portal, &intent).await {
+            Ok(macro_engine::ExecuteOutcome::Completed(_)) => {
+                Self::finish_batch_run(journal.as_ref(), &journal_id, "completed", 1).await;
+                Self::emit_batch_phase(
+                    &events,
+                    run_id,
+                    orchestration_engine::SequencePhase::Completed,
+                );
+                Ok(Self::batch_outcome(
                     name,
-                    result,
-                    steps: playbook.steps.clone(),
-                })
+                    steps,
+                    orchestration_engine::SequenceStatus::Completed,
+                    1,
+                    None,
+                ))
             }
-            Some(orchestration_engine::CommandMatch::Ephemeral { intent }) => {
-                let portal = connected.ok_or(AppError::SessionRequired)?;
-                let name = orchestration_engine::ephemeral_name(&prompt);
-                let playbook = playbook_store::Playbook::new(
-                    name.clone(),
-                    portal.clone(),
-                    vec![playbook_store::Step::Semantic { intent }],
-                )
-                .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
-                let result = self
-                    .run_steps(
-                        portal,
-                        &playbook.steps,
-                        RunScope {
-                            kind: playbook_store::RunKind::Ephemeral,
-                            playbook_id: None,
-                        },
-                        emit,
-                    )
-                    .await?;
-                Ok(DispatchOutcome {
-                    kind: "ephemeral",
+            Ok(macro_engine::ExecuteOutcome::HaltedEarly {
+                clicks_completed,
+                failed_candidate_index,
+                ..
+            }) => {
+                // Partial progress is honest data: completed carries the
+                // clicks that landed, stopped_at the drift point. The
+                // diverged URL stays out of telemetry (URLs can carry
+                // tokens); the recovery card reads it from a future
+                // outcome field, not from here.
+                Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", clicks_completed)
+                    .await;
+                let _ = self.record("batch:halted:UrlDriftDetected").await;
+                Self::emit_batch_phase(
+                    &events,
+                    run_id,
+                    orchestration_engine::SequencePhase::Blocked,
+                );
+                Ok(Self::batch_outcome(
                     name,
-                    result,
-                    steps: playbook.steps.clone(),
-                })
+                    steps,
+                    orchestration_engine::SequenceStatus::Failed,
+                    clicks_completed,
+                    Some(failed_candidate_index),
+                ))
             }
+            Err(_) => {
+                Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", 0).await;
+                Self::emit_batch_phase(
+                    &events,
+                    run_id,
+                    orchestration_engine::SequencePhase::Blocked,
+                );
+                Ok(Self::batch_outcome(
+                    name,
+                    steps,
+                    orchestration_engine::SequenceStatus::Failed,
+                    0,
+                    Some(0),
+                ))
+            }
+        }
+    }
+
+    /// Batch lane setup: session contract, headed browser, run id, journal
+    /// id, and fail-open journal start. Mirrors the `run_steps` preamble so
+    /// both lanes hold the same contracts; the operation semaphore stays
+    /// with the caller so it spans the whole run.
+    async fn begin_batch_run(
+        &self,
+        portal: &url::Url,
+    ) -> Result<
+        (
+            std::sync::Arc<browser_driver::ManagedBrowser>,
+            u64,
+            String,
+            Option<playbook_store::PlaybookStore>,
+        ),
+        AppError,
+    > {
+        let connected = self
+            .session_origin
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone();
+        if connected.is_none_or(|url| url.origin() != portal.origin()) {
+            return Err(AppError::SessionRequired);
+        }
+        let browser = self.browser(false).await?;
+        let run_id = self.next_playbook_run.fetch_add(1, Ordering::Relaxed);
+        let journal_id = format!(
+            "run-{run_id}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let journal = self.playbooks().await.ok();
+        if let Some(store) = &journal {
+            let _ = store
+                .record_run_start(&journal_id, None, playbook_store::RunKind::Ephemeral, 1)
+                .await;
+        }
+        Ok((browser, run_id, journal_id, journal))
+    }
+
+    /// Single entry-URL retry for an empty batch field: navigate once when
+    /// the intent names an entry, re-snapshot once, then stop — `None` when
+    /// still empty, so the run fails closed with no approval gate opened.
+    async fn retry_batch_on_entry(
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        intent: &macro_engine::SemanticIntent,
+    ) -> Option<Vec<browser_driver::AxElement>> {
+        let entry = intent.entry_url.as_deref()?;
+        let entry_url = url::Url::parse(entry).ok()?;
+        browser.navigate(&entry_url).await.ok()?;
+        Self::snapshot_batch_candidates(browser, portal, intent).await
+    }
+
+    /// Read-only pre-snapshot for the batch lane: live candidates for the
+    /// approval count, or `None` when the field is empty or unreadable.
+    /// Snapshot failures fail closed like single-run browser errors do.
+    async fn snapshot_batch_candidates(
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        intent: &macro_engine::SemanticIntent,
+    ) -> Option<Vec<browser_driver::AxElement>> {
+        let elements = browser.ax_snapshot(portal).await.ok()?;
+        match macro_engine::resolve_batch(&elements, intent) {
+            macro_engine::ResolveOutcome::BatchMatch(batch) => Some(batch),
+            _ => None,
+        }
+    }
+
+    /// One batch approval naming the live candidate count and carrying the
+    /// itemized previews for the gate card. Denials flow back as `false`
+    /// for the caller to report Blocked.
+    async fn approve_batch(
+        &self,
+        run_id: u64,
+        candidates: &[browser_driver::AxElement],
+        intent: &macro_engine::SemanticIntent,
+        prompt: &str,
+        events: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
+    ) -> bool {
+        // When an entry was resolved (stored or proposed), the gate card
+        // names its destination so a wrong route is visible pre-consent.
+        // Host plus path only — query strings never reach the summary.
+        let mut summary = format!(
+            "Batch click: {} {} controls for {prompt}",
+            candidates.len(),
+            intent.role,
+        );
+        if let Some(entry) = intent.entry_url.as_deref()
+            && let Ok(url) = url::Url::parse(entry)
+        {
+            use std::fmt::Write as _;
+            let _ = write!(
+                summary,
+                " @ {}{}",
+                url.host_str().unwrap_or("?"),
+                url.path()
+            );
+        }
+        self.approve_playbook_step(
+            run_id,
+            0,
+            1,
+            ApprovalContent {
+                kind: "intent",
+                summary,
+                candidates: candidate_previews(candidates),
+            },
+            events,
+        )
+        .await
+    }
+
+    /// Fail-open journal close for batch runs: telemetry must never fail a
+    /// run, mirroring `run_steps`.
+    async fn finish_batch_run(
+        journal: Option<&playbook_store::PlaybookStore>,
+        journal_id: &str,
+        status: &str,
+        completed: usize,
+    ) {
+        if let Some(store) = journal {
+            let _ = store.record_run_finish(journal_id, status, completed).await;
+        }
+    }
+
+    /// One-line progress event for the single-step batch lane.
+    fn emit_batch_phase(
+        events: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
+        run_id: u64,
+        phase: orchestration_engine::SequencePhase,
+    ) {
+        if let Ok(mut emit) = events.lock() {
+            emit(PlaybookEvent {
+                run_id,
+                step_index: 0,
+                total_steps: 1,
+                phase,
+                highlight: None,
+                approval: None,
+            });
+        }
+    }
+
+    /// Terminal batch outcome: one ephemeral step carrying N actions.
+    fn batch_outcome(
+        name: String,
+        steps: Vec<playbook_store::Step>,
+        status: orchestration_engine::SequenceStatus,
+        completed: usize,
+        stopped: Option<usize>,
+    ) -> DispatchOutcome {
+        DispatchOutcome {
+            kind: "ephemeral",
+            name,
+            result: orchestration_engine::SequenceOutcome {
+                completed_steps: completed,
+                total_steps: 1,
+                status,
+                stopped_at: stopped,
+            },
+            steps,
         }
     }
 
@@ -1181,8 +1622,11 @@ impl AppService {
                     run_id,
                     index,
                     total_steps,
-                    "action",
-                    Self::action_summary(&action),
+                    ApprovalContent {
+                        kind: "action",
+                        summary: Self::action_summary(&action),
+                        candidates: Vec::new(),
+                    },
                     &events,
                 )
             },
@@ -1191,8 +1635,11 @@ impl AppService {
                     run_id,
                     index,
                     total_steps,
-                    "intent",
-                    format!("{} · {}", intent.role, intent.label_query),
+                    ApprovalContent {
+                        kind: "intent",
+                        summary: format!("{} · {}", intent.role, intent.label_query),
+                        candidates: Vec::new(),
+                    },
                     &events,
                 )
             },
@@ -1490,6 +1937,9 @@ mod tests {
                             raw_prompt: String::new(),
                             ordinal_index: None,
                             is_last: false,
+                            is_plural: false,
+                            entry_url: None,
+                            primary_target_noun: None,
                         },
                     }],
                 )
@@ -1514,6 +1964,288 @@ mod tests {
             service.execute_playbook("999".into(), |_| {}).await,
             Err(AppError::InvalidInput(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_routes_plural_prompt_to_batch_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://github.com/")?;
+        // A saved 1-step legacy workflow whose name token-matches the prompt:
+        // without the plural bypass this is exactly what would replay.
+        service
+            .save_playbook(
+                "download_invoice_link".into(),
+                "https://github.com/".into(),
+                vec![playbook_store::Step::LegacySelector {
+                    action: browser_driver::Action::Click {
+                        selector: "#dl".into(),
+                    },
+                    wait: None,
+                }],
+            )
+            .await
+            .map_err(|_| "save")?;
+        *service.session_origin.lock().map_err(|_| "session")? = Some(portal.clone());
+        let saved = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .list_playbooks()
+            .await
+            .map_err(|_| "list")?;
+        // The problem-statement prompt bypasses the saved replay entirely.
+        let matched = orchestration_engine::resolve_command(
+            "download all my invoices from github",
+            Some(&portal),
+            &saved,
+        );
+        let Some(ref routed) = matched else {
+            panic!("plural prompt resolves");
+        };
+        assert_eq!(dispatch_lane(routed), DispatchLane::Batch);
+        let orchestration_engine::CommandMatch::Ephemeral { intent } = routed else {
+            panic!("plural prompt never takes the saved lane")
+        };
+        assert!(intent.is_plural);
+        // And the routed intent batches every candidate instead of
+        // truncating to the first click — no browser needed for pure
+        // resolution.
+        let buttons = ["Download invoice", "Download invoice", "Download invoice"];
+        let elements: Vec<browser_driver::AxElement> = buttons
+            .iter()
+            .enumerate()
+            .map(|(index, name)| browser_driver::AxElement {
+                backend_node_id: i64::try_from(index + 1).unwrap_or(1),
+                role: "link".into(),
+                name: (*name).into(),
+                description: String::new(),
+                container_text: Vec::new(),
+                landmark: None,
+            })
+            .collect();
+        let macro_engine::ResolveOutcome::BatchMatch(batch) =
+            macro_engine::resolve_batch(&elements, intent)
+        else {
+            panic!("plural intent batches all matches");
+        };
+        assert_eq!(batch.len(), 3);
+        // Control: the singular twin still takes the saved lane untouched.
+        let control = orchestration_engine::resolve_command(
+            "download invoice from github",
+            Some(&portal),
+            &saved,
+        );
+        let Some(ref control) = control else {
+            panic!("singular prompt resolves");
+        };
+        assert_eq!(dispatch_lane(control), DispatchLane::Saved);
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_previews_map_labels_roles_landmarks_and_containers() {
+        // Pure mapping: indices in document order, verbatim labels and
+        // roles, landmark flags straight from the snapshot, container
+        // fingerprints joined from surroundings (`None` when bare).
+        let candidates = vec![
+            browser_driver::AxElement {
+                backend_node_id: 1,
+                role: "link".into(),
+                name: "Download PDF - June 2026".into(),
+                description: String::new(),
+                container_text: vec!["Invoices".into(), "INV-001".into()],
+                landmark: None,
+            },
+            browser_driver::AxElement {
+                backend_node_id: 2,
+                role: "link".into(),
+                name: "Downloads".into(),
+                description: String::new(),
+                container_text: vec!["Primary".into()],
+                landmark: Some("navigation".into()),
+            },
+            browser_driver::AxElement {
+                backend_node_id: 3,
+                role: "button".into(),
+                name: String::new(),
+                description: String::new(),
+                container_text: Vec::new(),
+                landmark: None,
+            },
+        ];
+        assert_eq!(
+            candidate_previews(&candidates),
+            vec![
+                CandidatePreview {
+                    index: 0,
+                    label: "Download PDF - June 2026".into(),
+                    role: "link".into(),
+                    is_landmark: false,
+                    container: Some("Invoices INV-001".into()),
+                },
+                CandidatePreview {
+                    index: 1,
+                    label: "Downloads".into(),
+                    role: "link".into(),
+                    is_landmark: true,
+                    container: Some("Primary".into()),
+                },
+                CandidatePreview {
+                    index: 2,
+                    label: String::new(),
+                    role: "button".into(),
+                    is_landmark: false,
+                    container: None,
+                },
+            ]
+        );
+        assert!(candidate_previews(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_approval_carries_candidate_previews_to_the_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The approval card payload — not just the count: decide through the
+        // real gate and inspect the emitted event. No browser involved.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        let candidates = vec![browser_driver::AxElement {
+            backend_node_id: 7,
+            role: "link".into(),
+            name: "Download".into(),
+            description: String::new(),
+            container_text: vec!["INV-007".into()],
+            landmark: None,
+        }];
+        let intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "download".into(),
+            container_query: None,
+            raw_prompt: String::new(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: None,
+            primary_target_noun: None,
+        };
+        let mut captured: Vec<PlaybookEvent> = Vec::new();
+        let mut push = |event: PlaybookEvent| captured.push(event);
+        let events = std::sync::Mutex::new(&mut push);
+        let (approved, ()) = tokio::join!(
+            service.approve_batch(42, &candidates, &intent, "download all", &events),
+            async {
+                tokio::task::yield_now().await;
+                let _ = service.decide_playbook(42, 0, true);
+            }
+        );
+        assert!(approved);
+        assert_eq!(captured.len(), 1);
+        let approval = captured[0].approval.as_ref().ok_or("gate card emitted")?;
+        assert_eq!(
+            approval.summary,
+            "Batch click: 1 link controls for download all"
+        );
+        assert_eq!(
+            approval.candidates,
+            vec![CandidatePreview {
+                index: 0,
+                label: "Download".into(),
+                role: "link".into(),
+                is_landmark: false,
+                container: Some("INV-007".into()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn propose_entry_attaches_validated_table_route() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // No browser, no database: the tiered proposer is pure until the
+        // record call, which fails open without an initialized pool.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        let mut intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "invoices".into(),
+            container_query: None,
+            raw_prompt: "download all my invoices from github".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: None,
+            primary_target_noun: Some("invoice".into()),
+        };
+        service
+            .propose_entry_url("download all my invoices from github", &mut intent)
+            .await;
+        assert_eq!(
+            intent.entry_url.as_deref(),
+            Some("https://github.com/settings/billing")
+        );
+        // Non-matching prompts and pre-set entries stay untouched.
+        let mut other = intent.clone();
+        other.label_query = "dashboard".into();
+        other.entry_url = None;
+        service
+            .propose_entry_url("open the dashboard", &mut other)
+            .await;
+        assert_eq!(other.entry_url, None);
+        let mut preset = intent.clone();
+        preset.entry_url = Some("https://github.com/settings/billing".into());
+        service
+            .propose_entry_url("download all my invoices from github", &mut preset)
+            .await;
+        assert_eq!(
+            preset.entry_url.as_deref(),
+            Some("https://github.com/settings/billing")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_approval_names_resolved_entry_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The gate card surfaces host+path (never query) when the batch
+        // will navigate first — same decide-gate choreography as before.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        let candidates = vec![browser_driver::AxElement {
+            backend_node_id: 7,
+            role: "link".into(),
+            name: "Download".into(),
+            description: String::new(),
+            container_text: vec!["INV-007".into()],
+            landmark: None,
+        }];
+        let intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "download".into(),
+            container_query: None,
+            raw_prompt: String::new(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: Some("https://github.com/settings/billing?tab=x".into()),
+            primary_target_noun: None,
+        };
+        let mut captured: Vec<PlaybookEvent> = Vec::new();
+        let mut push = |event: PlaybookEvent| captured.push(event);
+        let events = std::sync::Mutex::new(&mut push);
+        let (approved, ()) = tokio::join!(
+            service.approve_batch(43, &candidates, &intent, "download all", &events),
+            async {
+                tokio::task::yield_now().await;
+                let _ = service.decide_playbook(43, 0, true);
+            }
+        );
+        assert!(approved);
+        let approval = captured[0].approval.as_ref().ok_or("gate card emitted")?;
+        assert_eq!(
+            approval.summary,
+            "Batch click: 1 link controls for download all @ github.com/settings/billing"
+        );
         Ok(())
     }
 

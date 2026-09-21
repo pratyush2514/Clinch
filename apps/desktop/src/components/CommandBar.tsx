@@ -1,11 +1,20 @@
 import { useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+type CandidatePreview = {
+  index: number;
+  label: string;
+  role: string;
+  isLandmark: boolean;
+  container: string | null;
+};
+
 type PlaybookApproval = {
   runId: number;
   stepIndex: number;
   kind: string;
   summary: string;
+  candidates: CandidatePreview[];
 };
 
 type PlaybookEvent = {
@@ -114,6 +123,16 @@ export default function CommandBar({ ready, busy, portal, report, errorMessage }
     {approval && <div className="gate-card" role="dialog" aria-label="Command approval">
       <div className="eyebrow">SENTINEL GATE</div>
       <p>Step {approval.stepIndex + 1} · {approval.kind} · <code>{approval.summary}</code>. Execution is paused until you decide.</p>
+      {approval.candidates.length > 0 && <ol aria-label="Queued controls">
+        {approval.candidates.slice(0, 10).map(candidate => <li key={candidate.index}>
+          <span>{candidate.index + 1}</span>
+          <div>
+            <strong>{candidate.label || "(unnamed)"}</strong>
+            <small>{candidate.role}{candidate.container ? ` · ${candidate.container}` : ""}</small>
+          </div>
+          {candidate.isLandmark && <span className="badge">[Navigation Link]</span>}
+        </li>)}
+      </ol>}
       <div className="actions">
         <button onClick={() => void decide(false)}>Reject</button>
         <button className="primary" onClick={() => void decide(true)}>Approve &amp; Submit</button>

@@ -5,9 +5,10 @@ use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
 pub use executor::{
-    DriftDetail, FastReplayMetrics, IntentError, IntentOutcome, RESOLVE_COST_USD, ResolveOutcome,
-    ResolvedIntent, SemanticIntent, execute_intent, grounding_diagnostic, resolve_fast,
-    resolve_intent, resolve_with_drift,
+    DriftDetail, ExecuteOutcome, FastReplayMetrics, IntentError, IntentOutcome, MAX_BATCH_CLICKS,
+    RESOLVE_COST_USD, ResolveOutcome, ResolvedIntent, SemanticIntent, ensure_at_entry_url,
+    entry_url_mismatched, execute_batch, execute_intent, grounding_diagnostic, resolve_batch,
+    resolve_fast, resolve_intent, resolve_with_drift,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
