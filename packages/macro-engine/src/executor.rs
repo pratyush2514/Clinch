@@ -905,7 +905,7 @@ pub async fn wait_for_settled_candidates(
     intent: &SemanticIntent,
 ) -> bool {
     wait_for_candidates_with(
-        || async { browser.ax_snapshot(origin).await.ok() },
+        || async { Some(browser.ax_snapshot(origin).await.0) },
         intent,
         std::time::Duration::from_millis(SETTLE_POLL_MS),
         std::time::Duration::from_millis(SETTLE_TIMEOUT_MS),
@@ -927,9 +927,9 @@ pub async fn execute_intent(
     intent: &SemanticIntent,
 ) -> Result<IntentOutcome, IntentError> {
     ensure_entry(browser, intent).await?;
-    browser.check_origin(origin).await?;
+    browser.check_anchored_origin(origin).await?;
     wait_for_settled_candidates(browser, origin, intent).await;
-    let elements = browser.ax_snapshot(origin).await?;
+    let (elements, _, _) = browser.ax_snapshot(origin).await;
     let resolved = resolve_intent(&elements, intent)
         .ok_or_else(|| IntentError::NoMatch(grounding_diagnostic(&elements, intent)))?;
     click_element(browser, &resolved.element).await
@@ -1008,9 +1008,9 @@ pub async fn execute_batch(
         ));
     }
     ensure_entry(browser, intent).await?;
-    browser.check_origin(origin).await?;
+    browser.check_anchored_origin(origin).await?;
     wait_for_settled_candidates(browser, origin, intent).await;
-    let elements = browser.ax_snapshot(origin).await?;
+    let (elements, _, _) = browser.ax_snapshot(origin).await;
     let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, intent) else {
         return Err(IntentError::NoMatch(grounding_diagnostic(
             &elements, intent,

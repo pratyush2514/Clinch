@@ -25,12 +25,7 @@ pub use preview::{DomRegion, Viewport};
 pub use session::{AuthSignal, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
-use std::{
-    path::Path,
-    process::Stdio,
-    sync::{Mutex, atomic::AtomicU64},
-    time::Duration,
-};
+use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
 use tokio::{
     process::{Child, Command},
     task::JoinHandle,
@@ -89,6 +84,66 @@ impl LaunchOptions {
     }
 }
 
+/// Select the active top-level page target for `current_url` from a
+/// `Target.getTargets` listing: the attached `page`-type target whose URL
+/// matches the live browser URL exactly. Returns `None` when no listing
+/// entry matches, so callers keep their current handle (fail-open).
+/// Pure over the listing, so origin transitions are provable hermetically.
+/// Crate-visible for the snapshot re-attachment path in [`a11y`].
+pub(crate) fn select_active_page_target(
+    targets: &[chromiumoxide::cdp::browser_protocol::target::TargetInfo],
+    current_url: &Url,
+) -> Option<chromiumoxide::cdp::browser_protocol::target::TargetId> {
+    targets
+        .iter()
+        .find(|target| {
+            target.r#type == "page" && target.attached && target.url == current_url.as_str()
+        })
+        .map(|target| target.target_id.clone())
+}
+
+/// Normalize an entry URL to its portal anchor: scheme plus host (and an
+/// explicit port), without path, query, or fragment. Pure so the binding
+/// is hermetically provable.
+fn anchor_origin(entry: &Url) -> Url {
+    let mut anchor = entry.clone();
+    anchor.set_path("/");
+    anchor.set_query(None);
+    anchor.set_fragment(None);
+    anchor
+}
+
+/// Anchored confinement verdict: drift holds only when the live page
+/// origin matches neither the call's requested origin nor the active
+/// anchor. The anchor is set solely by intentional navigation, so with no
+/// anchor this is exactly the legacy strict check.
+fn is_anchored_drift(live: &Url, requested: &Url, anchor: Option<&Url>) -> bool {
+    live.origin() != requested.origin()
+        && anchor.is_none_or(|pinned| live.origin() != pinned.origin())
+}
+
+/// Drift error text naming the active anchor and the live page, e.g.
+/// `The page left the configured portal (anchor=https://github.com/,
+/// live=https://evil.example/)`.
+fn drift_error_line(anchor: &Url, live: &str) -> String {
+    format!(
+        "The page left the configured portal (anchor={}, live={})",
+        anchor.as_str(),
+        live
+    )
+}
+
+/// Journal line for an intentional-navigation re-anchor, e.g.
+/// `portal_reanchored: none → https://github.com/`.
+#[must_use]
+pub fn portal_reanchored_line(previous: Option<&Url>, current: &Url) -> String {
+    format!(
+        "portal_reanchored: {} → {}",
+        previous.map_or("none", Url::as_str),
+        current.as_str()
+    )
+}
+
 // No Debug: CDP objects may contain session data.
 pub struct ManagedBrowser {
     headless: bool,
@@ -96,14 +151,13 @@ pub struct ManagedBrowser {
     browser: Browser,
     page: Page,
     handler: JoinHandle<()>,
-    /// Zero-node AX resyncs since the last drain. Incremented when a
-    /// snapshot finds an empty tree on a real page and re-arms the domain;
-    /// service drains it to journal `ax_target_resync` lines.
-    ax_resyncs: AtomicU64,
-    /// Last resync decision inputs, stored on every zero-node observation
-    /// (predicate true or not). Service drains it to journal the
-    /// `ax_resync_check` line. Instrumentation only.
-    last_resync_check: Mutex<Option<a11y::AxResyncCheck>>,
+    /// Intentional-navigation portal anchor, origin-normalized. Set only by
+    /// [`ManagedBrowser::reanchor_portal`] after a proposed route
+    /// navigates — never defaulted on launch or session attach, so the
+    /// starting tab's incidental origin can never silently confine later
+    /// runs. `None` means legacy strict confinement against the call's
+    /// requested origin.
+    anchored_portal: Mutex<Option<Url>>,
 }
 
 impl ManagedBrowser {
@@ -198,8 +252,9 @@ impl ManagedBrowser {
             browser,
             page,
             handler: task,
-            ax_resyncs: AtomicU64::new(0),
-            last_resync_check: Mutex::new(None),
+            // Deliberately unset: the starting tab's incidental origin must
+            // never confine later runs — only intentional navigation anchors.
+            anchored_portal: Mutex::new(None),
         };
         let mut script = AddScriptToEvaluateOnNewDocumentParams::new(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
@@ -311,20 +366,49 @@ impl ManagedBrowser {
 
     /// Re-anchor the driver on the live top-level page session after a
     /// settled navigation. Cross-origin renderer swaps can leave CDP
-    /// domains armed on the previous process, so this round-trips
-    /// `Target.getTargets` to confirm browser-target coherence and
-    /// re-issues `Accessibility.enable` on the current session. It cannot
-    /// replace the owned `Page` handle (chromiumoxide owns session
-    /// binding); it re-arms domain state on it. Fail-open by design —
-    /// returns nothing, ignores transient post-navigation errors — because
-    /// the snapshot path re-verifies before acting.
+    /// domains armed on the previous process; this delegates to the same
+    /// targeted re-attachment the snapshot path uses (re-query targets,
+    /// select the live page, ensure attachment, re-arm Accessibility).
+    /// Fail-open by design — returns nothing — because the snapshot path
+    /// re-verifies before acting.
     pub async fn refresh_target_session(&self) {
-        use chromiumoxide::cdp::browser_protocol::{
-            accessibility::EnableParams, target::GetTargetsParams,
-        };
-        let _ =
-            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetTargetsParams::default())).await;
-        let _ = tokio::time::timeout(IO_TIMEOUT, self.page.execute(EnableParams {})).await;
+        let page_url = self.current_url().await.ok().flatten();
+        self.reattach_active_target(page_url.as_ref()).await;
+    }
+
+    /// Active portal anchor, if intentional navigation set one. `None`
+    /// until the first [`ManagedBrowser::reanchor_portal`] call.
+    #[must_use]
+    pub fn portal_anchor(&self) -> Option<Url> {
+        self.anchored_portal.lock().ok()?.clone()
+    }
+
+    /// Bind portal confinement to an intentionally navigated entry route's
+    /// scheme and host. Returns the previous anchor for journaling;
+    /// idempotent — re-anchoring the same origin changes nothing
+    /// downstream. Fail-open: a poisoned lock leaves the anchor untouched
+    /// and reports no previous anchor.
+    pub fn reanchor_portal(&self, entry: &Url) -> Option<Url> {
+        self.anchored_portal
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.replace(anchor_origin(entry)))
+    }
+
+    /// Confinement check honoring intentional navigation: passes when the
+    /// live page matches the requested origin or the anchored portal, and
+    /// fails closed otherwise (drift, unreadable URL, or CDP failure).
+    /// With no anchor this is exactly [`ManagedBrowser::check_origin`].
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] on drift, unreadable URLs, or CDP failures.
+    pub async fn check_anchored_origin(&self, origin: &Url) -> Result<(), BrowserError> {
+        let anchor = self.portal_anchor();
+        let live = self.current_url().await?.ok_or(BrowserError::WrongOrigin)?;
+        if is_anchored_drift(&live, origin, anchor.as_ref()) {
+            return Err(BrowserError::WrongOrigin);
+        }
+        Ok(())
     }
 
     /// Probe whether the live page body text contains `needle`
@@ -465,6 +549,122 @@ mod tests {
         assert!(LaunchOptions::replay().headless);
         assert!(!LaunchOptions::interactive().headless);
         assert!(!LaunchOptions::default().headless);
+    }
+
+    #[test]
+    fn target_reselection_switches_ids_on_origin_transitions() -> Result<(), BrowserError> {
+        // Hermetic proof for post-navigation re-attachment: given one
+        // `Target.getTargets` listing spanning a `google.com` →
+        // `github.com` transition, selection follows the live URL from one
+        // target ID to the other. Non-page and detached entries never win.
+        use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
+        fn entry(id: &str, kind: &str, url: &str, attached: bool) -> TargetInfo {
+            TargetInfo {
+                target_id: TargetId::new(id),
+                r#type: kind.into(),
+                title: "fixture".into(),
+                url: url.into(),
+                attached,
+                opener_id: None,
+                can_access_opener: false,
+                opener_frame_id: None,
+                parent_frame_id: None,
+                browser_context_id: None,
+                subtype: None,
+            }
+        }
+        let listing = vec![
+            entry("google-target", "page", "https://google.com/", true),
+            entry(
+                "github-target",
+                "page",
+                "https://github.com/account/billing/history",
+                true,
+            ),
+            entry(
+                "worker",
+                "service_worker",
+                "https://github.com/account/billing/history",
+                true,
+            ),
+            entry(
+                "detached",
+                "page",
+                "https://github.com/account/billing/history",
+                false,
+            ),
+        ];
+        let parse = |url: &str| Url::parse(url).map_err(|_| BrowserError::InvalidAction);
+        // Pre-navigation: the google tab is active.
+        assert_eq!(
+            select_active_page_target(&listing, &parse("https://google.com/")?),
+            Some(TargetId::new("google-target"))
+        );
+        // Post-navigation: selection switches to the github tab.
+        let switched = select_active_page_target(
+            &listing,
+            &parse("https://github.com/account/billing/history")?,
+        );
+        assert_eq!(switched, Some(TargetId::new("github-target")));
+        assert_ne!(
+            switched,
+            Some(TargetId::new("google-target")),
+            "origin transition switches target IDs"
+        );
+        // Unknown URLs keep the current handle (fail-open): no match.
+        assert_eq!(
+            select_active_page_target(&listing, &parse("https://other.example/")?),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intentional_navigation_reanchors_portal_confinement() -> Result<(), BrowserError> {
+        // Hermetic proof for the google.com → github billing run: anchoring
+        // the intentionally navigated entry normalizes it to its origin,
+        // the journal line names the transition, and confinement then
+        // accepts the github page under the google request without drift.
+        // (Driver state transitions ride on these pure pieces:
+        // `reanchor_portal` stores `anchor_origin`, and `ax_snapshot`
+        // gates on `is_anchored_drift` — neither needs CDP to prove.)
+        let google = Url::parse("https://google.com/").map_err(|_| BrowserError::InvalidAction)?;
+        let entry = Url::parse("https://github.com/account/billing/history")
+            .map_err(|_| BrowserError::InvalidAction)?;
+        let anchor = anchor_origin(&entry);
+        assert_eq!(anchor.as_str(), "https://github.com/");
+        assert_eq!(
+            portal_reanchored_line(None, &anchor),
+            "portal_reanchored: none → https://github.com/"
+        );
+        assert_eq!(
+            portal_reanchored_line(Some(&anchor), &anchor),
+            "portal_reanchored: https://github.com/ → https://github.com/"
+        );
+        // Live github page, requested google portal, github anchored:
+        // intentional destination, no drift.
+        assert!(!is_anchored_drift(&entry, &google, Some(&anchor)));
+        // Same request with no anchor still drifts (legacy strict check).
+        assert!(is_anchored_drift(&entry, &google, None));
+        Ok(())
+    }
+
+    #[test]
+    fn unsolicited_origin_change_fails_closed_with_anchor_error() -> Result<(), BrowserError> {
+        // A page nobody navigated to matches neither the request nor the
+        // anchor: drift holds, retries are skipped, and the error names the
+        // active anchor plus the live page.
+        let google = Url::parse("https://google.com/").map_err(|_| BrowserError::InvalidAction)?;
+        let anchor = Url::parse("https://github.com/").map_err(|_| BrowserError::InvalidAction)?;
+        let evil = Url::parse("https://evil.example/").map_err(|_| BrowserError::InvalidAction)?;
+        assert!(is_anchored_drift(&evil, &google, Some(&anchor)));
+        assert_eq!(
+            drift_error_line(&anchor, evil.as_str()),
+            "The page left the configured portal (anchor=https://github.com/, live=https://evil.example/)"
+        );
+        // ...while the requested origin itself still passes beside an anchor.
+        assert!(!is_anchored_drift(&google, &google, Some(&anchor)));
+        Ok(())
     }
 
     #[tokio::test]

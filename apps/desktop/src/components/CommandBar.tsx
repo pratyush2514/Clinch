@@ -76,9 +76,14 @@ export default function CommandBar({ ready, busy, portal, report, errorMessage }
       // Route telemetry renders first so Session Activity shows the resolved
       // entry (or miss) before the terminal outcome line.
       if (result.routeLog) report(result.routeLog);
-      // Snapshot telemetry follows, so evaluated node counts are visible in
-      // Session Activity without polling the backend store.
-      if (result.telemetryLog) report(result.telemetryLog);
+      // Snapshot telemetry follows, one Session Activity row per line, so
+      // resync counter, check, action, and node counts are each visible
+      // without polling the backend store.
+      if (result.telemetryLog) {
+        for (const line of result.telemetryLog.split("\n")) {
+          if (line.trim()) report(line);
+        }
+      }
       report(`“${prompt.trim()}” ran ${result.kind} workflow ${result.name}: ${result.result.status.replaceAll("_", " ")} · ${result.result.completedSteps}/${result.result.totalSteps} steps.`);
     } catch (error) {
       report(errorMessage(error));

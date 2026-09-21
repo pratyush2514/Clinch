@@ -50,7 +50,7 @@ async fn ax_snapshot_lists_interactive_controls() -> Result<(), Box<dyn std::err
     let dir = tempfile::tempdir()?;
     let browser = headless_browser(&dir).await?;
     browser.navigate(&url).await?;
-    let elements = browser.ax_snapshot(&url).await?;
+    let (elements, _, _) = browser.ax_snapshot(&url).await;
     assert!(elements.iter().any(|element| element.role == "button"
         && element.name == "Pay now"
         && element.backend_node_id > 0));
@@ -80,7 +80,7 @@ async fn picker_overlay_pick_resolves_through_binding() -> Result<(), Box<dyn st
     let browser = headless_browser(&dir).await?;
     browser.navigate(&url).await?;
     browser.enable_picker().await?;
-    let elements = browser.ax_snapshot(&url).await?;
+    let (elements, _, _) = browser.ax_snapshot(&url).await;
     let button = elements
         .iter()
         .find(|element| element.role == "button" && element.name == "Pay now")
@@ -115,7 +115,7 @@ async fn som_badges_render_and_click_activates() -> Result<(), Box<dyn std::erro
     let dir = tempfile::tempdir()?;
     let browser = headless_browser(&dir).await?;
     browser.navigate(&url).await?;
-    let elements = browser.ax_snapshot(&url).await?;
+    let (elements, _, _) = browser.ax_snapshot(&url).await;
     let button = elements
         .iter()
         .find(|element| element.role == "button")

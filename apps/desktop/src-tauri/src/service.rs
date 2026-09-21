@@ -890,10 +890,7 @@ impl AppService {
             .map_err(|_| AppError::Internal)?
             .clone()
             .ok_or(AppError::SessionRequired)?;
-        let elements = browser
-            .ax_snapshot(&portal)
-            .await
-            .map_err(|_| AppError::BrowserUnavailable)?;
+        let (elements, _, _) = browser.ax_snapshot(&portal).await;
         macro_engine::resolve_intent(&elements, &intent)
             .map(|resolved| IntentPreview {
                 role: resolved.element.role,
@@ -1321,6 +1318,35 @@ impl AppService {
         Self::pre_navigate_to_entry(browser, intent).await
     }
 
+    /// Bind portal confinement to step 1's entry origin after intentional
+    /// navigation, so the drift guard evaluates the proposed route's host
+    /// instead of the pre-navigation tab origin. Returns the journaled
+    /// `portal_reanchored` line when the anchor actually changed; silent
+    /// when already bound, entry-less, or unparsable.
+    async fn reanchor_to_entry(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        steps: &[playbook_store::Step],
+    ) -> Option<String> {
+        let [playbook_store::Step::Semantic { intent }, ..] = steps else {
+            return None;
+        };
+        let entry = intent.entry_url.as_deref()?;
+        let entry_url = url::Url::parse(entry).ok()?;
+        let previous = browser.reanchor_portal(&entry_url);
+        let current = browser.portal_anchor()?;
+        if previous.as_ref() == Some(&current) {
+            return None;
+        }
+        Some(
+            self.journal_line(browser_driver::portal_reanchored_line(
+                previous.as_ref(),
+                &current,
+            ))
+            .await,
+        )
+    }
+
     /// Post-navigation session check via the existing Extension Bridge.
     /// Fail-open when no companion is connected (nothing to report
     /// logged-out); fails closed only when the bridge answers `no_cookies`
@@ -1369,10 +1395,13 @@ impl AppService {
         .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
         // Lazy browser attach when disconnected, then cross-domain
         // pre-navigation from step 1's entry (reusing the settle routine)
-        // before any snapshot. Unauthenticated bridge sessions halt here —
+        // before any snapshot. Re-anchor confinement to the proposed entry
+        // origin so snapshots evaluate the intentional destination, not the
+        // starting tab. Unauthenticated bridge sessions halt here —
         // never snapshotted.
         let browser = self.browser(false).await?;
         Self::pre_navigate_to_step(&browser, &playbook.steps).await?;
+        let telemetry_log = self.reanchor_to_entry(&browser, &playbook.steps).await;
         self.verify_bridge_auth(&portal).await?;
         let result = self
             .run_steps(
@@ -1391,9 +1420,10 @@ impl AppService {
             result,
             steps: playbook.steps.clone(),
             route_log,
-            // The single lane snapshots inside the macro engine, which has
-            // no journal access, so no per-snapshot line exists to surface.
-            telemetry_log: None,
+            // Per-snapshot lines live inside the macro engine here, which
+            // has no journal access — but the re-anchor line (if the anchor
+            // changed) still surfaces above the outcome.
+            telemetry_log,
         })
     }
 
@@ -1424,7 +1454,8 @@ impl AppService {
         }];
         // Cross-domain pre-navigation when step 1's entry differs from the
         // live tab (origin/path): navigate first via the shared settle
-        // routine, then verify bridge auth before any ARIA snapshot.
+        // routine, re-anchor confinement to the intentional destination,
+        // then verify bridge auth before any ARIA snapshot.
         Self::pre_navigate_to_step(&browser, &steps).await?;
         self.verify_bridge_auth(&portal).await?;
         let events = std::sync::Mutex::new(&mut emit);
@@ -1434,7 +1465,7 @@ impl AppService {
         // re-snapshot once, then stop. No approval gate ever opens on zero
         // candidates.
         let (candidates, telemetry_log) = self
-            .snapshot_settled_batch_candidates(&browser, &portal, &intent)
+            .snapshot_anchored_batch_candidates(&browser, &portal, &intent, &steps)
             .await;
         // Every terminal outcome below carries the same steps plus the
         // route-proposal and snapshot-telemetry lines, so failures still
@@ -1603,19 +1634,23 @@ impl AppService {
         )
     }
 
-    /// Log one snapshot's telemetry to `session_events`, fail-open: a
-    /// journal write must never fail a run.
-    async fn record_snapshot_telemetry(
-        &self,
-        elements: &[browser_driver::AxElement],
-        intent: &macro_engine::SemanticIntent,
-    ) -> String {
-        let noun = macro_engine::settle_probe_text(intent);
-        let line = Self::snapshot_telemetry_line(
-            elements.len(),
-            Self::count_noun_matches(elements, noun),
-            noun,
-        );
+    /// Combine one run's journaled diagnostic lines into the multi-line
+    /// `telemetryLog` surfaced in Session Activity: resync counter, resync
+    /// check, resync action(s), then snapshot stats — in journal order.
+    /// `None` when nothing was journaled, so paths that never snapshot
+    /// stay silent instead of emitting an empty block.
+    fn combine_telemetry(lines: &[String]) -> Option<String> {
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    /// Journal one diagnostic line fail-open and hand it back, so the exact
+    /// text in `session_events` also travels on the outcome for immediate
+    /// UI render.
+    async fn journal_line(&self, line: String) -> String {
         let _ = self.record(&line).await;
         line
     }
@@ -1623,87 +1658,135 @@ impl AppService {
     /// Single entry-URL retry for an empty batch field: navigate once when
     /// the intent names an entry, settle for rendered row candidates,
     /// re-snapshot once, then stop — `None` when still empty, so the run
-    /// fails closed with no approval gate opened. Returns the last
-    /// snapshot's telemetry line alongside the candidates.
+    /// fails closed with no approval gate opened. Returns every line this
+    /// retry journaled alongside the candidates.
     async fn retry_batch_on_entry(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         intent: &macro_engine::SemanticIntent,
-    ) -> (Option<Vec<browser_driver::AxElement>>, Option<String>) {
+    ) -> (Option<Vec<browser_driver::AxElement>>, Vec<String>) {
         let Some(entry) = intent.entry_url.as_deref() else {
-            return (None, None);
+            return (None, Vec::new());
         };
         let Ok(entry_url) = url::Url::parse(entry) else {
-            return (None, None);
+            return (None, Vec::new());
         };
         if browser.navigate(&entry_url).await.is_err() {
-            return (None, None);
+            return (None, Vec::new());
         }
         macro_engine::wait_for_settled_candidates(browser, portal, intent).await;
-        let (candidates, telemetry) = self
-            .snapshot_batch_candidates(browser, portal, intent)
+        self.snapshot_batch_candidates(browser, portal, intent)
+            .await
+    }
+
+    /// Batch-lane snapshot with confinement bound to step 1 first:
+    /// re-anchor to the intentional entry origin, settle-snapshot (plus the
+    /// entry-URL retry on empty fields), and combine every journaled line —
+    /// re-anchor line first when the anchor changed — into `telemetryLog`.
+    /// `None` candidates open no approval gate: the run fails closed.
+    async fn snapshot_anchored_batch_candidates(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        intent: &macro_engine::SemanticIntent,
+        steps: &[playbook_store::Step],
+    ) -> (Option<Vec<browser_driver::AxElement>>, Option<String>) {
+        let reanchored = self.reanchor_to_entry(browser, steps).await;
+        let (candidates, mut journaled) = self
+            .snapshot_settled_batch_candidates(browser, portal, intent)
             .await;
-        (candidates, Some(telemetry))
+        if let Some(line) = reanchored {
+            journaled.insert(0, line);
+        }
+        (candidates, Self::combine_telemetry(&journaled))
     }
 
     /// Settle-aware candidate collection for the batch lane: poll for
     /// rendered row candidates, snapshot once for the approval count, then
     /// take the single entry-URL retry on empty fields. `None` opens no
-    /// approval gate — the run fails closed. Returns the last snapshot's
-    /// telemetry line so outcomes can surface it in the UI.
+    /// approval gate — the run fails closed. Returns every line journaled
+    /// across both snapshots (first plus retry) so outcomes surface the
+    /// full diagnostic stream in the UI.
     async fn snapshot_settled_batch_candidates(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         intent: &macro_engine::SemanticIntent,
-    ) -> (Option<Vec<browser_driver::AxElement>>, Option<String>) {
+    ) -> (Option<Vec<browser_driver::AxElement>>, Vec<String>) {
         macro_engine::wait_for_settled_candidates(browser, portal, intent).await;
-        let (candidates, telemetry) = self
+        let (candidates, mut journaled) = self
             .snapshot_batch_candidates(browser, portal, intent)
             .await;
         if candidates.is_some() {
-            return (candidates, Some(telemetry));
+            return (candidates, journaled);
         }
-        self.retry_batch_on_entry(browser, portal, intent).await
+        let (retry_candidates, retry_lines) =
+            self.retry_batch_on_entry(browser, portal, intent).await;
+        journaled.extend(retry_lines);
+        (retry_candidates, journaled)
+    }
+
+    /// Build one snapshot's full diagnostic stream in strict journal order
+    /// — counter, check, CDP error, resync action(s), stats — from the
+    /// inline values [`browser_driver::ManagedBrowser::ax_snapshot`]
+    /// returns. Pure construction over owned values: no side-channel
+    /// state, nothing to drain out of order. The check line is emitted
+    /// whenever the snapshot observed zero nodes (or a CDP error); healthy
+    /// snapshots journal only counter plus stats.
+    fn snapshot_journal_lines(
+        elements: &[browser_driver::AxElement],
+        check: &browser_driver::AxResyncCheck,
+        resyncs: u64,
+        intent: &macro_engine::SemanticIntent,
+    ) -> Vec<String> {
+        // `before_discard` is structurally 0: inline returns replaced the
+        // drainable side-channels, so nothing can be wiped before journaling.
+        // `after_drain` carries this snapshot's own resync count.
+        let mut lines = vec![format!(
+            "ax_resync_counter: before_discard=0 after_drain={resyncs}"
+        )];
+        if check.node_count == 0 || check.cdp_error.is_some() {
+            lines.push(check.line());
+        }
+        if let Some(error) = check.cdp_error.as_deref() {
+            lines.push(format!("ax_snapshot_cdp_error: '{error}'"));
+        }
+        for _ in 0..resyncs {
+            lines.push(browser_driver::AX_TARGET_RESYNC_LINE.to_owned());
+        }
+        let noun = macro_engine::settle_probe_text(intent);
+        lines.push(Self::snapshot_telemetry_line(
+            elements.len(),
+            Self::count_noun_matches(elements, noun),
+            noun,
+        ));
+        lines
     }
 
     /// Read-only pre-snapshot for the batch lane: live candidates for the
     /// approval count, or `None` when the field is empty or unreadable.
-    /// Every snapshot — hit or miss — logs its telemetry first, so a zero
-    /// field still leaves evidence instead of silence, and returns the
-    /// logged line for UI surfacing. Snapshot failures fail closed like
-    /// single-run browser errors do.
+    /// Every snapshot — hit or miss — journals its full diagnostic stream
+    /// in strict order, so a zero field still leaves evidence instead of
+    /// silence, and returns every logged line for UI surfacing. CDP
+    /// failures arrive as check data (never `Err`), and an empty field
+    /// fails closed via `resolve_batch` like single-run browser errors do.
     async fn snapshot_batch_candidates(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         intent: &macro_engine::SemanticIntent,
-    ) -> (Option<Vec<browser_driver::AxElement>>, String) {
-        // Discard resyncs banked by other lanes so the lines below always
-        // belong to this snapshot, then journal the drain itself: a wiped
-        // pending count is itself diagnostic (scenario B).
-        let before_discard = browser.take_ax_resync_count();
-        let _ = browser.take_last_resync_check();
-        let elements = browser.ax_snapshot(portal).await.unwrap_or_default();
-        let after_drain = browser.take_ax_resync_count();
-        let _ = self
-            .record(&format!(
-                "ax_resync_counter: before_discard={before_discard} after_drain={after_drain}"
-            ))
-            .await;
-        if let Some(check) = browser.take_last_resync_check() {
-            let _ = self.record(&check.line()).await;
+    ) -> (Option<Vec<browser_driver::AxElement>>, Vec<String>) {
+        let (elements, check, resyncs) = browser.ax_snapshot(portal).await;
+        let mut journaled = Vec::new();
+        for line in Self::snapshot_journal_lines(&elements, &check, resyncs, intent) {
+            journaled.push(self.journal_line(line).await);
         }
-        for _ in 0..after_drain {
-            let _ = self.record(browser_driver::AX_TARGET_RESYNC_LINE).await;
-        }
-        let telemetry = self.record_snapshot_telemetry(&elements, intent).await;
         let candidates = match macro_engine::resolve_batch(&elements, intent) {
             macro_engine::ResolveOutcome::BatchMatch(batch) => Some(batch),
             _ => None,
         };
-        (candidates, telemetry)
+        (candidates, journaled)
     }
 
     /// One batch approval naming the live candidate count and carrying the
@@ -2561,6 +2644,81 @@ mod tests {
         assert_eq!(AppService::count_noun_matches(&[], "invoice"), 0);
     }
 
+    #[test]
+    fn telemetry_log_combines_full_diagnostic_stream() {
+        // `telemetryLog` carries every line journaled for the run — counter,
+        // check, resync action, stats — in journal order, so Session
+        // Activity shows predicate debugging without polling the store.
+        let lines = vec![
+            "ax_resync_counter: before_discard=0 after_drain=1".to_owned(),
+            "ax_resync_check: nodes=0 url='https://github.com/account/billing/history' predicate=true"
+                .to_owned(),
+            "ax_target_resync: re-enabled accessibility after 0-node tree".to_owned(),
+            "ax_snapshot_telemetry: total_nodes=142, target_noun_matches=3 (noun='invoice')"
+                .to_owned(),
+        ];
+        let Some(combined) = AppService::combine_telemetry(&lines) else {
+            panic!("non-empty stream combines");
+        };
+        let mut cursor = 0;
+        for line in &lines {
+            let position = combined[cursor..]
+                .find(line.as_str())
+                .unwrap_or_else(|| panic!("combined holds {line}"));
+            cursor += position + line.len();
+        }
+        assert!(combined.lines().count() == lines.len());
+        // Paths that never snapshot stay silent instead of emitting empties.
+        assert_eq!(AppService::combine_telemetry(&[]), None);
+    }
+
+    #[test]
+    fn snapshot_journal_lines_follow_strict_order_without_side_channels() {
+        // Inline construction from owned snapshot values — no drains, no
+        // locks — generates every journal line in exact sequence: counter,
+        // check, CDP error, resync action, stats.
+        let elements = vec![browser_driver::AxElement {
+            backend_node_id: 1,
+            role: "link".into(),
+            name: "Download".into(),
+            description: String::new(),
+            container_text: vec!["Invoices".into()],
+            landmark: None,
+        }];
+        let intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "download".into(),
+            container_query: None,
+            raw_prompt: "download all my invoices".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: None,
+            primary_target_noun: Some("invoice".into()),
+        };
+        let mut check = browser_driver::AxResyncCheck::new(0, None);
+        check.cdp_error = Some("Session detached".to_owned());
+        let lines = AppService::snapshot_journal_lines(&elements, &check, 1, &intent);
+        assert_eq!(
+            lines,
+            vec![
+                "ax_resync_counter: before_discard=0 after_drain=1".to_owned(),
+                "ax_resync_check: nodes=0 url='' predicate=false".to_owned(),
+                "ax_snapshot_cdp_error: 'Session detached'".to_owned(),
+                "ax_target_resync: re-enabled accessibility after 0-node tree".to_owned(),
+                "ax_snapshot_telemetry: total_nodes=1, target_noun_matches=1 (noun='invoice')"
+                    .to_owned(),
+            ]
+        );
+        // Healthy snapshots journal only counter plus stats: no check, no
+        // error, no resync action.
+        let healthy = browser_driver::AxResyncCheck::new(3, None);
+        let lines = AppService::snapshot_journal_lines(&elements, &healthy, 0, &intent);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("ax_resync_counter: "));
+        assert!(lines[1].starts_with("ax_snapshot_telemetry: "));
+    }
+
     #[tokio::test]
     async fn snapshot_telemetry_logs_empty_field_and_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2599,7 +2757,10 @@ mod tests {
                 landmark: None,
             },
         ];
-        service.record_snapshot_telemetry(&elements, &intent).await;
+        let check = browser_driver::AxResyncCheck::new(0, None);
+        for line in AppService::snapshot_journal_lines(&elements, &check, 0, &intent) {
+            service.journal_line(line).await;
+        }
         assert!(matches!(
             macro_engine::resolve_batch(&elements, &intent),
             macro_engine::ResolveOutcome::NoMatch(_)

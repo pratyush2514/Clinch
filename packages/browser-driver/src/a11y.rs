@@ -14,7 +14,6 @@ use chromiumoxide::cdp::browser_protocol::{
     target::GetTargetsParams,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
 
 /// Interactive AX roles surfaced to planners, normalized to lowercase at
 /// discovery (`Tab` → `tab`). Roles stay plain strings — the equivalent of
@@ -368,36 +367,41 @@ fn needs_ax_resync(node_count: usize, page_url: Option<&url::Url>) -> bool {
     node_count == 0 && page_url.is_some_and(|url| matches!(url.scheme(), "https" | "http"))
 }
 
-/// Debug record of one resync decision, stored every time a zero-node tree
-/// is observed (predicate true or not) so the desktop service can journal
-/// the exact inputs the predicate saw. Instrumentation only: recording a
-/// check never changes snapshot behavior.
+/// Debug record of one snapshot's resync decision, returned inline from
+/// [`ManagedBrowser::ax_snapshot`] alongside the elements. Instrumentation
+/// only: building a check never changes snapshot behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxResyncCheck {
-    /// Nodes the fetched tree held (always 0 for recorded checks).
+    /// Nodes the first tree fetch returned (0 on fetch error).
     pub node_count: usize,
     /// Page URL at observation time, or empty when the URL read failed.
     pub url: String,
     /// The [`needs_ax_resync`] verdict for these inputs.
     pub predicate: bool,
+    /// Caught CDP failure text (e.g. `"Session detached"`, `"Target
+    /// closed"`), `None` when every CDP call in the snapshot succeeded.
+    pub cdp_error: Option<String>,
 }
 
 impl AxResyncCheck {
     /// Build from an observed tree size plus the page URL read (`None`
-    /// when the read failed). The predicate is computed here so stored
-    /// checks carry the verdict instead of recomputing it at drain time.
+    /// when the read failed). The predicate is computed here so checks
+    /// carry the verdict instead of recomputing it downstream. No error
+    /// yet — callers attach one when a CDP call fails.
     #[must_use]
     pub fn new(node_count: usize, page_url: Option<&url::Url>) -> Self {
         Self {
             predicate: needs_ax_resync(node_count, page_url),
             node_count,
             url: page_url.map_or_else(String::new, |url| url.as_str().to_owned()),
+            cdp_error: None,
         }
     }
 
     /// Journal line, e.g.
     /// `ax_resync_check: nodes=0 url='https://github.com/x' predicate=true`.
-    /// A failed URL read renders as `url=''`.
+    /// A failed URL read renders as `url=''`. A caught CDP failure travels
+    /// separately as `ax_snapshot_cdp_error: '<e>'`.
     #[must_use]
     pub fn line(&self) -> String {
         format!(
@@ -423,84 +427,121 @@ impl ManagedBrowser {
         Ok(())
     }
 
-    /// Drain the pending zero-node resync count since the last drain. The
-    /// desktop service journals one [`AX_TARGET_RESYNC_LINE`] per count.
-    #[must_use]
-    pub fn take_ax_resync_count(&self) -> u64 {
-        self.ax_resyncs.swap(0, Ordering::Relaxed)
-    }
-
-    /// Drain the last resync decision check, if a zero-node tree was
-    /// observed since the last drain. Instrumentation only.
-    #[must_use]
-    pub fn take_last_resync_check(&self) -> Option<AxResyncCheck> {
-        self.last_resync_check
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-    }
-
-    /// Re-anchor the AX session after a zero-node tree on a real page:
-    /// best-effort `Target.getTargets` to confirm browser-target coherence
-    /// post-swap, then re-issue `Accessibility.enable`. Records one pending
-    /// resync for the service journal. Fail-open by design: transient
-    /// post-navigation CDP states must not fail the snapshot — the single
-    /// tree retry below still runs either way.
-    async fn resync_ax_target(&self) {
-        let _ =
-            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetTargetsParams::default())).await;
-        let _ = self.enable_accessibility().await;
-        self.ax_resyncs.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Capture the live interactive-element snapshot for `origin`. Discovery
-    /// itself stays on the AX graph (no tags, no classes); afterwards the
-    /// opt-in DOM fallback in `session.rs` may fill empties when its env
-    /// gate is set, and is a silent no-op otherwise.
-    ///
-    /// # Errors
-    /// Returns [`BrowserError`] on origin drift, CDP failure, or timeout.
-    pub async fn ax_snapshot(&self, origin: &url::Url) -> Result<Vec<AxElement>, BrowserError> {
-        self.check_origin(origin).await?;
-        self.enable_accessibility().await?;
-        let mut tree = tokio::time::timeout(
+    /// Single tree fetch with the CDP failure preserved as text for
+    /// [`AxResyncCheck::cdp_error`].
+    async fn fetch_ax_nodes(&self) -> Result<Vec<AxNode>, String> {
+        match tokio::time::timeout(
             IO_TIMEOUT,
             self.page.execute(GetFullAxTreeParams::builder().build()),
         )
         .await
-        .map_err(|_| BrowserError::Timeout)?
-        .map_err(|_| BrowserError::Connection)?;
-        let page_url = self.current_url().await.ok().flatten();
-        if tree.result.nodes.is_empty() {
-            // Instrumentation: record every zero-node observation with the
-            // exact predicate inputs, so a missing resync line is diagnosable
-            // (exempt predicate vs. wiped counter vs. wrong drain path).
-            // Fail-open: a poisoned slot skips the record, never the retry.
-            if let Ok(mut slot) = self.last_resync_check.lock() {
-                *slot = Some(AxResyncCheck::new(
-                    tree.result.nodes.len(),
-                    page_url.as_ref(),
-                ));
-            }
+        {
+            Err(_) => Err(BrowserError::Timeout.to_string()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Ok(Ok(tree)) => Ok(tree.result.nodes),
         }
-        if needs_ax_resync(tree.result.nodes.len(), page_url.as_ref()) {
-            // Zero nodes on a rendered page: re-anchor the target session,
-            // re-arm the domain, and retry the tree exactly once. Whatever
-            // comes back — even still empty — flows into the normal path so
-            // an unsettled page degrades instead of erroring.
-            self.resync_ax_target().await;
-            tree = tokio::time::timeout(
-                IO_TIMEOUT,
-                self.page.execute(GetFullAxTreeParams::builder().build()),
+    }
+
+    /// Best-effort re-attachment for the targeted retry: re-query
+    /// `Target.getTargets`, select the live page target for `page_url`,
+    /// ensure a foreign owner is attached, then re-arm Accessibility.
+    /// Fail-open by design — all errors swallowed — because the retry
+    /// fetch below still runs either way. Shared by snapshots and
+    /// post-navigation target refreshes.
+    pub(crate) async fn reattach_active_target(&self, page_url: Option<&url::Url>) {
+        let targets =
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetTargetsParams::default()))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|response| response.result.target_infos)
+                .unwrap_or_default();
+        if let Some(url) = page_url
+            && let Some(active) = crate::select_active_page_target(&targets, url)
+            && active != *self.page.target_id()
+        {
+            let _ = self.browser.get_page(active).await;
+        }
+        let _ = self.enable_accessibility().await;
+    }
+
+    /// Capture the live interactive-element snapshot for `origin`, with its
+    /// resync diagnostics inline: `(elements, check, resyncs)`. Discovery
+    /// itself stays on the AX graph (no tags, no classes); afterwards the
+    /// opt-in DOM fallback in `session.rs` may fill empties when its env
+    /// gate is set, and is a silent no-op otherwise.
+    ///
+    /// Single-exit pipeline: every path — success, zero-node tree, CDP
+    /// error — funnels into the one return below carrying full diagnostics.
+    /// Confinement honors intentional navigation: drift holds only when the
+    /// live page matches neither the requested origin nor the anchored
+    /// portal, and the error names the active anchor. Unsolicited drift
+    /// fails closed here with no targeted retry.
+    pub async fn ax_snapshot(&self, origin: &url::Url) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        let page_url = self.current_url().await.ok().flatten();
+        let anchor = self.portal_anchor();
+        let drifted = match &page_url {
+            Some(url) => crate::is_anchored_drift(url, origin, anchor.as_ref()),
+            None => true,
+        };
+        let (nodes, check, resyncs) = if drifted {
+            let effective = anchor.as_ref().unwrap_or(origin);
+            let live: &str = page_url.as_ref().map_or("unreadable", |url| url.as_str());
+            let mut check = AxResyncCheck::new(0, page_url.as_ref());
+            check.cdp_error = Some(crate::drift_error_line(effective, live));
+            (Vec::new(), check, 0)
+        } else if let Err(error) = self.enable_accessibility().await {
+            let mut check = AxResyncCheck::new(0, page_url.as_ref());
+            check.cdp_error = Some(error.to_string());
+            (Vec::new(), check, 0)
+        } else {
+            fetch_with_targeted_retry(
+                || self.fetch_ax_nodes(),
+                || self.reattach_active_target(page_url.as_ref()),
+                page_url.as_ref(),
             )
             .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
-        }
-        let mut elements = interactive_elements(&tree.result.nodes);
+        };
+        let mut elements = interactive_elements(&nodes);
         self.enrich_empty_containers(&mut elements).await;
-        Ok(elements)
+        (elements, check, resyncs)
     }
+}
+
+/// Fetch-then-retry core behind [`ManagedBrowser::ax_snapshot`]: run one
+/// tree fetch; when it errors or returns zero nodes, re-attach and retry
+/// exactly once. Returns the final nodes plus the first observation's
+/// check and whether the retry ran. Separated so hermetic tests can drive
+/// the policy over injected fetch/reattach fns without a browser.
+async fn fetch_with_targeted_retry<F, Fut, R, Rf>(
+    mut fetch: F,
+    mut reattach: R,
+    page_url: Option<&url::Url>,
+) -> (Vec<AxNode>, AxResyncCheck, u64)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<AxNode>, String>>,
+    R: FnMut() -> Rf,
+    Rf: std::future::Future<Output = ()>,
+{
+    let first = fetch().await;
+    let check = match &first {
+        Ok(nodes) => AxResyncCheck::new(nodes.len(), page_url),
+        Err(message) => {
+            let mut check = AxResyncCheck::new(0, page_url);
+            check.cdp_error = Some(message.clone());
+            check
+        }
+    };
+    let mut nodes = first.unwrap_or_default();
+    if check.cdp_error.is_some() || check.node_count == 0 {
+        reattach().await;
+        if let Ok(fetched) = fetch().await {
+            nodes = fetched;
+        }
+        return (nodes, check, 1);
+    }
+    (nodes, check, 0)
 }
 
 #[cfg(test)]
@@ -1293,6 +1334,7 @@ mod tests {
                 node_count: 0,
                 url: "https://github.com/account/billing/history".to_owned(),
                 predicate: true,
+                cdp_error: None,
             }
         );
         assert_eq!(
@@ -1300,5 +1342,66 @@ mod tests {
             "ax_resync_check: nodes=0 url='https://github.com/account/billing/history' predicate=true"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn targeted_retry_captures_cdp_error_and_retries_once() {
+        // Simulated CDP failure (`Err`, e.g. `"Session detached"`): the
+        // returned check carries `cdp_error: Some(..)` with zero nodes, the
+        // re-attachment runs exactly once, and the retry result flows
+        // through — all without a browser.
+        use std::sync::{Arc, Mutex};
+        let reattachments = Arc::new(Mutex::new(0_usize));
+        let (nodes, check, resyncs) = fetch_with_targeted_retry(
+            || async { Err::<Vec<AxNode>, String>("Session detached".to_owned()) },
+            || {
+                let reattachments = Arc::clone(&reattachments);
+                async move {
+                    if let Ok(mut count) = reattachments.lock() {
+                        *count += 1;
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+        assert!(nodes.is_empty());
+        assert_eq!(check.node_count, 0);
+        assert_eq!(check.cdp_error.as_deref(), Some("Session detached"));
+        assert_eq!(
+            reattachments.lock().map(|count| *count).unwrap_or_default(),
+            1
+        );
+        assert_eq!(resyncs, 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_retry_clean_empty_tree_carries_no_cdp_error() {
+        // A successful but empty fetch (`Ok(vec![])`, e.g. genuinely blank
+        // field): `cdp_error` stays `None` with `node_count: 0`, and the
+        // single retry still runs for the empty tree.
+        use std::sync::{Arc, Mutex};
+        let reattachments = Arc::new(Mutex::new(0_usize));
+        let (nodes, check, resyncs) = fetch_with_targeted_retry(
+            || async { Ok::<Vec<AxNode>, String>(Vec::new()) },
+            || {
+                let reattachments = Arc::clone(&reattachments);
+                async move {
+                    if let Ok(mut count) = reattachments.lock() {
+                        *count += 1;
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+        assert!(nodes.is_empty());
+        assert_eq!(check.node_count, 0);
+        assert_eq!(check.cdp_error, None);
+        assert_eq!(
+            reattachments.lock().map(|count| *count).unwrap_or_default(),
+            1
+        );
+        assert_eq!(resyncs, 1);
     }
 }
