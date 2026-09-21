@@ -57,7 +57,10 @@ pub trait LlmUrlProposer: Send + Sync {
 
 /// Detect a portal token from the table's own vocabulary. Exact tokens
 /// only — unknown spellings fall through instead of guessing.
-fn detect_portal(prompt: &str) -> Option<&'static str> {
+/// Public so desktop callers can derive `(portal, intent_class)` from prompt
+/// tokens without hardcoding portal strings.
+#[must_use]
+pub fn detect_portal(prompt: &str) -> Option<&'static str> {
     let tokens = crate::intent_resolver::tokens(prompt);
     PORTALS
         .iter()
@@ -72,11 +75,30 @@ fn accept(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
         .ok()
 }
 
+/// Tab-independent route proposal: derive `(portal, intent_class)` purely
+/// from natural-language prompt tokens plus the caller's topic word (the
+/// primary target noun), querying the normalized `portal_route` table
+/// directly. The active tab's URL is never inspected, vetoed, or filtered —
+/// `current_url` exists only for call-site compatibility and is ignored so
+/// starting on `google.com` or `about:blank` never blocks cross-domain
+/// pre-navigation.
+#[must_use]
+pub fn propose_route(
+    prompt: &str,
+    intent_class: &str,
+    current_url: Option<&url::Url>,
+    ctx: &ResolutionContext<'_>,
+) -> Option<ResolvedRoute> {
+    let _ = current_url;
+    resolve_entry_url(prompt, intent_class, ctx)
+}
+
 /// Resolve an entry URL for an ad-hoc prompt and intent class (the
-/// caller's normalized topic word — today, the ephemeral label).
+/// caller's normalized topic word — today, the ephemeral label or primary
+/// target noun).
 /// Deterministic, offline unless an adapter is configured, and total on
 /// failure: `None` keeps current behavior (manual/portal flow, no silent
-/// navigation).
+/// navigation). Tab-independent: no current-tab URL is inspected.
 #[must_use]
 pub fn resolve_entry_url(
     prompt: &str,
@@ -212,5 +234,29 @@ mod tests {
             panic!("valid LLM answer resolves");
         };
         assert_eq!(resolved.source, RouteSource::LlmFallback);
+    }
+
+    #[test]
+    fn propose_route_ignores_current_tab_url_and_resolves_from_prompt() {
+        // Tab-independent by design: the active tab never vetoes resolution.
+        // The same prompt resolves from `google.com` or `about:blank` purely
+        // via prompt tokens + primary noun against the normalized table.
+        let ctx = empty_ctx();
+        let prompt = "download all my invoices from github";
+        let expected = "https://github.com/account/billing/history";
+        for current in [
+            url::Url::parse("https://google.com").ok(),
+            url::Url::parse("about:blank").ok(),
+            None,
+        ] {
+            let current_ref = current.as_ref();
+            for intent_class in ["invoice", "invoices", "billing"] {
+                let Some(resolved) = propose_route(prompt, intent_class, current_ref, &ctx) else {
+                    panic!("prompt resolves from {current:?} for {intent_class}");
+                };
+                assert_eq!(resolved.source, RouteSource::PortalRouteTable);
+                assert_eq!(resolved.url.as_str(), expected);
+            }
+        }
     }
 }

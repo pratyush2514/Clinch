@@ -18,7 +18,8 @@ pub use intent_resolver::{
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use portal_routes::portal_route;
 pub use route_proposer::{
-    LlmUrlProposer, ResolutionContext, ResolvedRoute, RouteSource, resolve_entry_url,
+    LlmUrlProposer, ResolutionContext, ResolvedRoute, RouteSource, detect_portal, propose_route,
+    resolve_entry_url,
 };
 pub use runner::{
     SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError, StepOutcome,

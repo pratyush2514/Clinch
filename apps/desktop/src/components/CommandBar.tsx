@@ -36,6 +36,8 @@ type DispatchOutcome = {
     stoppedAt: number | null;
   };
   steps: unknown[];
+  routeLog?: string | null;
+  telemetryLog?: string | null;
 };
 
 export default function CommandBar({ ready, busy, portal, report, errorMessage }: {
@@ -71,6 +73,12 @@ export default function CommandBar({ ready, busy, portal, report, errorMessage }
       });
       setOutcome(result);
       setApproval(null);
+      // Route telemetry renders first so Session Activity shows the resolved
+      // entry (or miss) before the terminal outcome line.
+      if (result.routeLog) report(result.routeLog);
+      // Snapshot telemetry follows, so evaluated node counts are visible in
+      // Session Activity without polling the backend store.
+      if (result.telemetryLog) report(result.telemetryLog);
       report(`“${prompt.trim()}” ran ${result.kind} workflow ${result.name}: ${result.result.status.replaceAll("_", " ")} · ${result.result.completedSteps}/${result.result.totalSteps} steps.`);
     } catch (error) {
       report(errorMessage(error));

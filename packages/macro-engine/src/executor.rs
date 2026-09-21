@@ -789,7 +789,9 @@ pub fn entry_url_mismatched(current: &url::Url, entry: &url::Url) -> bool {
 
 /// Enforce the navigation pre-condition before grounding: when the live page
 /// differs from the intent's entry URL, navigate there first (`goto` awaits
-/// page load). An unreadable current URL also navigates — landing on known
+/// page load), then refresh the driver target handle against the settled
+/// top-level page session so post-swap CDP domains are re-armed before any
+/// snapshot. An unreadable current URL also navigates — landing on known
 /// state is the safe move. Same-portal moves keep origin checks green;
 /// anything else fails closed on the subsequent check. Returns whether
 /// navigation fired.
@@ -808,6 +810,7 @@ pub async fn ensure_at_entry_url(
         return Ok(false);
     }
     browser.navigate(entry).await?;
+    browser.refresh_target_session().await;
     Ok(true)
 }
 
@@ -830,7 +833,87 @@ async fn ensure_entry(
     Ok(())
 }
 
-/// Execute one intent: snapshot, resolve, badge, click. The badge stays
+/// Content-settle cadence for post-navigation snapshots: poll the live page
+/// every 250 ms, for at most 5000 ms, before the official ARIA snapshot.
+/// Async tables (e.g. GitHub Payment History) render rows after `load`, so
+/// snapshotting immediately yields zero candidates; explicit state polling
+/// replaces fixed sleeps and blind re-navigation retries.
+pub const SETTLE_POLL_MS: u64 = 250;
+/// Upper bound on one settle wait. Expiry is not an error — the snapshot
+/// still runs, so slow pages degrade to previous behavior instead of failing.
+pub const SETTLE_TIMEOUT_MS: u64 = 5000;
+
+/// Probe text for settle polling: the primary target noun when the intent
+/// carries one, else the label query. Both are prompt-derived, so readiness
+/// means "the content the user asked about rendered".
+#[must_use]
+pub fn settle_probe_text(intent: &SemanticIntent) -> &str {
+    intent
+        .primary_target_noun
+        .as_deref()
+        .filter(|noun| !noun.trim().is_empty())
+        .unwrap_or(&intent.label_query)
+}
+
+/// Poll `snapshot` until its tree holds at least one valid target
+/// candidate for `intent`, or `timeout` elapses. Readiness means
+/// [`resolve_batch`] yields a [`ResolveOutcome::BatchMatch`] — a static
+/// column header (`<th>Invoice</th>`) never satisfies it, only actionable
+/// row candidates do, so body-text matches cannot end the wait early. The
+/// first snapshot runs immediately, so already-settled pages pay one check
+/// and no sleep. Returns `true` when candidates landed, `false` on
+/// timeout. Snapshot errors count as not-ready (transient mid-navigation
+/// states) and keep polling within the same bound. Pure polling policy
+/// over an injected snapshot provider, so delayed-render fixtures can
+/// prove the loop hermetically without a browser.
+async fn wait_for_candidates_with<F, Fut>(
+    mut snapshot: F,
+    intent: &SemanticIntent,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<AxElement>>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let settled = snapshot().await.is_some_and(|elements| {
+            matches!(
+                resolve_batch(&elements, intent),
+                ResolveOutcome::BatchMatch(_)
+            )
+        });
+        if settled {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Wait for the intent's row candidates to render after navigation.
+/// Fail-open by design: timeouts and transient snapshot errors both fall
+/// through to the official snapshot, so unsettled pages behave exactly as
+/// before instead of failing. Returns whether candidates were observed;
+/// callers snapshot either way.
+pub async fn wait_for_settled_candidates(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    intent: &SemanticIntent,
+) -> bool {
+    wait_for_candidates_with(
+        || async { browser.ax_snapshot(origin).await.ok() },
+        intent,
+        std::time::Duration::from_millis(SETTLE_POLL_MS),
+        std::time::Duration::from_millis(SETTLE_TIMEOUT_MS),
+    )
+    .await
+}
+
+/// Execute one intent: settle, snapshot, resolve, badge, click. The badge stays
 /// visible on success as evidence of what was acted on; failures clear it so
 /// no stale overlay survives.
 ///
@@ -845,6 +928,7 @@ pub async fn execute_intent(
 ) -> Result<IntentOutcome, IntentError> {
     ensure_entry(browser, intent).await?;
     browser.check_origin(origin).await?;
+    wait_for_settled_candidates(browser, origin, intent).await;
     let elements = browser.ax_snapshot(origin).await?;
     let resolved = resolve_intent(&elements, intent)
         .ok_or_else(|| IntentError::NoMatch(grounding_diagnostic(&elements, intent)))?;
@@ -925,6 +1009,7 @@ pub async fn execute_batch(
     }
     ensure_entry(browser, intent).await?;
     browser.check_origin(origin).await?;
+    wait_for_settled_candidates(browser, origin, intent).await;
     let elements = browser.ax_snapshot(origin).await?;
     let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, intent) else {
         return Err(IntentError::NoMatch(grounding_diagnostic(
@@ -1834,5 +1919,179 @@ mod tests {
         );
         assert!(diagnostic.contains("Candidate 0 text:"), "{diagnostic}");
         assert!(diagnostic.contains("Candidate 1 text:"), "{diagnostic}");
+    }
+
+    /// Plural invoice intent mirroring the billing-history run: link role,
+    /// `download` label, `invoice` noun anchor, batch collection on.
+    fn invoice_batch_intent() -> SemanticIntent {
+        let mut intent = prose_intent("link", "download", None, "download all my invoices");
+        intent.is_plural = true;
+        intent.primary_target_noun = Some("invoice".into());
+        intent
+    }
+
+    /// Payment-history rows as the AX tree reports them once the async table
+    /// renders: download links carrying invoice evidence in name or
+    /// surroundings, plus one sidebar link the landmark gate must exclude.
+    fn payment_history_rows() -> Vec<AxElement> {
+        let mut rows = Vec::new();
+        for (index, id) in ["INV-001", "INV-002", "INV-003"].iter().enumerate() {
+            rows.push(AxElement {
+                backend_node_id: i64::try_from(index + 1).unwrap_or(1),
+                container_text: vec![(*id).into(), "Invoices".into()],
+                landmark: None,
+                ..element("link", "Download")
+            });
+        }
+        rows.push(AxElement {
+            backend_node_id: 11,
+            container_text: vec!["Primary".into()],
+            landmark: Some("navigation".into()),
+            ..element("link", "Download")
+        });
+        rows
+    }
+
+    #[test]
+    fn settle_cadence_is_explicit_state_polling() {
+        // Regression guard on the contracted cadence: 250 ms polls, 5000 ms
+        // ceiling. Production waits reuse these; hermetic tests below pass
+        // scaled values to stay fast.
+        assert_eq!(SETTLE_POLL_MS, 250);
+        assert_eq!(SETTLE_TIMEOUT_MS, 5000);
+        // Probe text is the prompt-derived noun, falling back to the label.
+        let anchored = invoice_batch_intent();
+        assert_eq!(settle_probe_text(&anchored), "invoice");
+        let bare = intent("link", "download");
+        assert_eq!(settle_probe_text(&bare), "download");
+    }
+
+    /// Static header-only tree: what the AX snapshot holds before the async
+    /// table renders. The `Invoice` column header exists from page load, but
+    /// as a non-interactive `columnheader` it can never satisfy
+    /// [`resolve_batch`] — readiness needs row candidates, not header text.
+    fn header_only_tree() -> Vec<AxElement> {
+        vec![AxElement {
+            backend_node_id: 99,
+            role: "columnheader".into(),
+            name: "Invoice".into(),
+            description: String::new(),
+            container_text: Vec::new(),
+            landmark: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn settle_polling_waits_past_headers_for_row_candidates() {
+        // The reported failure: `<th>Invoice</th>` exists on page load, so a
+        // body-text check returns in <50 ms while the rows are still absent.
+        // The loop must keep polling past header-only trees until row
+        // candidate nodes land (header snapshots stand in for the first
+        // ~10 ms of GitHub's ~500 ms async render; production cadence is
+        // 250 ms polls / 5000 ms ceiling).
+        use std::sync::{Arc, Mutex};
+        let polls = Arc::new(Mutex::new(0_usize));
+        let intent = invoice_batch_intent();
+        // Headers alone never settle: no actionable candidate exists yet.
+        assert!(matches!(
+            resolve_batch(&header_only_tree(), &intent),
+            ResolveOutcome::NoMatch(_)
+        ));
+        let seen = wait_for_candidates_with(
+            {
+                let polls = Arc::clone(&polls);
+                move || {
+                    let polls = Arc::clone(&polls);
+                    async move {
+                        let mut count = polls
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *count += 1;
+                        // Rows render after the second poll; earlier polls
+                        // see the header-only tree.
+                        Some(if *count > 2 {
+                            payment_history_rows()
+                        } else {
+                            header_only_tree()
+                        })
+                    }
+                }
+            },
+            &intent,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        assert!(seen, "polling observes the delayed rows");
+        assert!(
+            *polls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                > 1,
+            "more than one poll ran before candidates landed"
+        );
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&payment_history_rows(), &intent)
+        else {
+            panic!("settled rows batch together")
+        };
+        assert_eq!(
+            batch
+                .iter()
+                .map(|element| element.backend_node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_timeout_fails_closed_when_rows_never_render() {
+        // Headers forever, rows never: the loop must expire at its timeout
+        // (scaled down here; production waits the full 5000 ms) and report
+        // unready, and the field must fail closed with a diagnostic — never
+        // an empty batch, never a blind navigation.
+        let intent = invoice_batch_intent();
+        let seen = wait_for_candidates_with(
+            || async { Some(header_only_tree()) },
+            &intent,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(!seen, "expiry reports unready");
+        let empty: Vec<AxElement> = Vec::new();
+        assert!(matches!(
+            resolve_batch(&empty, &intent),
+            ResolveOutcome::NoMatch(_)
+        ));
+        let diagnostic = grounding_diagnostic(&empty, &intent);
+        assert!(
+            diagnostic.contains("Evaluated 0 candidates"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn batch_scoring_matches_recorded_replay_for_download_files() {
+        // Replay-target alignment: the fast replay path (`resolve_fast`,
+        // what recorded `Download files` steps use) and the batch collector
+        // share one scoring model, so the replay winner must sit inside the
+        // batch set — never a control the batch would refuse.
+        let intent = invoice_batch_intent();
+        let rows = payment_history_rows();
+        let (replayed, metrics) = resolve_fast(&rows, &intent);
+        assert_eq!(metrics.cost_usd.to_bits(), 0.0f64.to_bits());
+        let Some(winner) = replayed else {
+            panic!("replay resolves a winner")
+        };
+        let ResolveOutcome::BatchMatch(batch) = resolve_batch(&rows, &intent) else {
+            panic!("batch collects")
+        };
+        assert_eq!(batch.len(), 3);
+        assert!(
+            batch
+                .iter()
+                .any(|element| element.backend_node_id == winner.element.backend_node_id),
+            "replay winner is a batch member"
+        );
     }
 }

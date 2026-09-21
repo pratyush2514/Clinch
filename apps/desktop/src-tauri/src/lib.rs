@@ -301,6 +301,98 @@ mod tests {
         id: u64,
     }
 
+    /// Restores `CLINCH_CHROMIUM_PATH` on drop so the hermetic browser
+    /// failure below never leaks into other tests sharing the process.
+    /// Sound here: no other test in this workspace launches a browser
+    /// (all browser fixtures are `#[ignore]`d), so nothing else reads the
+    /// variable during the guard's lifetime.
+    struct ChromiumEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    #[allow(unsafe_code)]
+    impl ChromiumEnvGuard {
+        fn hold_bogus() -> Self {
+            let prior = std::env::var_os("CLINCH_CHROMIUM_PATH");
+            // Edition 2024 marks env mutation unsafe (process-wide); see the
+            // soundness note on the struct.
+            unsafe {
+                std::env::set_var("CLINCH_CHROMIUM_PATH", "nonexistent-chromium-hermetic-test");
+            }
+            Self { prior }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for ChromiumEnvGuard {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                unsafe {
+                    std::env::set_var("CLINCH_CHROMIUM_PATH", prior);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("CLINCH_CHROMIUM_PATH");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_button_dispatch_proposes_route_and_logs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The exact command string the frontend Run button invokes
+        // (`CommandBar.tsx` → `invoke("dispatch_natural_command", …)`).
+        // With a github session connected, the IPC handler must reach the
+        // ephemeral dispatch path: route proposal runs before any browser
+        // attach, so even though no Chromium exists here
+        // (`browser_unavailable`), `session_events` still carries
+        // `route_proposed` and step 1 would carry the billing-history entry.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "init")?;
+        service
+            .test_connect(url::Url::parse("https://github.com/").map_err(|_| "url")?)
+            .map_err(|_| "connect")?;
+        let app = with_commands(mock_builder())
+            .manage(service)
+            .build(mock_context(noop_assets()))?;
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
+        let origin = url::Url::parse("http://tauri.localhost")?;
+        let _chromium = ChromiumEnvGuard::hold_bogus();
+        let request = InvokeRequest {
+            cmd: "dispatch_natural_command".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: origin,
+            body: InvokeBody::Json(serde_json::json!({
+                "prompt": "download all my invoices from github",
+                "progress": "__CHANNEL__:0",
+            })),
+            headers: tauri::http::HeaderMap::new(),
+            invoke_key: INVOKE_KEY.into(),
+        };
+        let error = get_ipc_response(&webview, request)
+            .err()
+            .ok_or("expected browser_unavailable past proposal")?;
+        assert_eq!(error["code"], "browser_unavailable");
+        // Proposal ran on the IPC path before the browser attach failed.
+        let events = app
+            .state::<AppService>()
+            .test_session_events()
+            .await
+            .map_err(|_| "events")?;
+        assert!(
+            events
+                .iter()
+                .any(|outcome| outcome
+                    .starts_with("route_proposed:github.com/account/billing/history")),
+            "route_proposed logged, got {events:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn task_channel_command_requires_connected_session() -> Result<(), Box<dyn std::error::Error>> {
         let app = with_commands(mock_builder())

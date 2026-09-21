@@ -712,12 +712,13 @@ fn singular_stem(token: &str) -> String {
 /// Primary target noun: the last identifying keyword of the
 /// identifier-stripped prompt — the same stream the label comes from —
 /// stemmed (`download all my invoices` → `invoice`), skipping the
-/// connected portal's own host tokens (`download all my invoices from
-/// github` still anchors `invoice`, never the `github` trailer — the same
-/// host/plumbing split the saved path uses). Collection modifiers never
-/// survive filtering, so the noun is always the content word — never `all`.
-/// `None` when stripping leaves no keywords (a lone identifier scopes by
-/// container instead and needs no anchor).
+/// connected portal's own host tokens and the curated portal vocabulary
+/// (`download all my invoices from github` still anchors `invoice`, never
+/// the `github` trailer — the same host/plumbing split the saved path uses,
+/// and it holds even when parked on another portal such as `google.com`).
+/// Collection modifiers never survive filtering, so the noun is always the
+/// content word — never `all`. `None` when stripping leaves no keywords (a
+/// lone identifier scopes by container instead and needs no anchor).
 fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Option<String> {
     let host_tokens: Vec<String> = connected_origin.map_or_else(Vec::new, |origin| {
         content_tokens(origin.as_str())
@@ -728,7 +729,9 @@ fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Op
     label_keywords(prompt)
         .into_iter()
         .rev()
-        .find(|token| !host_tokens.contains(token))
+        .find(|token| {
+            !host_tokens.contains(token) && !crate::portal_routes::PORTALS.contains(&token.as_str())
+        })
         .map(|token| singular_stem(token.as_str()))
 }
 
@@ -1678,6 +1681,14 @@ mod tests {
         let portal = portal()?;
         assert_eq!(
             extract_primary_noun("download all my invoices from github", Some(&portal)).as_deref(),
+            Some("invoice")
+        );
+        // Cross-portal starts hold too: parked on `google.com`, the `github`
+        // trailer is still plumbing (curated portal vocabulary), so the
+        // anchor stays the content noun and pre-navigation can fire.
+        let google = url::Url::parse("https://google.com")?;
+        assert_eq!(
+            extract_primary_noun("download all my invoices from github", Some(&google)).as_deref(),
             Some("invoice")
         );
         // Identifier-stripped streams only: a lone identifier arrives

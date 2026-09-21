@@ -6,7 +6,9 @@ mod picker;
 mod preview;
 mod session;
 mod som;
-pub use a11y::{AxElement, interactive_elements, render_semantic_list};
+pub use a11y::{
+    AX_TARGET_RESYNC_LINE, AxElement, AxResyncCheck, interactive_elements, render_semantic_list,
+};
 pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
 use chromiumoxide::{
     Browser, Page,
@@ -23,7 +25,12 @@ pub use preview::{DomRegion, Viewport};
 pub use session::{AuthSignal, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
-use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::{Mutex, atomic::AtomicU64},
+    time::Duration,
+};
 use tokio::{
     process::{Child, Command},
     task::JoinHandle,
@@ -89,6 +96,14 @@ pub struct ManagedBrowser {
     browser: Browser,
     page: Page,
     handler: JoinHandle<()>,
+    /// Zero-node AX resyncs since the last drain. Incremented when a
+    /// snapshot finds an empty tree on a real page and re-arms the domain;
+    /// service drains it to journal `ax_target_resync` lines.
+    ax_resyncs: AtomicU64,
+    /// Last resync decision inputs, stored on every zero-node observation
+    /// (predicate true or not). Service drains it to journal the
+    /// `ax_resync_check` line. Instrumentation only.
+    last_resync_check: Mutex<Option<a11y::AxResyncCheck>>,
 }
 
 impl ManagedBrowser {
@@ -183,6 +198,8 @@ impl ManagedBrowser {
             browser,
             page,
             handler: task,
+            ax_resyncs: AtomicU64::new(0),
+            last_resync_check: Mutex::new(None),
         };
         let mut script = AddScriptToEvaluateOnNewDocumentParams::new(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
@@ -290,6 +307,45 @@ impl ManagedBrowser {
             .map_err(|_| BrowserError::Timeout)?
             .map_err(|_| BrowserError::Navigation)?;
         Ok(())
+    }
+
+    /// Re-anchor the driver on the live top-level page session after a
+    /// settled navigation. Cross-origin renderer swaps can leave CDP
+    /// domains armed on the previous process, so this round-trips
+    /// `Target.getTargets` to confirm browser-target coherence and
+    /// re-issues `Accessibility.enable` on the current session. It cannot
+    /// replace the owned `Page` handle (chromiumoxide owns session
+    /// binding); it re-arms domain state on it. Fail-open by design —
+    /// returns nothing, ignores transient post-navigation errors — because
+    /// the snapshot path re-verifies before acting.
+    pub async fn refresh_target_session(&self) {
+        use chromiumoxide::cdp::browser_protocol::{
+            accessibility::EnableParams, target::GetTargetsParams,
+        };
+        let _ =
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetTargetsParams::default())).await;
+        let _ = tokio::time::timeout(IO_TIMEOUT, self.page.execute(EnableParams {})).await;
+    }
+
+    /// Probe whether the live page body text contains `needle`
+    /// (case-insensitive substring over `document.body.innerText`).
+    /// Read-only readiness signal for content-settle polling: never
+    /// navigates, never mutates. Fails closed on CDP, timeout, or parse
+    /// errors so settle loops can tell "not ready" from "ready".
+    ///
+    /// # Errors
+    /// Reports connection, timeout, evaluation, or invalid-needle failures.
+    pub async fn page_text_contains(&self, needle: &str) -> Result<bool, BrowserError> {
+        let needle = serde_json::to_string(needle).map_err(|_| BrowserError::InvalidAction)?;
+        let expression = format!(
+            "(() => {{ const n={needle}; const t=(document.body && document.body.innerText)||''; return t.toLowerCase().includes(n.toLowerCase()); }})()"
+        );
+        tokio::time::timeout(IO_TIMEOUT, self.page.evaluate(expression))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?
+            .into_value::<bool>()
+            .map_err(|_| BrowserError::InvalidAction)
     }
 
     /// Stop and reap the managed child before its profile can be reopened.

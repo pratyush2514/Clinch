@@ -26,6 +26,9 @@ pub enum AppError {
     StaleApproval,
     SessionRequired,
     WorkflowFailed,
+    /// Extension bridge reports a logged-out session for the target portal.
+    /// Carries the full human-readable message so the UI can surface it.
+    AuthenticationRequired(String),
     /// Picking needs the visible managed window: replays run headless, so an
     /// overlay armed there can never receive a click.
     PickerUnavailable,
@@ -212,6 +215,18 @@ pub struct DispatchOutcome {
     /// playbooks without reconstructing them client-side. Additive to the
     /// IPC shape: older clients ignore unknown keys.
     steps: Vec<playbook_store::Step>,
+    /// Route telemetry for the Session Activity UI: the exact
+    /// `route_proposed:…` / `route_resolution_miss:…` line recorded to
+    /// `session_events`, so the command bar can render it immediately
+    /// without polling. `None` for stored replays (no proposal attempted).
+    /// Additive: older clients ignore unknown keys.
+    route_log: Option<String>,
+    /// Snapshot telemetry for the Session Activity UI: the exact
+    /// `ax_snapshot_telemetry:…` line from the last candidate snapshot, so
+    /// node counts render without polling. `None` when no snapshot ran
+    /// (stored replays, single-step ephemerals snapshotting inside the
+    /// macro engine). Additive: older clients ignore unknown keys.
+    telemetry_log: Option<String>,
 }
 
 /// POC health metrics for local testing: playbook runs, macro-replay share
@@ -281,6 +296,25 @@ impl AppService {
                     .map_err(|_| AppError::StorageUnavailable)
             })
             .await
+    }
+
+    /// Test-only session plumbing: connect `portal` without launching a
+    /// browser (mirrors the `session_origin` a manual login would leave).
+    #[cfg(test)]
+    pub(crate) fn test_connect(&self, portal: url::Url) -> Result<(), AppError> {
+        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal);
+        Ok(())
+    }
+
+    /// Test-only read of the Session Activity backing store.
+    #[cfg(test)]
+    pub(crate) async fn test_session_events(&self) -> Result<Vec<String>, AppError> {
+        let pool = self.database().await?;
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT outcome FROM session_events")
+            .fetch_all(pool)
+            .await
+            .map_err(|_| AppError::StorageUnavailable)?;
+        Ok(rows.into_iter().map(|(outcome,)| outcome).collect())
     }
 
     pub async fn initialize(&self) -> Result<StorageStatus, AppError> {
@@ -1199,17 +1233,27 @@ impl AppService {
             name,
             result,
             steps: playbook.steps.clone(),
+            route_log: None,
+            telemetry_log: None,
         })
     }
 
-    /// Cold-path entry resolution: when the intent carries no entry, ask
-    /// the tiered proposer (account entity → route table → configured LLM
-    /// only) and adopt validated proposals. Logs host plus path — never
-    /// query strings — to session activity before any downstream navigation
-    /// occurs. No-op when an entry is already present.
-    async fn propose_entry_url(&self, prompt: &str, intent: &mut macro_engine::SemanticIntent) {
+    /// Cold-path entry resolution: tab-independent by design. Never inspects
+    /// the active tab's URL, never vetoes or filters against it — `(portal,
+    /// intent_class)` comes purely from prompt tokens plus the primary target
+    /// noun, queried against the normalized `portal_route` table. Shared by
+    /// the single and batch dispatch lanes. Records host plus path — never
+    /// query strings — to `session_events` and returns the exact log line so
+    /// dispatch outcomes can surface it in the Session Activity UI
+    /// immediately. Returns `None` when an entry is already present (nothing
+    /// proposed, nothing to surface).
+    async fn propose_entry_url(
+        &self,
+        prompt: &str,
+        intent: &mut macro_engine::SemanticIntent,
+    ) -> Option<String> {
         if intent.entry_url.is_some() {
-            return;
+            return None;
         }
         // Production wires no account directory (no stored credential backs
         // one) and no LLM adapter: only the curated table tier can fire.
@@ -1217,18 +1261,89 @@ impl AppService {
             account_dir: None,
             llm: None,
         };
-        if let Some(route) =
-            orchestration_engine::resolve_entry_url(prompt, &intent.label_query, &ctx)
+        // Try the label first, then the primary target noun when it differs:
+        // both are prompt-derived topic words, so neither inspects tab state.
+        let mut resolved =
+            orchestration_engine::resolve_entry_url(prompt, &intent.label_query, &ctx);
+        if resolved.is_none()
+            && let Some(noun) = intent.primary_target_noun.as_deref()
+            && !noun.eq_ignore_ascii_case(&intent.label_query)
         {
-            let _ = self
-                .record(&format!(
-                    "route_proposed:{}{} source:{:?}",
-                    route.url.host_str().unwrap_or("?"),
-                    route.url.path(),
-                    route.source
-                ))
-                .await;
+            resolved = orchestration_engine::resolve_entry_url(prompt, noun, &ctx);
+        }
+        if let Some(route) = resolved {
+            let line = format!(
+                "route_proposed:{}{} · source: {:?}",
+                route.url.host_str().unwrap_or("?"),
+                route.url.path(),
+                route.source
+            );
+            let _ = self.record(&line).await;
             intent.entry_url = Some(route.url.as_str().to_owned());
+            Some(line)
+        } else {
+            let line = format!("route_resolution_miss: prompt='{prompt}'");
+            let _ = self.record(&line).await;
+            Some(line)
+        }
+    }
+
+    /// Cross-domain pre-navigation: when step 1 names an entry URL that
+    /// differs from the live tab (origin/path), navigate there first. Reuses
+    /// the macro engine's existing settle routine (`goto` awaits page load),
+    /// so starting on `google.com` or `about:blank` lands on the route before
+    /// any ARIA snapshot. No-op without a step-1 entry URL.
+    async fn pre_navigate_to_entry(
+        browser: &Arc<ManagedBrowser>,
+        intent: &macro_engine::SemanticIntent,
+    ) -> Result<bool, AppError> {
+        let Some(entry) = intent.entry_url.as_deref() else {
+            return Ok(false);
+        };
+        let entry_url = url::Url::parse(entry)
+            .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        macro_engine::ensure_at_entry_url(browser, &entry_url)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)
+    }
+
+    /// Pre-navigation driven explicitly by step 1's entry URL: extracts the
+    /// step-1 intent and reuses [`Self::pre_navigate_to_entry`], so dispatch
+    /// lanes provably navigate from `step.entry_url` (identical to
+    /// `intent.entry_url` by construction) before the first `ax_snapshot`.
+    async fn pre_navigate_to_step(
+        browser: &Arc<ManagedBrowser>,
+        steps: &[playbook_store::Step],
+    ) -> Result<bool, AppError> {
+        let [playbook_store::Step::Semantic { intent }, ..] = steps else {
+            return Ok(false);
+        };
+        Self::pre_navigate_to_entry(browser, intent).await
+    }
+
+    /// Post-navigation session check via the existing Extension Bridge.
+    /// Fail-open when no companion is connected (nothing to report
+    /// logged-out); fails closed only when the bridge answers `no_cookies`
+    /// for the target portal — no candidate snapshot may run unauthenticated.
+    async fn verify_bridge_auth(&self, portal: &url::Url) -> Result<(), AppError> {
+        let server = self.bridge.lock().map_err(|_| AppError::Internal)?.clone();
+        let Some(server) = server else {
+            return Ok(());
+        };
+        if server.connection_count() == 0 {
+            return Ok(());
+        }
+        match server
+            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT)
+            .await
+        {
+            Err(crate::ws_server::BridgeError::NoCookies) => {
+                let label = portal.host_str().unwrap_or("portal").to_owned();
+                Err(AppError::AuthenticationRequired(format!(
+                    "Authentication required: extension bridge reports logged-out status for {label}"
+                )))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1240,7 +1355,11 @@ impl AppService {
         mut intent: macro_engine::SemanticIntent,
         emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
-        self.propose_entry_url(&prompt, &mut intent).await;
+        // Ephemeral entry point (command-bar Run): propose the route at the
+        // top, before any macro task step exists, so `intent.entry_url` and
+        // step 1 carry the same proposed route into pre-navigation. The
+        // returned log line travels on the outcome for immediate UI render.
+        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
         let name = orchestration_engine::ephemeral_name(&prompt);
         let playbook = playbook_store::Playbook::new(
             name.clone(),
@@ -1248,6 +1367,13 @@ impl AppService {
             vec![playbook_store::Step::Semantic { intent }],
         )
         .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        // Lazy browser attach when disconnected, then cross-domain
+        // pre-navigation from step 1's entry (reusing the settle routine)
+        // before any snapshot. Unauthenticated bridge sessions halt here —
+        // never snapshotted.
+        let browser = self.browser(false).await?;
+        Self::pre_navigate_to_step(&browser, &playbook.steps).await?;
+        self.verify_bridge_auth(&portal).await?;
         let result = self
             .run_steps(
                 portal,
@@ -1264,6 +1390,10 @@ impl AppService {
             name,
             result,
             steps: playbook.steps.clone(),
+            route_log,
+            // The single lane snapshots inside the macro engine, which has
+            // no journal access, so no per-snapshot line exists to surface.
+            telemetry_log: None,
         })
     }
 
@@ -1281,28 +1411,49 @@ impl AppService {
         mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
-        self.propose_entry_url(&prompt, &mut intent).await;
+        // Ephemeral entry point (command-bar Run): propose the route at the
+        // top, before any macro task step exists. The log line travels on
+        // every batch outcome so failures still surface the proposal.
+        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
         let (browser, run_id, journal_id, journal) = self.begin_batch_run(&portal).await?;
         let name = orchestration_engine::ephemeral_name(&prompt);
+        // The proposed route lives on both `intent.entry_url` and step 1, so
+        // pre-navigation provably runs from `step.entry_url`.
         let steps = vec![playbook_store::Step::Semantic {
             intent: intent.clone(),
         }];
+        // Cross-domain pre-navigation when step 1's entry differs from the
+        // live tab (origin/path): navigate first via the shared settle
+        // routine, then verify bridge auth before any ARIA snapshot.
+        Self::pre_navigate_to_step(&browser, &steps).await?;
+        self.verify_bridge_auth(&portal).await?;
         let events = std::sync::Mutex::new(&mut emit);
         // Read-only snapshot first: the approval names the real candidate
         // count, and empty fields fail closed before any gate is raised.
         // A single entry-URL retry covers wrong-page starts: navigate once,
         // re-snapshot once, then stop. No approval gate ever opens on zero
         // candidates.
-        let mut candidates = Self::snapshot_batch_candidates(&browser, &portal, &intent).await;
-        if candidates.is_none() {
-            candidates = Self::retry_batch_on_entry(&browser, &portal, &intent).await;
-        }
+        let (candidates, telemetry_log) = self
+            .snapshot_settled_batch_candidates(&browser, &portal, &intent)
+            .await;
+        // Every terminal outcome below carries the same steps plus the
+        // route-proposal and snapshot-telemetry lines, so failures still
+        // surface both in the UI.
+        let outcome = |status, completed: usize, stopped: Option<usize>| {
+            Self::batch_outcome(
+                name.clone(),
+                steps.clone(),
+                status,
+                completed,
+                stopped,
+                route_log.clone(),
+                telemetry_log.clone(),
+            )
+        };
         let Some(candidates) = candidates else {
             Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", 0).await;
             let _ = self.record("batch:denied:ZeroCandidatesFound").await;
-            return Ok(Self::batch_outcome(
-                name,
-                steps,
+            return Ok(outcome(
                 orchestration_engine::SequenceStatus::Failed,
                 0,
                 Some(0),
@@ -1319,9 +1470,7 @@ impl AppService {
                 run_id,
                 orchestration_engine::SequencePhase::Blocked,
             );
-            return Ok(Self::batch_outcome(
-                name,
-                steps,
+            return Ok(outcome(
                 orchestration_engine::SequenceStatus::Denied,
                 0,
                 Some(0),
@@ -1335,9 +1484,7 @@ impl AppService {
                     run_id,
                     orchestration_engine::SequencePhase::Completed,
                 );
-                Ok(Self::batch_outcome(
-                    name,
-                    steps,
+                Ok(outcome(
                     orchestration_engine::SequenceStatus::Completed,
                     1,
                     None,
@@ -1361,9 +1508,7 @@ impl AppService {
                     run_id,
                     orchestration_engine::SequencePhase::Blocked,
                 );
-                Ok(Self::batch_outcome(
-                    name,
-                    steps,
+                Ok(outcome(
                     orchestration_engine::SequenceStatus::Failed,
                     clicks_completed,
                     Some(failed_candidate_index),
@@ -1376,9 +1521,7 @@ impl AppService {
                     run_id,
                     orchestration_engine::SequencePhase::Blocked,
                 );
-                Ok(Self::batch_outcome(
-                    name,
-                    steps,
+                Ok(outcome(
                     orchestration_engine::SequenceStatus::Failed,
                     0,
                     Some(0),
@@ -1428,33 +1571,139 @@ impl AppService {
         Ok((browser, run_id, journal_id, journal))
     }
 
+    /// Count snapshot nodes mentioning the target noun (case-insensitive
+    /// substring over accessible name, description, and surroundings).
+    /// Mirrors the batch noun gate so telemetry and selection agree; an
+    /// empty noun matches nothing.
+    fn count_noun_matches(elements: &[browser_driver::AxElement], noun: &str) -> usize {
+        let stem = noun.trim().to_lowercase();
+        if stem.is_empty() {
+            return 0;
+        }
+        elements
+            .iter()
+            .filter(|element| {
+                element.name.to_lowercase().contains(&stem)
+                    || element.description.to_lowercase().contains(&stem)
+                    || element
+                        .container_text
+                        .iter()
+                        .any(|context| context.to_lowercase().contains(&stem))
+            })
+            .count()
+    }
+
+    /// Session-activity line for one candidate snapshot, e.g.
+    /// `ax_snapshot_telemetry: total_nodes=142, target_noun_matches=3
+    /// (noun='invoice')`. Counts carry no URLs, labels, or page text —
+    /// only volumes plus the prompt-derived noun.
+    fn snapshot_telemetry_line(total_nodes: usize, noun_matches: usize, noun: &str) -> String {
+        format!(
+            "ax_snapshot_telemetry: total_nodes={total_nodes}, target_noun_matches={noun_matches} (noun='{noun}')"
+        )
+    }
+
+    /// Log one snapshot's telemetry to `session_events`, fail-open: a
+    /// journal write must never fail a run.
+    async fn record_snapshot_telemetry(
+        &self,
+        elements: &[browser_driver::AxElement],
+        intent: &macro_engine::SemanticIntent,
+    ) -> String {
+        let noun = macro_engine::settle_probe_text(intent);
+        let line = Self::snapshot_telemetry_line(
+            elements.len(),
+            Self::count_noun_matches(elements, noun),
+            noun,
+        );
+        let _ = self.record(&line).await;
+        line
+    }
+
     /// Single entry-URL retry for an empty batch field: navigate once when
-    /// the intent names an entry, re-snapshot once, then stop — `None` when
-    /// still empty, so the run fails closed with no approval gate opened.
+    /// the intent names an entry, settle for rendered row candidates,
+    /// re-snapshot once, then stop — `None` when still empty, so the run
+    /// fails closed with no approval gate opened. Returns the last
+    /// snapshot's telemetry line alongside the candidates.
     async fn retry_batch_on_entry(
+        &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         intent: &macro_engine::SemanticIntent,
-    ) -> Option<Vec<browser_driver::AxElement>> {
-        let entry = intent.entry_url.as_deref()?;
-        let entry_url = url::Url::parse(entry).ok()?;
-        browser.navigate(&entry_url).await.ok()?;
-        Self::snapshot_batch_candidates(browser, portal, intent).await
+    ) -> (Option<Vec<browser_driver::AxElement>>, Option<String>) {
+        let Some(entry) = intent.entry_url.as_deref() else {
+            return (None, None);
+        };
+        let Ok(entry_url) = url::Url::parse(entry) else {
+            return (None, None);
+        };
+        if browser.navigate(&entry_url).await.is_err() {
+            return (None, None);
+        }
+        macro_engine::wait_for_settled_candidates(browser, portal, intent).await;
+        let (candidates, telemetry) = self
+            .snapshot_batch_candidates(browser, portal, intent)
+            .await;
+        (candidates, Some(telemetry))
+    }
+
+    /// Settle-aware candidate collection for the batch lane: poll for
+    /// rendered row candidates, snapshot once for the approval count, then
+    /// take the single entry-URL retry on empty fields. `None` opens no
+    /// approval gate — the run fails closed. Returns the last snapshot's
+    /// telemetry line so outcomes can surface it in the UI.
+    async fn snapshot_settled_batch_candidates(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        intent: &macro_engine::SemanticIntent,
+    ) -> (Option<Vec<browser_driver::AxElement>>, Option<String>) {
+        macro_engine::wait_for_settled_candidates(browser, portal, intent).await;
+        let (candidates, telemetry) = self
+            .snapshot_batch_candidates(browser, portal, intent)
+            .await;
+        if candidates.is_some() {
+            return (candidates, Some(telemetry));
+        }
+        self.retry_batch_on_entry(browser, portal, intent).await
     }
 
     /// Read-only pre-snapshot for the batch lane: live candidates for the
     /// approval count, or `None` when the field is empty or unreadable.
-    /// Snapshot failures fail closed like single-run browser errors do.
+    /// Every snapshot — hit or miss — logs its telemetry first, so a zero
+    /// field still leaves evidence instead of silence, and returns the
+    /// logged line for UI surfacing. Snapshot failures fail closed like
+    /// single-run browser errors do.
     async fn snapshot_batch_candidates(
+        &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         intent: &macro_engine::SemanticIntent,
-    ) -> Option<Vec<browser_driver::AxElement>> {
-        let elements = browser.ax_snapshot(portal).await.ok()?;
-        match macro_engine::resolve_batch(&elements, intent) {
+    ) -> (Option<Vec<browser_driver::AxElement>>, String) {
+        // Discard resyncs banked by other lanes so the lines below always
+        // belong to this snapshot, then journal the drain itself: a wiped
+        // pending count is itself diagnostic (scenario B).
+        let before_discard = browser.take_ax_resync_count();
+        let _ = browser.take_last_resync_check();
+        let elements = browser.ax_snapshot(portal).await.unwrap_or_default();
+        let after_drain = browser.take_ax_resync_count();
+        let _ = self
+            .record(&format!(
+                "ax_resync_counter: before_discard={before_discard} after_drain={after_drain}"
+            ))
+            .await;
+        if let Some(check) = browser.take_last_resync_check() {
+            let _ = self.record(&check.line()).await;
+        }
+        for _ in 0..after_drain {
+            let _ = self.record(browser_driver::AX_TARGET_RESYNC_LINE).await;
+        }
+        let telemetry = self.record_snapshot_telemetry(&elements, intent).await;
+        let candidates = match macro_engine::resolve_batch(&elements, intent) {
             macro_engine::ResolveOutcome::BatchMatch(batch) => Some(batch),
             _ => None,
-        }
+        };
+        (candidates, telemetry)
     }
 
     /// One batch approval naming the live candidate count and carrying the
@@ -1532,13 +1781,17 @@ impl AppService {
         }
     }
 
-    /// Terminal batch outcome: one ephemeral step carrying N actions.
+    /// Terminal batch outcome: one ephemeral step carrying N actions, plus
+    /// the route-proposal and snapshot-telemetry lines for immediate
+    /// Session Activity render.
     fn batch_outcome(
         name: String,
         steps: Vec<playbook_store::Step>,
         status: orchestration_engine::SequenceStatus,
         completed: usize,
         stopped: Option<usize>,
+        route_log: Option<String>,
+        telemetry_log: Option<String>,
     ) -> DispatchOutcome {
         DispatchOutcome {
             kind: "ephemeral",
@@ -1550,6 +1803,8 @@ impl AppService {
                 stopped_at: stopped,
             },
             steps,
+            route_log,
+            telemetry_log,
         }
     }
 
@@ -2183,7 +2438,7 @@ mod tests {
             .await;
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://github.com/settings/billing")
+            Some("https://github.com/account/billing/history")
         );
         // Non-matching prompts and pre-set entries stay untouched.
         let mut other = intent.clone();
@@ -2194,13 +2449,166 @@ mod tests {
             .await;
         assert_eq!(other.entry_url, None);
         let mut preset = intent.clone();
-        preset.entry_url = Some("https://github.com/settings/billing".into());
+        preset.entry_url = Some("https://github.com/account/billing/history".into());
         service
             .propose_entry_url("download all my invoices from github", &mut preset)
             .await;
         assert_eq!(
             preset.entry_url.as_deref(),
-            Some("https://github.com/settings/billing")
+            Some("https://github.com/account/billing/history")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ephemeral_dispatch_attaches_proposed_route_to_task_step()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Hermetic replay of the command-bar Run path for an ad-hoc prompt
+        // starting with no entry URL: resolve the ephemeral intent, propose
+        // the route at the top (before steps exist), then build step 1
+        // exactly like the dispatch lanes do.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://github.com/")?;
+        *service.session_origin.lock().map_err(|_| "session")? = Some(portal.clone());
+        let prompt = "download all my invoices from github";
+        let saved = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .list_playbooks()
+            .await
+            .map_err(|_| "list")?;
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
+            orchestration_engine::resolve_command(prompt, Some(&portal), &saved)
+        else {
+            panic!("ad-hoc prompt resolves ephemeral");
+        };
+        assert_eq!(intent.entry_url, None);
+        service.propose_entry_url(prompt, &mut intent).await;
+        // Explicit propagation: the proposed route lands on both the intent
+        // and step 1 of the ephemeral task.
+        let expected = "https://github.com/account/billing/history";
+        assert_eq!(intent.entry_url.as_deref(), Some(expected));
+        let steps = [playbook_store::Step::Semantic {
+            intent: intent.clone(),
+        }];
+        let playbook_store::Step::Semantic {
+            intent: step_intent,
+        } = &steps[0]
+        else {
+            panic!("step 1 is semantic");
+        };
+        assert_eq!(step_intent.entry_url.as_deref(), Some(expected));
+        // Pre-navigation triggers from a foreign tab: step 1 differs from
+        // `google.com`, so `ensure_at_entry_url` would issue CDP navigation
+        // before the first `ax_snapshot`.
+        let current = url::Url::parse("https://google.com")?;
+        let entry = url::Url::parse(step_intent.entry_url.as_deref().ok_or("entry")?)?;
+        assert!(macro_engine::entry_url_mismatched(&current, &entry));
+        // Session Activity carries the proposal (host + path, never query).
+        let pool = service.database().await.map_err(|_| "database")?;
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT outcome FROM session_events")
+            .fetch_all(pool)
+            .await
+            .map_err(|_| "events")?;
+        assert!(
+            rows.iter().any(|(outcome,)| outcome
+                .starts_with("route_proposed:github.com/account/billing/history")),
+            "route_proposed logged, got {rows:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_telemetry_counts_noun_mentions_case_insensitively() {
+        // Pure line shape: exact example format, mixed-case evidence all
+        // counting toward the noun.
+        assert_eq!(
+            AppService::snapshot_telemetry_line(142, 3, "invoice"),
+            "ax_snapshot_telemetry: total_nodes=142, target_noun_matches=3 (noun='invoice')"
+        );
+        let elements = vec![
+            browser_driver::AxElement {
+                backend_node_id: 1,
+                role: "link".into(),
+                name: "Download".into(),
+                description: String::new(),
+                container_text: vec!["Invoices".into(), "INV-001".into()],
+                landmark: None,
+            },
+            browser_driver::AxElement {
+                backend_node_id: 2,
+                role: "link".into(),
+                name: "INVOICE-2".into(),
+                description: String::new(),
+                container_text: Vec::new(),
+                landmark: None,
+            },
+            browser_driver::AxElement {
+                backend_node_id: 3,
+                role: "link".into(),
+                name: "Settings".into(),
+                description: "Preferences".into(),
+                container_text: vec!["General".into()],
+                landmark: None,
+            },
+        ];
+        assert_eq!(AppService::count_noun_matches(&elements, "invoice"), 2);
+        assert_eq!(AppService::count_noun_matches(&elements, "INVOICE"), 2);
+        assert_eq!(AppService::count_noun_matches(&elements, ""), 0);
+        assert_eq!(AppService::count_noun_matches(&[], "invoice"), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_telemetry_logs_empty_field_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Page where the target rows never appear: no node mentions the
+        // noun, the field fails closed with no batch, and the telemetry
+        // line still lands in Session Activity for diagnosis.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "download".into(),
+            container_query: None,
+            raw_prompt: "download all my invoices".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: None,
+            primary_target_noun: Some("invoice".into()),
+        };
+        let elements = vec![
+            browser_driver::AxElement {
+                backend_node_id: 1,
+                role: "link".into(),
+                name: "Settings".into(),
+                description: String::new(),
+                container_text: vec!["General".into()],
+                landmark: None,
+            },
+            browser_driver::AxElement {
+                backend_node_id: 2,
+                role: "link".into(),
+                name: "Profile".into(),
+                description: String::new(),
+                container_text: vec!["Account".into()],
+                landmark: None,
+            },
+        ];
+        service.record_snapshot_telemetry(&elements, &intent).await;
+        assert!(matches!(
+            macro_engine::resolve_batch(&elements, &intent),
+            macro_engine::ResolveOutcome::NoMatch(_)
+        ));
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            events.iter().any(|outcome| outcome
+                == "ax_snapshot_telemetry: total_nodes=2, target_noun_matches=0 (noun='invoice')"),
+            "telemetry logged, got {events:?}"
         );
         Ok(())
     }

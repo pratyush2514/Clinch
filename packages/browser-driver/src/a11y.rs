@@ -9,10 +9,12 @@
 //! language-specific patterns appear anywhere here.
 
 use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
-use chromiumoxide::cdp::browser_protocol::accessibility::{
-    AxNode, AxValue, EnableParams, GetFullAxTreeParams,
+use chromiumoxide::cdp::browser_protocol::{
+    accessibility::{AxNode, AxValue, EnableParams, GetFullAxTreeParams},
+    target::GetTargetsParams,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 /// Interactive AX roles surfaced to planners, normalized to lowercase at
 /// discovery (`Tab` → `tab`). Roles stay plain strings — the equivalent of
@@ -353,7 +355,104 @@ pub fn render_semantic_list(elements: &[AxElement]) -> String {
     out
 }
 
+/// Session-activity line journaled (by the desktop service) for every
+/// zero-node accessibility resync. Single source so the driver policy and
+/// the journaled text cannot drift apart.
+pub const AX_TARGET_RESYNC_LINE: &str =
+    "ax_target_resync: re-enabled accessibility after 0-node tree";
+
+/// Pure resync decision: an empty tree on a real page means a renderer swap
+/// deactivated the Accessibility domain; an empty tree on `about:blank`
+/// (or an unreadable URL) is expected and needs no resync.
+fn needs_ax_resync(node_count: usize, page_url: Option<&url::Url>) -> bool {
+    node_count == 0 && page_url.is_some_and(|url| matches!(url.scheme(), "https" | "http"))
+}
+
+/// Debug record of one resync decision, stored every time a zero-node tree
+/// is observed (predicate true or not) so the desktop service can journal
+/// the exact inputs the predicate saw. Instrumentation only: recording a
+/// check never changes snapshot behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AxResyncCheck {
+    /// Nodes the fetched tree held (always 0 for recorded checks).
+    pub node_count: usize,
+    /// Page URL at observation time, or empty when the URL read failed.
+    pub url: String,
+    /// The [`needs_ax_resync`] verdict for these inputs.
+    pub predicate: bool,
+}
+
+impl AxResyncCheck {
+    /// Build from an observed tree size plus the page URL read (`None`
+    /// when the read failed). The predicate is computed here so stored
+    /// checks carry the verdict instead of recomputing it at drain time.
+    #[must_use]
+    pub fn new(node_count: usize, page_url: Option<&url::Url>) -> Self {
+        Self {
+            predicate: needs_ax_resync(node_count, page_url),
+            node_count,
+            url: page_url.map_or_else(String::new, |url| url.as_str().to_owned()),
+        }
+    }
+
+    /// Journal line, e.g.
+    /// `ax_resync_check: nodes=0 url='https://github.com/x' predicate=true`.
+    /// A failed URL read renders as `url=''`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "ax_resync_check: nodes={} url='{}' predicate={}",
+            self.node_count, self.url, self.predicate
+        )
+    }
+}
+
 impl ManagedBrowser {
+    /// Arm the Accessibility domain on the live CDP session. Unconditional
+    /// by contract: every tree fetch — initial and resync retry alike —
+    /// re-arms first, because cross-origin renderer swaps deactivate the
+    /// domain on the new process.
+    ///
+    /// # Errors
+    /// Reports connection failure or timeout.
+    async fn enable_accessibility(&self) -> Result<(), BrowserError> {
+        tokio::time::timeout(IO_TIMEOUT, self.page.execute(EnableParams {}))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        Ok(())
+    }
+
+    /// Drain the pending zero-node resync count since the last drain. The
+    /// desktop service journals one [`AX_TARGET_RESYNC_LINE`] per count.
+    #[must_use]
+    pub fn take_ax_resync_count(&self) -> u64 {
+        self.ax_resyncs.swap(0, Ordering::Relaxed)
+    }
+
+    /// Drain the last resync decision check, if a zero-node tree was
+    /// observed since the last drain. Instrumentation only.
+    #[must_use]
+    pub fn take_last_resync_check(&self) -> Option<AxResyncCheck> {
+        self.last_resync_check
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Re-anchor the AX session after a zero-node tree on a real page:
+    /// best-effort `Target.getTargets` to confirm browser-target coherence
+    /// post-swap, then re-issue `Accessibility.enable`. Records one pending
+    /// resync for the service journal. Fail-open by design: transient
+    /// post-navigation CDP states must not fail the snapshot — the single
+    /// tree retry below still runs either way.
+    async fn resync_ax_target(&self) {
+        let _ =
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetTargetsParams::default())).await;
+        let _ = self.enable_accessibility().await;
+        self.ax_resyncs.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture the live interactive-element snapshot for `origin`. Discovery
     /// itself stays on the AX graph (no tags, no classes); afterwards the
     /// opt-in DOM fallback in `session.rs` may fill empties when its env
@@ -363,17 +462,41 @@ impl ManagedBrowser {
     /// Returns [`BrowserError`] on origin drift, CDP failure, or timeout.
     pub async fn ax_snapshot(&self, origin: &url::Url) -> Result<Vec<AxElement>, BrowserError> {
         self.check_origin(origin).await?;
-        tokio::time::timeout(IO_TIMEOUT, self.page.execute(EnableParams {}))
-            .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
-        let tree = tokio::time::timeout(
+        self.enable_accessibility().await?;
+        let mut tree = tokio::time::timeout(
             IO_TIMEOUT,
             self.page.execute(GetFullAxTreeParams::builder().build()),
         )
         .await
         .map_err(|_| BrowserError::Timeout)?
         .map_err(|_| BrowserError::Connection)?;
+        let page_url = self.current_url().await.ok().flatten();
+        if tree.result.nodes.is_empty() {
+            // Instrumentation: record every zero-node observation with the
+            // exact predicate inputs, so a missing resync line is diagnosable
+            // (exempt predicate vs. wiped counter vs. wrong drain path).
+            // Fail-open: a poisoned slot skips the record, never the retry.
+            if let Ok(mut slot) = self.last_resync_check.lock() {
+                *slot = Some(AxResyncCheck::new(
+                    tree.result.nodes.len(),
+                    page_url.as_ref(),
+                ));
+            }
+        }
+        if needs_ax_resync(tree.result.nodes.len(), page_url.as_ref()) {
+            // Zero nodes on a rendered page: re-anchor the target session,
+            // re-arm the domain, and retry the tree exactly once. Whatever
+            // comes back — even still empty — flows into the normal path so
+            // an unsettled page degrades instead of erroring.
+            self.resync_ax_target().await;
+            tree = tokio::time::timeout(
+                IO_TIMEOUT,
+                self.page.execute(GetFullAxTreeParams::builder().build()),
+            )
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        }
         let mut elements = interactive_elements(&tree.result.nodes);
         self.enrich_empty_containers(&mut elements).await;
         Ok(elements)
@@ -1102,5 +1225,80 @@ mod tests {
         assert!(list.contains("[1] textbox — Email address\n"));
         assert!(list.contains("[2] button — Download [in: Statements / Statement #42]\n"));
         assert!(render_semantic_list(&[]).is_empty());
+    }
+
+    #[test]
+    fn ax_snapshot_unconditionally_enables_accessibility_and_resyncs_zero_nodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Hermetic policy proof for the cross-origin zero-node failure:
+        // after a `google.com` → `github.com` renderer swap the
+        // Accessibility domain deactivates, so `getFullAXTree` returns 0
+        // nodes on a rendered page. Live CDP traffic stays behind the
+        // Chromium-gated `#[ignore]`d fixtures (repo convention); this
+        // locks the decision policy those calls implement:
+        // - `ax_snapshot` arms `Accessibility.enable` unconditionally
+        //   before every tree fetch — initial and resync retry alike, via
+        //   `enable_accessibility`, never gated on navigation state;
+        // - an empty tree on a real page fires exactly one resync carrying
+        //   `AX_TARGET_RESYNC_LINE`, and the retry recovers rendered nodes.
+        assert_eq!(
+            AX_TARGET_RESYNC_LINE,
+            "ax_target_resync: re-enabled accessibility after 0-node tree"
+        );
+        let billing = url::Url::parse("https://github.com/account/billing/history")?;
+        let plain_http = url::Url::parse("http://portal.example/")?;
+        let blank = url::Url::parse("about:blank")?;
+        // Empty tree on a rendered page resyncs, whatever the scheme.
+        assert!(needs_ax_resync(0, Some(&billing)));
+        assert!(needs_ax_resync(0, Some(&plain_http)));
+        // Non-empty trees never resync, even on real pages.
+        assert!(!needs_ax_resync(4, Some(&billing)));
+        // `about:blank` and unreadable URLs are expected-empty: no resync.
+        assert!(!needs_ax_resync(0, Some(&blank)));
+        assert!(!needs_ax_resync(0, None));
+        // Simulated run: the first fetch returns 0 nodes on the billing
+        // page (resync fires), the retry returns the rendered rows and the
+        // snapshot recovers non-zero interactive elements.
+        assert!(needs_ax_resync(0, Some(&billing)));
+        let retry = vec![
+            node(Some("link"), Some("Download"), false, Some(1))?,
+            node(Some("link"), Some("Download"), false, Some(2))?,
+            node(Some("link"), Some("Download"), false, Some(3))?,
+        ];
+        assert!(!needs_ax_resync(retry.len(), Some(&billing)));
+        assert_eq!(interactive_elements(&retry).len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn ax_resync_check_line_reports_empty_url_on_failed_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A failed page-URL read (`current_url` erroring mid-swap) stores
+        // the check with no URL: the emitted line must still render with
+        // `url=''` and a false predicate (scenario A) — never panic, never
+        // omit the line.
+        let check = AxResyncCheck::new(0, None);
+        assert!(!check.predicate);
+        assert_eq!(
+            check.line(),
+            "ax_resync_check: nodes=0 url='' predicate=false"
+        );
+        // A populated read renders verbatim with a true predicate, and the
+        // struct carries the inputs (not a bare boolean) for the journal.
+        let billing = url::Url::parse("https://github.com/account/billing/history")?;
+        let check = AxResyncCheck::new(0, Some(&billing));
+        assert_eq!(
+            check,
+            AxResyncCheck {
+                node_count: 0,
+                url: "https://github.com/account/billing/history".to_owned(),
+                predicate: true,
+            }
+        );
+        assert_eq!(
+            check.line(),
+            "ax_resync_check: nodes=0 url='https://github.com/account/billing/history' predicate=true"
+        );
+        Ok(())
     }
 }
