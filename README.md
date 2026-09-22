@@ -1,84 +1,42 @@
-# Clinch — Local Action Studio (post–Phase A)
+# Clinch — Local Action Studio
 
-Implements the desktop/session-sync scaffold and the generic task runner: checkpointed Task → Plan → Step execution, versioned CDP macros, deterministic replay, bounded local selector repair, Sentinel approvals, and a mirrored viewport. First-run planning uses a configured script. No ATS forms or scheduling.
+Clinch is a Tauri v2 desktop app for local browser workflows. It connects to a managed Chromium process over CDP, imports browser sessions with consent, runs recorded macros and semantic playbooks, and displays progress and approval requests.
 
-Since then: hardened session sync (Edge, AES-256-GCM, Windows DPAPI with App-Bound detection, per-OS paths, shadow-copy reads, LocalStorage hydration, wildcard SSO cookies, UA mirroring, Brave-on-Windows default), headless-first replay with an embedded re-auth panel, a visual element picker, a loopback extension bridge (`packages/extension-bridge`), AX-tree + Set-of-Marks dynamic discovery, versioned Playbook schema with v1 migration, a step runner with approvals, persisted playbooks with save/list/run commands, a workflow builder, and a natural-language command bar. Current ledger: `docs/STATUS.md`.
+The current working-tree code is the source of truth. [Build status](docs/STATUS.md) records the implemented scope and validation limits; [architecture](docs/ARCHITECTURE.md) and [technical contracts](docs/TRD.md) explain the execution paths. Future ideas are isolated in [FUTURE_FEATURES.md](docs/FUTURE_FEATURES.md).
 
-See [Phase A final integration](docs/PHASE_A_FINAL_INTEGRATION.md) for the Python/Ollama adapter setup, launch commands, and live-portal manual walkthrough.
+## Run locally
 
-## Run
-
-Prerequisites: Rust stable with the platform C/C++ build tools, Node 24, and an installed Chrome/Chromium executable. The product targets macOS; Windows builds support development, manual-login fallback, and DPAPI cookie import (Brave recommended — Chrome 127+ seals its key with App-Bound encryption third-party apps cannot unwrap).
+Use Rust stable with platform build tools, Node.js 24 (the CI version), and an installed Chrome/Chromium executable. Native cookie import has macOS and Windows implementations; platform support is not a real-portal compatibility guarantee.
 
 ```sh
 npm ci
 npm run tauri -- dev
 ```
 
-`CLINCH_CHROMIUM_PATH` optionally selects the browser executable. On macOS the default is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. The browser runs as a managed, headed child with an app-owned persistent profile, `--remote-debugging-port=0`, and loopback CDP. This spike opens a separate interactive Chromium window; it does not claim inline embedding in the left pane. Existing local browser launch flags are preserved by this implementation.
+Set `CLINCH_CHROMIUM_PATH` to select the managed browser executable. The source browser selected for cookie import is separate from this executable. Windows defaults the source selection to Brave; other platforms default to Chrome.
 
-The desktop app initializes `clinch.db` in its platform app-data directory through one lazy `sqlx` pool, with WAL mode and foreign keys enabled. Its sibling `browser-profile` directory holds Chromium's own persistent profile. The database stores session outcome metadata and task checkpoints, never imported cookie values or Safe Storage keys. Chrome controls encryption of its own profile. No separate plaintext cookie dump is written.
+`npm run dev` starts the frontend alone. Native session and execution commands require Tauri. Installer bundling is currently disabled in `apps/desktop/src-tauri/tauri.conf.json`.
 
-## Workspace and dependency structure
+## Use the current UI
 
-```text
-Cargo.toml
-apps/desktop/                 React + TypeScript + Vite + Tailwind
-  src/                        Resizable shell, session UI, task workspace, workflow builder, command bar
-  src-tauri/                  Tauri v2 commands, service wiring, loopback extension bridge
-packages/
-  orchestration-engine/       Task state, SQLite checkpoints, step runner, NL intent resolver
-  browser-driver/             Managed child + chromiumoxide CDP bridge, AX tree, Set-of-Marks, picker
-  macro-engine/               Versioned JSON record/replay, selector repair flags, semantic executor
-  session-sync/               Consent, per-OS paths, cookie + LocalStorage extraction, decryption, UA
-  filesystem-tool/            GUID download finalization without trusting server filenames
-  credential-vault/           keyring-core + macOS Keychain adapter, Windows DPAPI + App-Bound detection
-  playbook-store/             SQLite WAL initialization, versioned Playbook schema + persistence
-  llm-provider/               Bounded local selector-repair adapter process
-  extension-bridge/           MV3 companion extension (plain JS, workspace-excluded)
-```
+1. Enter the portal URL. For local-profile import, select Chrome, Brave, or Edge and a profile folder, then grant consent and choose **Sync session**. Alternatively choose **Sign in manually**, or use **Sync via extension** with the companion loaded.
+2. Complete login/2FA in Clinch's managed Chromium window. The in-app sign-in panel reports status; it does not host the login page. Cookie import and URL-based session checks do not guarantee authenticated access.
+3. Describe new work in the command bar, or build role/label steps in the workflow builder. Review approval requests before execution. The natural-language path resolves a saved playbook, one semantic intent, or a plural batch; it is not a general multi-step autonomous planner.
+4. Save completed command-bar runs as playbooks and replay them from the workflow list. Names use ASCII letters, digits, underscores, and hyphens. Optional descriptions are limited to 280 UTF-8 bytes.
+5. Use **Run Task** in the task workspace for an existing macro's workflow name. That form sends no planning selectors, so a new name without a macro fails validation. The Rust task API still supports script-planned first runs with selectors.
+6. View task files through **Open File** or **Show in Folder**. The command resolves a completed task's saved file inside its download directory.
 
-Dependency direction:
+Cmd/Ctrl+K currently opens a single **Connect a portal** item; natural-language input is in the separate command bar. The element-picker backend remains available, but no picker component is mounted in the current UI.
 
-```text
-desktop -> session-sync -> credential-vault
-desktop -> browser-driver -> session-sync (cookie contract)
-desktop -> playbook-store -> sqlx/SQLite
-desktop -> orchestration-engine -> macro-engine -> browser-driver
-desktop -> orchestration-engine -> playbook-store (run + resolve)
-playbook-store -> macro-engine + browser-driver (Step schema types)
-orchestration-engine -> sqlx (shared application pool)
-browser-driver -> chromiumoxide -> native CDP WebSocket
-```
+## Browser and storage
 
-The filesystem-tool boundary remains reserved. UI uses `react-resizable-panels` and `cmdk`; task progress streams through a typed Tauri `Channel`, with no frontend polling.
+Chromium is a separate process with an app-owned persistent `browser-profile`, not an embedded interactive webview. The UI has a polled JPEG mirror and an optional CDP screencast. **Spin up browser** acquires a headless context; **Take Control** switches to a visible window. Task macro replay requires headless mode; session setup and semantic playbook execution use headed mode.
 
-## Run a task
+Application data contains `clinch.db` (SQLite WAL), `macros/<workflow>.json`, download directories, and the Chromium profile. Playbooks store their steps in SQLite; they do not require an attached macro file. Imported cookie values and Safe Storage keys are not written to the application database. Source cookie databases are temporarily copied for reading, and Chromium manages persistence of its own cookies and storage.
 
-1. Enter a stable HTTPS portal page URL (no query or fragment), then sync the session or sign in manually. Finish any login/2FA in the managed Chromium window.
-2. In the **task workspace**, choose a workflow name and the CSS selector for download links. If the starting page has an intermediate same-origin link, supply that link's selector too.
-3. Click **Run Task**. The first successful run records its script into `macros/<workflow>.json` under app data. Reusing that workflow and URL loads the saved macro; new selector fields do not overwrite it.
-4. The step list reports live state, timings, DOM targets, and local download paths. Downloads are scoped to `downloads/<task-id>/`, use Chromium GUID filenames, and require a completed CDP download event plus a nonempty local file.
+Planning and route lookup do not require a model. Optional `CLINCH_INTENT_PROVIDER` enables structured intent parsing; optional `CLINCH_REPAIR_PROVIDER` enables local selector repair in the task lane. See [provider setup](docs/PHASE_A_FINAL_INTEGRATION.md) for the separate contracts and limits.
 
-The task vocabulary is intentionally narrow: same-origin navigation links, non-secret filter inputs, and file download links (at most 25 per download step). Buttons that generate PDFs, new-tab downloads, cross-origin/CDN downloads, nested frames, and shadow DOM require additional adapters. No generic script evaluation, credential entry, or form submission is exposed through macros.
-
-Task snapshots and append-only `task_checkpoints` are committed in SQLite WAL before dispatch and after each step. Macro publication is atomic and occurs only after all steps succeed. On restart, unfinished tasks become `interrupted`; uncertain actions are never retried automatically. Missing/ambiguous/invalid/invisible selectors yield a targeted repair request containing the step index, selector, reason, and target-versus-wait stage. Automatic LLM repair and resume are outside these steps. Failed/partial downloads may leave files in that run's directory; inspect it before starting a fresh run.
-
-See [Steps 3–4 implementation and verification](docs/PHASE_0_STEPS_3_4.md) for the current evidence and boundaries.
-
-## Session-sync logic
-
-1. `profile.rs`: validates explicit consent, HTTPS portal URL without embedded credentials, and `Default` / `Profile N` names. Paths are derived under the selected browser's macOS Application Support directory, not accepted as arbitrary IPC paths.
-2. `credential-vault`: reads the existing `Chrome Safe Storage` / `Chrome` or `Brave Safe Storage` / `Brave` entry through a local `keyring-core` store. Keychain calls run on a blocking worker; no entries are created or changed. Keys are kept in zeroizing buffers.
-3. `reader.rs`: opens `Network/Cookies` or `Cookies` read-only with `sqlx`; a transaction includes committed WAL content. Selects only exact host cookies and applicable parent-domain cookies, filters expired cookies, and preserves cookie security flags, paths, expiry, and SameSite.
-4. `crypto.rs`: supports macOS `v10` AES-128-CBC with PBKDF2-HMAC-SHA1 (1003 iterations), PKCS#7 validation, and schema-24 SHA-256 host binding. Schema 23 is also supported. Unknown schemas/encryption and partitioned cookies fail closed to manual login.
-5. `service.rs`: maps absent cookies, unsupported platforms/formats, Keychain failures, decryption failures, and timeouts to explicit fallback reasons. Native Keychain prompts have a 120-second application wait limit; a timed-out OS prompt may still need dismissal because an already-running native call cannot be cancelled safely.
-6. `browser-driver`: translates each prepared cookie to `Network.setCookie`; host-only cookies use URL with domain omitted, and session cookies omit expiry. Each response and timeout is checked. Partial injection is never reported as success; manual login remains available.
-7. Desktop opens the portal in its own Chromium profile. **Imported cookies do not prove authenticated access.** The user verifies the portal and can sign in manually, including when a site requires fresh 2FA. Manual login reads neither source cookies nor Keychain.
-
-The dummy Sentinel Gate previews a harmless backend-issued request and accepts a single explicit approve/reject response. It executes no external action. Phase A bill downloads are not approval-gated.
-
-## Verification commands
+## Verification
 
 ```sh
 npm run build
@@ -86,29 +44,9 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build -p clinch-desktop --locked
-cargo audit
+python -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-An opt-in synthetic CDP integration test launches an installed browser with a temporary profile and does not access personal profiles or navigate to a real portal:
+[The macOS CI workflow](.github/workflows/check.yml) runs the frontend build, Rust format/lint/test/build checks, and `cargo audit`. It does not run the Python adapter tests or ignored Chromium tests. See [STATUS.md](docs/STATUS.md) for browser test commands and what the latest documentation reconciliation actually verified.
 
-```sh
-# Set CLINCH_CHROMIUM_PATH to your installed browser first.
-cargo test -p browser-driver real_cdp_cookie_injection -- --ignored
-```
-
-Tests cover local SQLite fixtures, live WAL reads, scoped domains, expiration, unsupported formats, wrong keys, host-binding checks, property-based Unicode crypto round trips and malformed input, fallback mapping, cookie-to-CDP conversion, WAL initialization, and single-use dummy approval state. CI runs on macOS so the platform-specific adapter is compiled.
-
-The Windows workspace run passed all 19 tests, including the opt-in real Chromium cookie injection test and Tauri mock-runtime command dispatch for approval and consent. The Windows build script supplies Common Controls v6 to both app and test executables without duplicate manifests. These IPC tests do not establish rendered UI behavior.
-
-The Windows-hosted check of `credential-vault` for `aarch64-apple-darwin` passed; this is compile evidence, not live Keychain validation. Browser preview QA was blocked by the browser tool's unavailable admin-policy check.
-
-`cargo audit` completed with seven upstream warnings: unmaintained `proc-macro-error` and five `unic-*` packages, plus `RUSTSEC-2024-0429` in `glib` through Tauri's Linux GTK dependency tree. No advisory was suppressed. Linux is not a target of this spike; review these upstream dependencies before expanding platform support or shipping.
-
-## Validation still required on macOS
-
-- Actual Keychain consent/denial and Chrome/Brave decryption on installed browser versions.
-- Portal acceptance, manual 2FA login, and persistent authenticated sessions on five real portals.
-- Signed/notarized distribution and a bundled Chromium strategy; no installer is produced in this step.
-- Phase A H1–H4 metrics and H5's two-month time tracking; scaffolding tests do not establish those gates.
-
-Implementation references: [Chromium macOS v10 encryption](https://raw.githubusercontent.com/chromium/chromium/130.0.6723.58/components/os_crypt/sync/os_crypt_mac.mm), [Chromium cookie schema and host binding](https://raw.githubusercontent.com/chromium/chromium/main/net/extras/sqlite/sqlite_persistent_cookie_store.cc), and [keyring-core Entry API](https://docs.rs/keyring-core/1.0.0/keyring_core/struct.Entry.html). Unsupported future formats use fallback rather than assumptions about compatibility.
+There are no shipped ATS/job-application, price-monitoring, scheduler, team-sharing, or native-app automation features.

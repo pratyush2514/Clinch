@@ -1,34 +1,32 @@
-# Phase A Step 5
+# Selector repair, approvals, and viewport
 
-Selector repair is integrated into task execution. Replay stays model-free when selectors resolve. A target or wait selector failure makes at most one local provider request per stage, bounded to 30 seconds. A repaired wait resumes only the wait; it never replays the preceding action. Rejected, ambiguous, out-of-region, or unresolved candidates leave the macro unchanged and produce `needs_repair`.
+This retained phase filename documents current task-lane behavior. It is not a historical validation report.
 
-## Local provider setup
+## Selector repair
 
-Set `CLINCH_REPAIR_PROVIDER` to a trusted local model-adapter executable before starting Clinch. The adapter reads one JSON document from stdin and writes exactly `{"selector":"..."}` to stdout, then exits successfully. Input fields are `selector`, `html`, and `bounds` (CSS-pixel x/y/width/height). Connect this adapter to your chosen local model; no model or API key is bundled or silently selected. No adapter means repair fails closed with `needs_repair`.
+[HealingReplay](../packages/macro-engine/src/lib.rs) is integrated into Engine::run_task. When a target or wait selector fails, it makes at most one provider attempt for that stage, bounded to 30 seconds. Invalid, ambiguous, out-of-region, or unresolved candidates stop with needs_repair.
 
-The HTML is a bounded structural clone of a unique local ancestor and its adjacent parent. Text, field values, URLs, script/style contents, and non-structural attributes are removed. Only id/class/type/role attributes remain. A legacy selector with no surviving unique local ancestor cannot safely be localized and remains `needs_repair`; the entire page is never substituted. Prefer anchored selectors such as `#billing .invoice` when recording.
+Context contains a stripped structural clone around a unique local ancestor, the failed selector, and CSS-pixel bounds. Page text, field values, URLs, and script/style content are removed from the structural snippet. Without a surviving local anchor, repair fails closed rather than sending a whole page.
 
-Validated repairs use the existing same-directory temporary file, sync, and atomic replacement. Macro schema version remains 1 with backward-compatible `lastHealedAt` and `healingHistory` fields. First-run plans are still published only after every step completes.
+Validated updates use atomic macro publication and version-1 lastHealedAt/healingHistory fields. Wait-stage repair resumes only the wait. Missing provider configuration stops the repair; it does not select or download a model.
 
-## Sentinel Gate and viewport
+This integration is specific to the task macro lane. Legacy steps inside saved playbooks use replay_step and return repair needs without calling HealingReplay. Semantic execution uses accessibility grounding rather than CSS selector repair.
 
-React receives task/highlight/approval events through the existing Tauri Channel. Clicks, non-secret typing, and the new typed `submit` form action require a local decision tied to the exact task and step. Review Details keeps execution blocked. Approve & Submit grants one action; Reject, stale/duplicate decisions, and the five-minute deadline cannot authorize execution. Decisions are inserted into SQLite before executing an approved action. The old low-level executor rejects submit actions; the healing executor routes them through consent. Submission targets must be unique, same-origin forms.
+## Approval behavior
 
-The left pane polls local CDP JPEG viewport frames, with overlays scaled using CSS viewport dimensions. These images stay local and are never provider context. Manual interaction still uses the separate managed Chromium window; this is a mirrored viewport, not native window embedding or remote-input forwarding.
+Click, non-secret fill, and submit actions require a decision bound to task/step identity. Review Details leaves execution blocked; Reject or deadline expiry does not authorize the action. Accepted decisions are written to sentinel_decisions before execution. The generic executor rejects submit; the dedicated approved path validates a form target.
 
-## Validation
+Playbook semantic and legacy action approvals are separate service gates with session-event journaling. Navigation and typed download-links actions are not gated. The harmless preview-approval command is not the execution gate.
 
-Required checks: `cargo test --workspace`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all --check`, and `npm run build`.
+## Viewport
 
-The opt-in `macro-engine` integration test runs an isolated local Chromium fixture:
+BrowserViewport polls JPEG frames and scales target highlights using viewport dimensions. BrowserScreencast acquires an event stream for a headless context and offers Take Control. Actual manual interaction occurs in the managed Chromium window, not through the image preview.
+
+## Focused validation
 
 ```powershell
 $env:CLINCH_CHROMIUM_PATH = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 cargo test -p macro-engine --test healing -- --ignored --nocapture
 ```
 
-It checks sanitized mock-provider context, invalid-candidate preservation, atomic publication, successful action execution, healing history, wait-only repair without repeated input, rejected consent, and actual viewport capture. No personal profile or real billing portal is used. The orchestration unit test verifies blocking, rejection, matching identity, single-use decisions, and the audit rows.
-
-Browser-tool visual inspection is currently blocked by unavailable admin-policy verification. Rust/CDP integration and frontend compilation do not establish rendered modal/overlay correctness or real-model accuracy.
-
-Final verification on this Windows host: 27 workspace tests passed (3 opt-in tests excluded from the default run); both the macro healing and invoice regression opt-in tests passed separately. Invoice replay measured 432 ms on the local fixture with simulated immediate consent. Clippy with `-D warnings`, formatting, frontend build, and `git diff --check` passed. The submission fixture also confirms the ungated executor rejects submit and that only approved execution triggers the form handler.
+The fixture uses a mock repair provider and isolated Chromium to check sanitized context, candidate validation, publication, wait-only repair, consent, and viewport capture. It does not establish live-model accuracy or rendered UI correctness. Current check results belong in [STATUS.md](STATUS.md); adapter setup is in [PHASE_A_FINAL_INTEGRATION.md](PHASE_A_FINAL_INTEGRATION.md).

@@ -4,10 +4,10 @@ mod service;
 mod ws_server;
 use auth::AuthPanel;
 use service::{
-    AppError, AppService, ApprovalPreview, BridgeStatus, DispatchOutcome, IntentPreview,
-    PickerStatus, PocMetrics, SessionStatus, StorageStatus,
+    AppError, AppService, ApprovalPreview, BridgeStatus, ContextStatus, DispatchOutcome,
+    IntentPreview, PickerStatus, PocMetrics, SessionStatus, StorageStatus,
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -56,6 +56,33 @@ async fn browser_viewport(
     state: tauri::State<'_, AppService>,
 ) -> Result<browser_driver::Viewport, AppError> {
     state.viewport().await
+}
+#[tauri::command]
+async fn acquire_browser_context<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppService>,
+) -> Result<ContextStatus, AppError> {
+    // Frames stream over `browser-screencast-frame` until release, takeover
+    // re-acquire, or app exit; a closed listener simply ends the pump.
+    state
+        .acquire_context(move |frame| {
+            let _ = app.emit(service::SCREENCAST_EVENT, frame);
+        })
+        .await
+}
+#[tauri::command]
+async fn release_browser_context(state: tauri::State<'_, AppService>) -> Result<(), AppError> {
+    state.release_context().await
+}
+#[tauri::command]
+async fn take_control(state: tauri::State<'_, AppService>) -> Result<ContextStatus, AppError> {
+    state.take_control().await
+}
+// Tauri's CommandArg contract requires the State wrapper by value.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn browser_context_status(state: tauri::State<'_, AppService>) -> Result<ContextStatus, AppError> {
+    state.context_status()
 }
 #[tauri::command]
 async fn initialize(state: tauri::State<'_, AppService>) -> Result<StorageStatus, AppError> {
@@ -148,6 +175,15 @@ async fn save_playbook(
     state.save_playbook(name, portal_url, steps).await
 }
 #[tauri::command]
+async fn save_run_as_workflow(
+    run_id: String,
+    name: String,
+    description: Option<String>,
+    state: tauri::State<'_, AppService>,
+) -> Result<String, AppError> {
+    state.save_run_as_workflow(run_id, name, description).await
+}
+#[tauri::command]
 async fn list_playbooks(
     state: tauri::State<'_, AppService>,
 ) -> Result<Vec<playbook_store::PlaybookSummary>, AppError> {
@@ -225,6 +261,10 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         downloaded_file_action,
         task_decision,
         browser_viewport,
+        acquire_browser_context,
+        release_browser_context,
+        take_control,
+        browser_context_status,
         sync_session,
         manual_login,
         close_browser,
@@ -240,6 +280,7 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         picker_disable,
         preview_intent,
         save_playbook,
+        save_run_as_workflow,
         list_playbooks,
         execute_playbook,
         decide_playbook,

@@ -7,6 +7,11 @@ publish.workspace = true
 [dependencies]
 filesystem-tool = { path = "../filesystem-tool" }
 chromiumoxide = { version = "0.9.1", default-features = false }
+# Scripted WebSocket responses for the hermetic CDP harness in
+# `test_utils` (same spec as the desktop bridge). The harness ships so
+# downstream integration tests can drive scripted CDP traffic; production
+# paths never construct it.
+async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 tokio.workspace = true
 thiserror.workspace = true

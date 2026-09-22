@@ -16,6 +16,8 @@ skills
 *txt
 *log
 *md
+!docs/STATUS.md
+!docs/FUTURE_FEATURES.md
 .agents
 AGENTS.md
 opencode.json

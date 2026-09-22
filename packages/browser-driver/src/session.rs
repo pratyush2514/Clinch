@@ -6,7 +6,6 @@
 //! into the CDP target and only counts/origins are reported outward.
 
 use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
-use session_sync::Cookie;
 use url::Url;
 
 /// Machine-readable result of opening a portal after cookie injection.
@@ -100,35 +99,6 @@ pub fn detect_auth_signal(current: &Url, portal: &Url) -> AuthSignal {
 }
 
 impl ManagedBrowser {
-    /// Inject a prepared cookie set, open the portal, and classify the landing.
-    ///
-    /// This is the single headless-first entry point used before every macro
-    /// navigation: injection and navigation stay paired so a replay never
-    /// runs against an unauthenticated blank tab.
-    ///
-    /// # Errors
-    /// Returns [`BrowserError`] when injection or navigation fails. An
-    /// expired session is *not* an error — it returns
-    /// [`AuthSignal::LoginRedirect`] / [`AuthSignal::SsoChallenge`] /
-    /// [`AuthSignal::OriginMismatch`] so the desktop layer can raise the
-    /// embedded auth panel instead of spawning an external OS browser window.
-    pub async fn establish_session(
-        &self,
-        cookies: &[Cookie],
-        portal: &Url,
-    ) -> Result<AuthSignal, BrowserError> {
-        self.inject(cookies).await?;
-        self.navigate(portal).await?;
-        let current = self
-            .page
-            .url()
-            .await
-            .map_err(|_| BrowserError::Connection)?
-            .ok_or(BrowserError::WrongOrigin)?;
-        let current = Url::parse(&current).map_err(|_| BrowserError::WrongOrigin)?;
-        Ok(detect_auth_signal(&current, portal))
-    }
-
     /// Re-read the live URL and classify it (cheap reauth poll for the panel).
     ///
     /// # Errors

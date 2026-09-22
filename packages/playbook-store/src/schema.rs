@@ -17,6 +17,9 @@ use url::Url;
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_STEPS: usize = 100;
 const MAX_NAME_LEN: usize = 64;
+/// Free-text memo bound: long enough for one UI line, short enough to keep
+/// workflow-list rows compact.
+pub const MAX_DESCRIPTION_LEN: usize = 280;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -50,6 +53,12 @@ pub struct Playbook {
     pub name: String,
     pub origin: Url,
     pub steps: Vec<Step>,
+    /// Optional free-text memo. Metadata only — never executed.
+    /// `#[serde(default)]` keeps payloads written before the field existed
+    /// parsing with no memo; omission on serialize keeps memo-less
+    /// envelopes byte-identical to v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl Playbook {
@@ -61,14 +70,23 @@ impl Playbook {
             name,
             origin,
             steps,
+            description: None,
         };
         playbook.validate()?;
         Ok(playbook)
     }
 
+    /// Attach a free-text memo. Builder-style so existing constructors keep
+    /// working; length is enforced by [`Playbook::validate`].
+    #[must_use]
+    pub fn with_description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
+    }
+
     /// # Errors
     /// Rejects unsupported versions, unsafe names/origins, oversized plans,
-    /// and invalid steps.
+    /// oversized memos, and invalid steps.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.version != SCHEMA_VERSION {
             return Err(SchemaError::Version);
@@ -79,6 +97,13 @@ impl Playbook {
                 .name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(SchemaError::Invalid);
+        }
+        if self
+            .description
+            .as_deref()
+            .is_some_and(|memo| memo.len() > MAX_DESCRIPTION_LEN)
         {
             return Err(SchemaError::Invalid);
         }
@@ -227,6 +252,12 @@ mod tests {
             assert!(Playbook::new(name.into(), origin()?, vec![pay_step()]).is_err());
         }
         assert!(Playbook::new("empty".into(), origin()?, Vec::new()).is_err());
+        assert!(
+            Playbook::new("pay".into(), origin()?, vec![pay_step()])?
+                .with_description(Some("x".repeat(281)))
+                .validate()
+                .is_err()
+        );
         assert!(
             Playbook::parse(
                 r#"{"version":1,"name":"x","origin":"https://user:secret@example.com/","steps":[]}"#

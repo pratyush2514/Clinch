@@ -1,103 +1,73 @@
-# Technical Requirements Document (TRD)
-## Autonomous Web Action Studio
+# Clinch technical contracts
 
-**Status:** Draft v3 (Tauri locked, cookie sync locked, dual-pane mandated, self-healing macro engine specified)
-**Companion to:** PRD.md, ARCHITECTURE.md
+Reconciled against working-tree code on 2026-09-22. Implementation references below take precedence over this summary.
 
----
+## Desktop and browser
 
-## 1. Platform & Packaging
+[Command registration](../apps/desktop/src-tauri/src/lib.rs) defines the IPC surface. [AppService](../apps/desktop/src-tauri/src/service.rs) wires commands to browser, storage, task, and playbook operations. Task/playbook progress uses typed Tauri Channels; screencast frames use events.
 
-- **Target OS (v1):** macOS (Apple Silicon primary, Intel best-effort). Windows is a v2 target.
-- **App shell — LOCKED: Tauri v2 (Rust).** No longer an open decision. Rationale: ~5–10MB installer bundle vs. Electron's 150MB+, ~30–50MB RAM footprint vs. Electron's typical 150MB+, native OS Keychain/Keytar integration, sub-second IPC between the Rust core and the frontend. Electron is rejected for this product specifically because bundle size and memory footprint directly undercut the "lightweight workstation" positioning.
-- **Automation surface:** Tauri's default webview (WKWebView on macOS) does not expose Chrome DevTools Protocol. The left-pane live execution view hosts a **separately embedded, real Chromium instance** controlled via CDP — Tauri provides the shell and native OS bindings around it, not the automation surface itself.
-- **Distribution:** Signed, notarized `.dmg` with auto-update; Mac App Store deferred (sandboxing constraints complicate automation).
+[ManagedBrowser](../packages/browser-driver/src/lib.rs) launches an installed Chromium with an app-owned profile and loopback CDP. `LaunchOptions::interactive()` is headed and `replay()` is headless. Task replay refuses a headed browser. Playbook `run_steps` and semantic dispatch currently use headed mode. Mode changes restart the browser and transfer cookies in memory; tab sessionStorage is not transferred.
 
-## 2. Functional Requirements
+The UI uses Tauri's native webview for React and JPEG images for the browser mirror. Neither native Chromium embedding nor input forwarding through the image is implemented. Bundling is disabled in the Tauri configuration.
 
-### 2.1 Session & Authentication: 1-Click Local Cookie Sync (LOCKED)
-- On first connecting a site, or on launch, the app reads the user's local Chrome/Brave cookie store and imports the relevant session cookies into the embedded Chromium instance via CDP's `Network.setCookie`, so authenticated portals (Workday, Amazon, enterprise SSO-backed sites) work immediately without a fresh login or 2FA challenge.
-- **Implementation requirements:**
-  - Locate and read the local browser's `Cookies` SQLite database.
-  - Decrypt values using the OS-Keychain-gated Safe Storage key (macOS: Keychain access, which surfaces a native OS permission prompt — this prompt IS the user's point of informed consent at the OS level, and must be paired with an in-app explanation before it appears, not sprung on the user unexplained).
-  - Inject decrypted cookies into the embedded Chromium profile's cookie jar via CDP; never persist raw imported cookie values outside the app's own encrypted local storage.
-  - **Mandatory fallback:** if decryption fails (browser version incompatibility, unsupported browser, no local cookie found for the target domain), fall back to a one-time manual login inside the app's own persistent embedded profile — this path must always exist and be tested, since cookie-store formats change across browser releases.
-- This is the default mechanism for all three v1 anchor Playbooks (Job Application Engine, Invoice Harvester, Deal Radar).
+## Sessions and local data
 
-### 2.2 Task Execution Engine
-- Accepts a natural-language task (via Cmd+K) or a triggered Playbook Card.
-- First run: LLM produces a plan, executes each step against the embedded Chromium instance, and **records the step sequence as a macro** (selector paths, action types, inputs) as it executes.
-- Repeat runs: replay the recorded macro directly via native CDP socket commands — no LLM call, millisecond-scale step latency, $0 marginal API cost.
-- Self-healing: if a recorded selector fails to resolve, pause that step, send only the broken step's local context to the LLM for a targeted repair, update the macro file, and continue.
-- Supports pause / resume / edit-step-and-resume / abort at any point, backed by checkpointed state.
+[SyncRequest validation](../packages/session-sync/src/profile.rs) requires consent, an HTTPS portal without credentials, and a supported profile name. The task command additionally disallows URL queries/fragments. Source browsers are Chrome, Brave, and Edge, with OS-specific profile paths and Default → Profile 1 fallback.
 
-### 2.3 Self-Healing CDP Macro Architecture (detailed spec)
-- **First Run:** LLM plans the DOM interaction sequence; each planned action is executed and simultaneously serialized into a deterministic CDP script (selector, action type, input value, wait conditions).
-- **Subsequent Runs:** the orchestration engine replays the serialized CDP script directly against the browser's DevTools socket — no LLM involvement, no network round-trip to a model provider, sub-second-to-millisecond execution per step.
-- **Self-Healing Loop:** a replay step whose selector no longer resolves triggers a narrow-scope LLM call containing only the current DOM state around the expected element; the LLM returns a corrected selector, which is written back into the macro file so the fix persists for future runs.
-- Macro files are versioned (JSON), with a `last_healed_at` timestamp and a healing-event history for transparency.
+[The reader](../packages/session-sync/src/reader.rs) stages the source Cookies database and best-effort WAL sibling in temporary storage before reading. Selection includes the host, related domain/subdomain rules, and curated SSO secondaries. It filters expired cookies and rejects unsupported schema/encryption/partitioning. Temporary files are removed on normal cleanup; this is not an encrypted application vault.
 
-### 2.4 Dual-Pane UI (mandated)
-- **Left pane — Live Interactive Webview:** renders the embedded Chromium instance's actual viewport in real time; overlays a visible agent cursor and DOM-highlight indicators on the element currently being acted on; includes an always-visible, single-click "take manual control" bar.
-- **Right pane — Spatial Canvas:** a scrubbable Action Canvas (step timeline, replayable forward/back), dynamic data tables generated from extracted content, and Playbook Cards. Supports export to local file, Notion, or Slack.
-- **Cmd+K Intent Bar:** global shortcut for plain-English task entry, available regardless of which pane has focus.
+[Crypto](../packages/session-sync/src/crypto.rs) supports legacy AES-128-CBC and AES-256-GCM paths, including schema host binding. [Credential access](../packages/credential-vault/src/lib.rs) reads macOS Safe Storage keys or Windows DPAPI-protected Local State keys. App-Bound key detection can produce an explicit fallback. Keys and decrypted values use zeroizing buffers.
 
-### 2.5 Sentinel Gate (Approval System)
-- Rules engine: `{action_type: [submit_form, send_message, make_payment, delete_file], requires_approval: bool, preview_required: bool, risk_tier: enum}`.
-- **Non-configurable override for v1:** the Job Application Engine requires a Sentinel Gate approval before every submission, regardless of policy configuration.
-- Preview renders human-readable state before blocking on confirmation. All decisions logged immutably.
+The service bounds key access to 120 seconds and profile reads to 15 seconds. A running native permission call may outlive the application's wait. Extraction and injection failures map to fallback reasons; browser/storage failures can still return errors.
 
-### 2.6 Anti-Detection Guardrails
-- Randomized micro-delays (200–800ms) between CDP actions to avoid obviously robotic timing.
-- No headless-mode artifacts (`navigator.webdriver` flags, synthetic viewport signatures).
-- Reduces detection risk; does not guarantee it — communicated honestly in-product, not marketed as a bypass.
+Best-effort localStorage extraction seeds missing keys, and source user-agent lookup can mirror browser identity. Imported secrets are not stored in `clinch.db`; Chromium owns persistence within its profile. Prompts and grounding diagnostics may appear in local session logs or saved intents, so the database is not restricted to counts-only metadata.
 
-### 2.7 Credential Vault
-- OS Keychain-backed, local-only storage for credentials the user explicitly enters into the app.
-- Injected directly into form fields by the automation layer; the LLM never receives raw secret values.
+[Auth classification](../packages/browser-driver/src/session.rs) checks URL origin and login path segments, distinguishing known SSO from unknown foreign origins. It does not inspect authenticated account state. Manual-login readiness requires the user to finish signing in. The bridge auth probe rejects explicit NoCookies replies but otherwise permits continuation, including when no extension is connected.
 
-### 2.8 Local Data & Privacy
-- Runs, Playbooks, macros, screenshots, imported-cookie metadata, and the Master Profile/resume vault stored locally by default (SQLite + filesystem blob store).
-- Minimum-necessary context sent to the LLM provider (page text/structure relevant to the current step or a broken-selector repair) — never raw credentials or cookie values.
-- Visible, per-run log of exactly what data (if any) left the device.
+## Extension bridge
 
-## 3. Non-Functional Requirements
+The [MV3 manifest](../packages/extension-bridge/manifest.json) requests cookies, storage, activeTab, scripting, alarms, and all-URL host permissions. The desktop [WebSocket server](../apps/desktop/src-tauri/src/ws_server.rs) binds loopback port 9223 at startup, with lazy startup as a backstop.
 
-- **Reliability:** a failed or ambiguous step fails visibly on the Canvas — never silently continues (critical for the Job Application Engine).
-- **Performance:** macro-replay steps execute in well under 1 second; first-run steps are bounded by model latency.
-- **Security:** the embedded Chromium instance runs sandboxed; filesystem access scoped per-Playbook; imported cookie data never persisted outside the app's own encrypted store.
-- **Auditability:** every action, Sentinel Gate decision, cookie-sync event, and data-egress event is logged with timestamp and immutable ID.
-- **Macro & Playbook portability:** stored as plain, versioned JSON — git-diffable, exportable, importable.
+Desktop-initiated SYNC_SESSION requests have single-use identities, expiration, and server-side domain filtering. The extension returns scoped cookies and a user agent. Cookie contents are passed to CDP, not to model adapters or application journal rows.
 
-## 4. Trust & Legal Considerations
+## Task and macro contracts
 
-- Under U.S. case law (*Van Buren v. United States*, *hiQ Labs v. LinkedIn*), using a user's own valid credentials/session to access their own accounts via automation is generally understood not to constitute CFAA "unauthorized access," and a bare ToS violation is civil, not criminal. This does not eliminate the operational risk that a target platform can suspend an account it flags as automated — mitigated by pacing, mandatory Sentinel Gates, and the fallback design above, not by legal precedent alone.
-- The cookie-sync mechanism reads only the local user's own browser data via an OS-permissioned path (Keychain-gated decryption) — this must be communicated transparently in-app (consent screen before the OS prompt appears) both because it's the right thing to do and because undisclosed credential-adjacent data access is the kind of pattern security software and platform reviewers scrutinize.
-- Local-only storage of credentials, resumes, and profile data reduces GDPR/CCPA exposure.
-- None of the above is legal advice; a real legal review is warranted before launch, especially for the Job Application Engine given ATS-specific terms of use.
+[TaskRequest](../packages/orchestration-engine/src/lib.rs) has `workflow`, `portalUrl`, optional `linkSelector`, and `downloadSelector`. Names are 1–64 ASCII letters/digits/underscores/hyphens. The script planner builds navigate, optional link click, and download-links actions. Existing macros supply the plan on replay.
 
-## 5. Data Model (high-level entities)
+[Action](../packages/browser-driver/src/actions.rs) supports navigate, click, non-secret fill, submit, and download_links. These are constrained operations, not arbitrary script execution. Typed downloads accept supported same-origin links/blobs, cap a download-links step at 25 links, correlate completion by CDP GUID, and require a nonempty file.
 
-- `Task` — a single user request; has one or more `Run`s.
-- `Run` — one execution attempt of a Task or Playbook; contains ordered `Step`s.
-- `Step` — atomic action with type, target selector, inputs, outputs, screenshot, status.
-- `Macro` — the recorded, replayable CDP step sequence for a Playbook, versioned, with `last_healed_at` and a healing-event history.
-- `Playbook` — versioned, named, parameterized template; references a `Macro` once one exists.
-- `SentinelGateEvent` — linked to a `Step`; records the policy rule applied, preview shown, decision.
-- `CredentialRef` — pointer into OS Keychain, never the raw secret.
-- `BrowserProfile` — the app-owned embedded Chromium profile that receives synced cookies from the local Chrome/Brave installation, with manual-login fallback state.
-- `MasterProfile` (Job Application Engine) — personal details, work authorization, portfolio links, resume/cover-letter files, answer bank for custom questions.
+Task states are planned, running, needs_repair, completed, failed, and interrupted. Step states are pending, running, completed, needs_repair, failed, and interrupted. Snapshot/checkpoint writes use revision checks. Recovery marks unfinished tasks interrupted; there is no general pause/edit/resume/abort API.
 
-## 6. Testing & Quality Requirements
+[Macro](../packages/macro-engine/src/lib.rs) files use version 1, reject unknown fields/actions/versions, and are bounded to 1 MiB. Optional lastHealedAt/healingHistory metadata records validated selector updates. Successful first-run recordings publish atomically after all steps complete.
 
-- Golden-path regression suite of real ATS/portal task recordings, re-run on every macro-engine or model change.
-- Explicit test coverage for the cookie-sync fallback path (simulate decryption failure, unsupported browser version, missing domain) — this path must never hard-fail.
-- Explicit test coverage for Sentinel Gate bypass attempts and the non-configurable submit-approval floor on the Job Application Engine.
-- Chaos testing: network drop mid-run, page-structure change mid-macro-replay, credential vault lock — must fail visibly, never silently corrupt state.
+## Repair and provider contracts
 
-## 7. Open Technical Decisions
+The task lane uses HealingReplay with LocalProvider. One repair attempt per failed target/wait stage has a 30-second bound. Context is stripped local structure plus selector and bounds; an invalid or unlocalized repair stops with needs_repair. A failed wait is repaired without repeating its action.
 
-1. Exact embedded-Chromium approach: bundled Chromium build vs. CEF vs. a Playwright-managed instance rendered into the Tauri window.
-2. Selector-recording strategy for macros (CSS selector vs. accessibility-tree path vs. hybrid) — affects self-healing accuracy.
-3. Cross-browser cookie-store support beyond Chrome/Brave (Safari, Firefox) — different encryption schemes, deferred prioritization.
-4. Scoping mechanism for filesystem/Playbook permissions (per-folder grants vs. per-run sandbox).
+`CLINCH_REPAIR_PROVIDER` selects a trusted executable; `CLINCH_REPAIR_PROVIDER_SCRIPT` adds one argument without a shell. Input is `{"selector":"…","html":"…","bounds":[0,0,100,100]}`; output is `{"selector":"…"}`, with output/selector size validation. The supplied Python adapter uses loopback Ollama. It does not implement intent parsing.
+
+Ephemeral command parsing separately supports `CLINCH_INTENT_PROVIDER` and `CLINCH_INTENT_PROVIDER_SCRIPT`. Input is `{"prompt":"…"}`; output contains `label_query` and optional nullable `container_query`. Unset configuration or returned invalid output uses deterministic parsing. The current implementation synchronously waits for process completion, has no enforced timeout, and checks its 4096-byte output limit after capture. Do not describe this path as bounded or guaranteed responsive.
+
+No provider executable is sandboxed by these contracts. There is no built-in cloud provider or per-run egress dashboard.
+
+## Playbooks and semantic execution
+
+[Playbook schema](../packages/playbook-store/src/schema.rs) version 1 contains name, origin, steps, and optional description. Limits are 100 steps, 64 ASCII name bytes, and 280 UTF-8 description bytes. Steps are legacy_selector (action and wait) or semantic (intent). The database stores the envelope in steps_json and upserts by name; legacy descriptions are migrated additively.
+
+[SemanticIntent](../packages/macro-engine/src/executor.rs) includes role, labelQuery, containerQuery, rawPrompt, ordinalIndex, isLast, isPlural, entryUrl, and primaryTargetNoun. Grounding uses role admission, label/context scoring, document-order ordinal selection, and live node geometry. It is a pointer-action executor, not a general text-entry planner.
+
+Saved playbooks and ephemeral commands use [the runner](../packages/orchestration-engine/src/runner.rs). Legacy selector failures return repair needs without invoking task HealingReplay. Semantic drift handling and signature-history helpers do not constitute a user-facing rollback feature.
+
+The plural command lane resolves at most 30 candidates, approves the batch and each click, and halts on failures. Snapshot document order is the ordering contract. Entry routes in production come from the curated route table; optional account/model route interfaces are not configured.
+
+## Approval and persistence boundaries
+
+Legacy click/fill/submit and semantic intent execution require explicit decisions. Typed navigate/download_links actions do not. Decisions identify the run/step, are single-use, and have five-minute deadlines. The generic low-level executor refuses submit; approved form submission uses a dedicated path.
+
+Task approvals write sentinel_decisions before execution. Playbook decisions use session_events text. The preview_approval/resolve_approval demo is separate from execution gates. No configurable risk tiers or ATS-specific submission feature exists.
+
+Database tables include session_events, playbooks, runs, signature_history, entry_urls, tasks, task_checkpoints, and sentinel_decisions. Tasks have durable step checkpoints; playbook runs have summary journaling, not equivalent restart/resume semantics. Some journal writes are best effort.
+
+Completed command-bar save keys are held in memory (32-entry cap) and consumed by save_run_as_workflow. Playbook persistence is durable; the key registry is not. TaskWorkspace saves legacy steps through save_playbook instead.
+
+See [STATUS.md](STATUS.md) for validation and [POC.md](POC.md) for outstanding acceptance work.

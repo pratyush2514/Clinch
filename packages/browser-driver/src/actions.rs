@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 use url::Url;
 
+/// Poll interval for condition waits: tight enough to notice fast DOM
+/// updates, loose enough to avoid CDP spam while a page settles.
+const WAIT_POLL_MS: u64 = 25;
+/// Upper bound on one typed action's CDP execution, generous enough for
+/// slow downloads to start streaming before the caller gives up.
+const ACTION_TIMEOUT: Duration = Duration::from_mins(1);
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -218,7 +225,7 @@ impl ManagedBrowser {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(error);
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
                 }
                 // Navigation destroys the old JS context. Retry only this read-only probe,
                 // never the preceding click or download, and retain the original deadline.
@@ -226,7 +233,7 @@ impl ManagedBrowser {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(BrowserError::Timeout);
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -252,7 +259,7 @@ impl ManagedBrowser {
         let selector = action.selector().ok_or(BrowserError::InvalidAction)?;
         self.resolve(selector, matches!(action, Action::DownloadLinks { .. }))
             .await?;
-        tokio::time::timeout(Duration::from_mins(1), async {
+        tokio::time::timeout(ACTION_TIMEOUT, async {
             match action {
                 Action::Click { .. } => {
                     let element = self.page.find_element(selector).await.map_err(|_| BrowserError::Connection)?;

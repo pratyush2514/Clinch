@@ -36,6 +36,9 @@ type DispatchOutcome = {
     stoppedAt: number | null;
   };
   steps: unknown[];
+  // Registry key for one-click save: present only when this ephemeral run
+  // completed and the backend remembered its exact graph plus origin.
+  runId?: string | null;
   routeLog?: string | null;
   telemetryLog?: string | null;
 };
@@ -73,6 +76,11 @@ export default function CommandBar({ ready, busy, portal, report, errorMessage }
       });
       setOutcome(result);
       setApproval(null);
+      // Pre-fill the save box with the backend slug so one click persists
+      // the proven path under a valid playbook name.
+      if (result.kind === "ephemeral" && result.result.status === "completed") {
+        setSaveName(result.name);
+      }
       // Route telemetry renders first so Session Activity shows the resolved
       // entry (or miss) before the terminal outcome line.
       if (result.routeLog) report(result.routeLog);
@@ -101,16 +109,34 @@ export default function CommandBar({ ready, busy, portal, report, errorMessage }
 
   async function saveOutcome() {
     if (!outcome || outcome.kind !== "ephemeral" || !saveName.trim()) return;
-    if (!portal) { report("Enter the portal URL above first — it anchors the workflow."); return; }
+    // Only the legacy rebuild needs the portal re-entered: the registry
+    // path carries the run's own origin server-side.
+    if (!outcome.runId && !portal) {
+      report("Enter the portal URL above first — it anchors the workflow.");
+      return;
+    }
     setSaving(true);
     try {
-      const id = await invoke<string>("save_playbook", {
-        name: saveName.trim(),
-        portalUrl: portal,
-        steps: outcome.steps,
-      });
+      // Prefer the backend registry key: the exact executed graph plus its
+      // origin, with no portal re-entry and no step round-trip through the
+      // client. Stale or evicted keys fail closed server-side. Runs without
+      // a key (older backends) fall back to rebuilding from echoed steps.
+      const id = outcome.runId
+        ? await invoke<string>("save_run_as_workflow", {
+            runId: outcome.runId,
+            name: saveName.trim(),
+            description: null,
+          })
+        : await invoke<string>("save_playbook", {
+            name: saveName.trim(),
+            portalUrl: portal,
+            steps: outcome.steps,
+          });
       setSavedId(id);
       report(`Saved playbook ${saveName.trim()} (id ${id}) — replay it in one click from the workflow list.`);
+      // The replay list lives in another component: notify it instead of
+      // threading state across the workspace.
+      window.dispatchEvent(new CustomEvent("clinch:playbooks-changed"));
     } catch (error) { report(errorMessage(error)); }
     finally { setSaving(false); }
   }

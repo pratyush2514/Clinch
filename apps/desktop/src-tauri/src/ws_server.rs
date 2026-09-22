@@ -39,6 +39,14 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TTL: Duration = Duration::from_mins(1);
 /// Concurrent extension sockets; beyond this the oldest is evicted.
 const MAX_CONNECTIONS: usize = 4;
+/// Per-connection outbound queue: a wedged companion is skipped instead of
+/// back-pressuring sync onto every other connection.
+const OUTBOX_BUFFER: usize = 8;
+/// Grace window polls for a companion mid-reconnect (TCP + WS handshake +
+/// registration take a few hundred ms); a genuinely absent extension still
+/// fails fast right after it.
+const RECONNECT_POLL_ATTEMPTS: usize = 20;
+const RECONNECT_POLL_MS: u64 = 100;
 /// Oversized frames are dropped unread (largest legitimate payload is a few KB).
 const MAX_FRAME_BYTES: usize = 256 * 1024;
 const MAX_COOKIES: usize = 500;
@@ -336,16 +344,13 @@ impl BridgeServer {
                 },
             );
         }
-        // Grace window for a companion mid-reconnect (TCP + WS handshake +
-        // registration take a few hundred ms); a genuinely absent extension
-        // still fails fast right after it.
         let mut connected = false;
-        for _ in 0..20 {
+        for _ in 0..RECONNECT_POLL_ATTEMPTS {
             connected = self.connections.lock().is_ok_and(|guard| !guard.is_empty());
             if connected {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(RECONNECT_POLL_MS)).await;
         }
         if !connected {
             self.pending.lock().map(|mut guard| guard.remove(&id)).ok();
@@ -479,7 +484,7 @@ where
     use futures::StreamExt;
 
     let (mut sink, mut stream) = ws.split();
-    let (outbox, mut inbox) = mpsc::channel::<String>(8);
+    let (outbox, mut inbox) = mpsc::channel::<String>(OUTBOX_BUFFER);
     let id = server.next_connection.fetch_add(1, Ordering::Relaxed);
     {
         let Ok(mut connections) = server.connections.lock() else {

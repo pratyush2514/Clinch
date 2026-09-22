@@ -147,6 +147,11 @@ pub struct GateRequest {
     pub action: Action,
 }
 
+/// How long one engine-level consent gate waits for a decision before it
+/// resolves as denied. Mirrors the desktop approval timeout: both layers
+/// must agree, so either side timing out fails the step closed.
+const CONSENT_TIMEOUT_MINS: u64 = 5;
+
 struct PendingGate {
     request: GateRequest,
     reply: tokio::sync::oneshot::Sender<bool>,
@@ -230,11 +235,14 @@ impl Engine {
                 approval: Some(request.clone()),
             });
         }
-        let approved = tokio::time::timeout(std::time::Duration::from_mins(5), receive)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
+        let approved = tokio::time::timeout(
+            std::time::Duration::from_mins(CONSENT_TIMEOUT_MINS),
+            receive,
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
         if let Ok(mut gate) = self.gate.lock() {
             *gate = None;
         }

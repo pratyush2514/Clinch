@@ -1,114 +1,67 @@
-# Architecture & Approach
-## Autonomous Web Action Studio
+# Clinch architecture
 
----
+Reconciled against the working-tree implementation on 2026-09-22. Code is authoritative; this document describes existing paths, not a target architecture.
 
-## 1. High-Level Architecture
+## Runtime and ownership
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│              Tauri v2 (Rust) Desktop Shell — LOCKED                │
-│      (native menus, OS Keychain access, filesystem, ~30-50MB RAM,  │
-│       5-10MB installer — Electron rejected: 150MB+ bundle/RAM)     │
-│                                                                     │
-│  ┌───────────────────────────┐   ┌───────────────────────────────┐│
-│  │  LEFT: Live Interactive    │   │  RIGHT: Spatial Canvas        ││
-│  │  Webview                   │   │  - Scrubbable Action Canvas   ││
-│  │  - Embedded, real Chromium │   │    (step timeline, replayable)││
-│  │    instance (CDP control,  │   │  - Dynamic data tables         ││
-│  │    NOT Tauri's default     │   │  - Playbook Cards              ││
-│  │    WKWebView)               │   │  - Export: file/Notion/Slack  ││
-│  │  - Agent cursor + DOM      │   └───────────────┬───────────────┘│
-│  │    highlight overlays      │                    │                │
-│  │  - 1-click manual takeover │                    │                │
-│  │    bar (always visible)    │                    │                │
-│  └──────────────┬──────────────┘                   │                │
-│                 │                                    │              │
-│         ┌───────▼────────────────────────────────────▼──────────┐  │
-│         │            Orchestration Engine (local process)         │  │
-│         │  - Task → Plan → Step loop (first run)                  │  │
-│         │  - Self-healing CDP macro record / replay / heal        │  │
-│         │  - Sentinel Gate rules evaluation                        │  │
-│         │  - Checkpointing + event log (SQLite)                   │  │
-│         └───────┬─────────────────────┬────────────┬─────────────┘  │
-│                 │                     │             │                │
-│      ┌──────────▼─────────┐  ┌────────▼──────┐ ┌────▼──────────┐    │
-│      │ Session Sync Manager│  │ Filesystem /   │ │ Credential     │  │
-│      │ - 1-Click Local     │  │ Local Tool     │ │ Vault (OS      │  │
-│      │   Chrome/Brave      │  │ Layer (scoped) │ │ Keychain-      │  │
-│      │   Cookie Import     │  └────────────────┘ │ backed)        │  │
-│      │ - OS-Keychain-gated │                      └────────────────┘  │
-│      │   decryption        │                                          │
-│      │ - Fallback: manual  │                                          │
-│      │   login in app-owned│                                          │
-│      │   profile           │                                          │
-│      └─────────────────────┘                                          │
-│                                                                       │
-│  ┌───────────────────────── Cmd+K Intent Bar ─────────────────────┐  │
-│  └─────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────┬────────────────────────────────────┘
-                                │  (minimal, scoped context — only on
-                                │   first-run planning and selector
-                                │   self-healing, never on macro replay)
-                                ▼
-                  ┌───────────────────────────┐
-                  │   LLM Reasoning Provider    │
-                  │  (BYO key: Anthropic/OpenAI │
-                  │   /etc., provider-agnostic) │
-                  └───────────────────────────┘
-```
+The React/TypeScript frontend runs in Tauri's webview. Rust commands in [lib.rs](../apps/desktop/src-tauri/src/lib.rs) delegate to [AppService](../apps/desktop/src-tauri/src/service.rs), which owns the database pool, managed browser handle, connected portal, pending approvals, and completed-run registry.
 
-## 2. Design Principles (in priority order)
+Chromium is an independently launched process controlled through chromiumoxide/CDP. Its viewport is mirrored into React; input is performed in the managed window or through typed backend actions. The app does not embed Chromium's native window or forward pointer/keyboard input through the preview.
 
-1. **Frictionless authenticated access, transparently obtained.** 1-Click Local Cookie Sync is the default session mechanism — it removes re-login and 2FA friction on Workday, Amazon, and other authenticated portals from minute one. The OS-level permission prompt this requires is paired with an in-app consent explanation beforehand, and a manual-login fallback always exists if sync fails.
-2. **Visibility over autonomy.** Every action is inspectable before, during, and after execution via the mandated dual-pane layout — the primary differentiator vs. cloud-VM and terminal-daemon competitors.
-3. **Pay the LLM once per workflow, not once per click.** The self-healing CDP macro loop is a structural requirement: record on first run, replay via native CDP sockets thereafter, heal only the specific broken selector.
-4. **Reversibility.** Pause/edit/resume beats restart-from-scratch; the orchestration engine is checkpointable at every step boundary.
-5. **Least privilege.** Filesystem and credential access are scoped per-Playbook/per-run; imported cookies never persist outside the app's own encrypted store.
-6. **A safety floor that isn't configurable away.** For the Job Application Engine's submissions, the Sentinel Gate requirement is a hard product line, not a setting that can be disabled.
+The operation semaphore serializes task execution, playbook execution, sync, and manual navigation where acquired. Background-context acquire/release/take-control methods do not acquire this semaphore; do not assume every browser lifecycle action is protected by the run lock.
 
-## 3. Core Components
+## Packages
 
-### 3.1 Orchestration Engine
-Per-`Run` state machine: on first run, requests a plan from the LLM and executes step-by-step, serializing each step into a deterministic CDP `Macro`. On repeat runs, replays the `Macro` directly via native CDP socket commands. On a broken selector, isolates just that step, sends minimal DOM context to the LLM for a targeted repair, updates the `Macro`, and resumes. Emits a structured event per step to both panes and appends to an immutable local event log. Checkpoints after every step.
+- `browser-driver`: process launch/restart, CDP cookies and navigation, constrained actions, accessibility snapshots, Set-of-Marks clicks, picker bindings, JPEG previews, and screencast frames.
+- `session-sync`: consent/request validation, platform profile paths, temporary cookie database reads, decryption, localStorage extraction, and source user-agent lookup.
+- `credential-vault`: read-only macOS Safe Storage access and Windows DPAPI key access, including App-Bound detection.
+- `macro-engine`: validated version-1 macro JSON, atomic recording publication, bounded selector repair, semantic grounding, and plural execution.
+- `orchestration-engine`: durable task state/checkpoints, task approvals, playbook step dispatch, command resolution, and route lookup.
+- `playbook-store`: shared SQLite initialization, validated playbook persistence, run summaries, signature history, and entry-URL storage helpers.
+- `filesystem-tool`: download extension finalization from bounded file inspection.
+- `llm-provider`: selector-repair process contract. Intent parsing has a separate provider implementation in the orchestration engine.
+- `extension-bridge`: plain JavaScript MV3 companion; excluded from Cargo workspace membership.
 
-### 3.2 Live Interactive Webview (Left Pane / Browser Driver Layer)
-A real, embedded Chromium instance (not Tauri's native OS webview) controlled via CDP, running sandboxed and isolated from the user's default browser process. Renders agent cursor and DOM-highlight overlays during execution, and hosts the always-visible manual-takeover bar. Anti-detection pacing guardrails live here.
+Dependency direction is desktop → orchestration → macro → browser driver; orchestration and desktop also use playbook-store. Playbook-store uses macro/browser types, browser-driver uses session-sync's cookie contract, and session-sync uses credential-vault. Download finalization uses filesystem-tool.
 
-### 3.3 Session Sync Manager
-Implements 1-Click Local Chrome/Brave Cookie Import: reads the local browser's cookie store, decrypts via the OS-Keychain-gated Safe Storage key, and injects the relevant cookies into the embedded Chromium instance's cookie jar via CDP. Falls back to a one-time manual login in an app-owned persistent profile whenever import fails (unsupported browser, decryption failure, missing domain) — this fallback path is a first-class part of the component, not an afterthought.
+## Execution paths
 
-### 3.4 Filesystem / Local Tool Layer
-Scoped file access per Playbook — explicit folder/file grants, surfaced to the user in plain language.
+### Task macros
 
-### 3.5 Credential Vault
-OS Keychain-backed. The orchestration engine resolves a `CredentialRef` to inject a secret directly into a form field via the browser driver — the LLM never sees the raw value.
+`TaskWorkspace → run_task → Engine::run_task → HealingReplay`.
 
-### 3.6 Spatial Canvas (Right Pane, Frontend)
-Consumes the orchestration engine's event stream to render a scrubbable Action Canvas (replayable step timeline), dynamic data tables, and Playbook Cards. Supports export to local file, Notion, or Slack.
+The current form replays an existing macro by workflow name. The backend's `TaskRequest::plan` can construct navigate, optional link click, and download-links steps for a first run when selectors are supplied by an API caller. Both paths checkpoint before and after each step. Completed first runs publish a versioned macro atomically.
 
-### 3.7 Sentinel Gate
-Evaluates the rules engine against each state-changing step; renders a human-readable preview and blocks execution until confirmed. Hard-enforces the non-configurable submission-approval floor for the Job Application Engine. Logs every decision immutably.
+Task replay requires a headless browser. Startup recovery marks unfinished task state interrupted; it does not repeat uncertain actions or provide a resume API. Selector repair is confined to a failed target or wait stage, with no repetition of an action whose wait failed.
 
-### 3.8 Playbook Store
-Versioned, human-readable (JSON) Playbook definitions, each referencing a recorded `Macro`. Git-diffable by design for future team-sharing.
+### Playbooks and natural-language commands
 
-## 4. Phased Build Approach
+`WorkflowForm → save_playbook/list_playbooks/execute_playbook → run_steps`.
 
-**Phase 0 — Spike:** Prove the full loop on Invoice Harvester (lower stakes) — Session Sync Manager (cookie import + fallback) + embedded Chromium + orchestration engine + macro record on first run + macro replay on second run + one Sentinel Gate. Validate against 5 real portals.
+Playbooks contain legacy selector steps or semantic intents. Legacy playbook steps use `replay_step`, not the task lane's `HealingReplay`; selector failures stop for repair. Semantic intents ground role, label, and optional contextual fields against live accessibility data, then use node geometry for clicks.
 
-**Phase 1 — MVP:** Ship all three anchor Playbooks (Job Application Engine, Invoice Harvester, Deal Radar). Dual-pane UI, Cmd+K, Sentinel Gate (hard submission floor on Job Application Engine), 1-Click Cookie Sync with fallback, local storage.
+`CommandBar → dispatch_natural_command → resolve_command` chooses a saved playbook, one ephemeral semantic intent, or a plural batch. Saved-name/host matching is deterministic. Ephemeral parsing can invoke a configured intent provider, with a deterministic fallback for returned failures or invalid output.
 
-**Phase 2 — Reliability & Reuse:** Harden self-healing accuracy, add scheduling, surface macro-reuse-rate and cookie-sync-success-rate metrics to users, build the golden-path regression suite.
+Cold-path entry routing uses the curated portal-route table in production. Account-directory and LLM route tiers exist as library interfaces but are not wired by AppService. An entry URL on the first semantic step supports pre-navigation and re-anchoring; the separate `entry_urls` table is not read on this dispatch path.
 
-**Phase 3 — Team Layer:** Shared Playbook libraries, roles, audit-log export, approval delegation.
+Plural dispatch snapshots candidates, asks for batch approval, and checks approval before each click. It caps execution at 30 candidates and stops on drift/failure. Candidate ordering follows snapshot document order, not a geometric visual sort.
 
-**Phase 4 — Native App Reach (separate track):** macOS Accessibility API spike for non-browser app control.
+The exported decomposition and dynamic-variable extraction helpers are tested library code; the desktop does not call them. A compound natural-language prompt is not automatically a sequence of saved steps.
 
-## 5. Why This Architecture Fits the Positioning
+## Persistence and transport
 
-- **1-Click Cookie Sync** solves the anti-bot/authenticated-site problem that structurally cripples cloud agents, with a real-browser session from the first run — the required consent screen and fallback path are what keep this a feature rather than a liability.
-- **Self-healing CDP macros** make "$0 cost, sub-second repeat runs" an architectural property, not a marketing line.
-- **Dual-pane + Spatial Canvas** turns output into an artifact (spreadsheet, Kanban board, export) instead of a chat transcript.
-- **Tauri v2/Rust** keeps the product feeling like a lightweight workstation rather than a resource-hungry Electron app, matching the "professional tool" positioning.
-- **Non-configurable Sentinel Gate floor** on the flagship use case is a hard-coded safety line because the downside is asymmetric and severe for the user this product is trying to help.
+Task snapshots and append-only checkpoint rows commit together with revision checks; browser I/O stays outside those transactions. Task approval records use `sentinel_decisions`. Playbook decisions and diagnostics use `session_events` text rows.
+
+The `playbooks` table contains name, portal URL, serialized step envelope, description, and timestamps. Save upserts by name. `runs` journals playbook/ephemeral run summaries; tasks have their own snapshot/checkpoint storage. Some run/telemetry writes are best effort, so these are not a complete immutable audit trail.
+
+Completed command-bar runs can be saved using a session-memory registry capped at 32 entries. Saved playbooks and run rows survive restart; registry keys do not. Signature-history and entry-URL helpers exist without a user-facing management/rollback surface.
+
+Task and playbook progress use Tauri Channels. The JPEG mirror polls `browser_viewport`; acquired screencasts use `browser-screencast-frame` events. Closing a frontend view does not itself cancel an executing task.
+
+## Session and provider boundaries
+
+Session import is explicit and supports Chrome, Brave, and Edge. The extension listens through a desktop loopback server at `127.0.0.1:9223`; requests are initiated by the desktop, correlated, expired, and domain-filtered. Source profiles and the managed profile are separate.
+
+Manual login uses the managed Chromium window. The URL classifier distinguishes same-origin landings, login path markers, known SSO challenges, and unknown origin mismatches. Known SSO is still pending auth until returning to the portal. This classifier is a heuristic, not proof of account access.
+
+No cloud provider is configured by default. Optional adapters are trusted executables, not sandboxed model runtimes. See [TRD.md](TRD.md) for privacy, timeout, and action limits, [STATUS.md](STATUS.md) for validation, and [FUTURE_FEATURES.md](FUTURE_FEATURES.md) for unimplemented ideas.

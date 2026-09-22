@@ -74,6 +74,11 @@ export default function WorkflowForm({ ready, busy, portal, report, errorMessage
 
   useEffect(() => {
     if (ready) void refreshList();
+    // Saves from the command bar and task workspace land here without a
+    // remount: refresh the replay list whenever any saver reports one.
+    const refresh = () => { void refreshList(); };
+    window.addEventListener("clinch:playbooks-changed", refresh);
+    return () => window.removeEventListener("clinch:playbooks-changed", refresh);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready]);
 
@@ -150,7 +155,7 @@ export default function WorkflowForm({ ready, busy, portal, report, errorMessage
   const runBusy = busy || (run?.running ?? false);
 
   return <section className="workflow-form" aria-label="Workflow builder">
-    <div className="eyebrow">PHASE B / WORKFLOW BUILDER</div>
+    <div className="eyebrow">WORKFLOW BUILDER</div>
     <h3>Describe controls, not selectors.</h3>
     <p>Connect a portal first, then preview each intent against the live page. Save named workflows below and replay them with one click; clicks pause for approval like every other run.</p>
     <form onSubmit={event => { event.preventDefault(); void checkMatch(); }}>

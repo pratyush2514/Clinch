@@ -1095,6 +1095,7 @@ mod tests {
             portal_url: portal_url.into(),
             step_count: 1,
             updated_at: String::new(),
+            description: None,
         }
     }
 

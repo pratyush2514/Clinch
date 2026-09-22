@@ -7,7 +7,10 @@
 
 /// Hosts navigation may target. Exact matches only, kept alongside the
 /// portal route table: adding a portal means extending both lists together.
-const ALLOWED_HOSTS: &[&str] = &["github.com"];
+/// `www.google.com` / `google.com` back the grounded search-fallback tier
+/// only (`/search?q=…` template, never guessed TLDs); table and entity
+/// tiers still resolve solely to portal hosts.
+const ALLOWED_HOSTS: &[&str] = &["github.com", "www.google.com", "google.com"];
 
 /// Why a proposed URL was rejected. Variants stay coarse on purpose: the
 /// caller only needs fail-closed, and messages never echo the URL (which
@@ -61,5 +64,18 @@ mod tests {
         assert!(validate_proposed_url("not a url at all").is_err());
         assert!(validate_proposed_url("").is_err());
         assert!(validate_proposed_url("https://github.com/settings/billing").is_ok());
+    }
+
+    #[test]
+    fn url_policy_allows_grounded_search_but_rejects_its_abuse() {
+        // Tier 5 template host passes; credentials and non-https fail even
+        // on the search host, and lookalikes never pass.
+        assert!(
+            validate_proposed_url("https://www.google.com/search?q=open+amazon+for+me").is_ok()
+        );
+        assert!(validate_proposed_url("https://google.com/search?q=hi").is_ok());
+        assert!(validate_proposed_url("https://user:pass@www.google.com/search?q=hi").is_err());
+        assert!(validate_proposed_url("http://www.google.com/search?q=hi").is_err());
+        assert!(validate_proposed_url("https://www.google.com.evil.com/search?q=hi").is_err());
     }
 }

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import BrowserScreencast from "./components/BrowserScreencast";
 
 type TaskState = "planned" | "running" | "needs_repair" | "completed" | "failed" | "interrupted";
 type StepState = "pending" | "running" | "completed" | "needs_repair" | "failed" | "interrupted";
@@ -93,6 +94,7 @@ export default function TaskWorkspace({ ready, busy, portal, setBusy, report, er
       });
       setSavedId(id);
       report(`Saved playbook ${saveName.trim()} (id ${id}) — replay it in one click from the workflow list.`);
+      window.dispatchEvent(new CustomEvent("clinch:playbooks-changed"));
     } catch (error) { report(errorMessage(error)); }
     finally { setSaving(false); }
   }
@@ -115,6 +117,7 @@ export default function TaskWorkspace({ ready, busy, portal, setBusy, report, er
   }
 
   return <section className="task-workspace" aria-label="Task workspace">
+    <BrowserScreencast ready={ready} report={report} errorMessage={errorMessage} />
     <dialog ref={modal} onCancel={event => { event.preventDefault(); void decide(false); }} aria-labelledby="sentinel-title">
       <div className="eyebrow">SENTINEL GATE</div><h2 id="sentinel-title">Review this action</h2>
       <p>Run {gate?.taskId} · Step {(gate?.stepIndex ?? 0) + 1}. Execution is paused until you decide.</p>
@@ -125,7 +128,7 @@ export default function TaskWorkspace({ ready, busy, portal, setBusy, report, er
     </dialog>
     <div className="eyebrow">TASK WORKSPACE</div>
     <h3>Replay saved paths.</h3>
-    <p>Enter a saved workflow name to replay its recorded path, or describe new work in plain language above. Connect the portal and finish signing in first.</p>
+    <p>Enter a saved workflow name to replay its recorded path, or describe new work in plain language above. Ad-hoc prompts auto-acquire the browser and resolve via search fallback; saved replays use their stored portal.</p>
     <form onSubmit={event => { event.preventDefault(); void run(); }}>
       <fieldset disabled={!ready || busy}>
         <label>Workflow name<input required pattern="[A-Za-z0-9_-]+" maxLength={64} value={workflow} onChange={event => setWorkflow(event.target.value)} /></label>

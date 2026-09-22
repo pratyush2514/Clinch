@@ -8,6 +8,10 @@ use sqlx::{
 };
 use std::{path::Path, time::Duration};
 
+/// `SQLite` busy timeout: writers briefly wait on each other's WAL locks
+/// instead of failing instantly under concurrent runs.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Local storage directory is unavailable")]
@@ -32,6 +36,10 @@ pub struct PlaybookSummary {
     pub portal_url: String,
     pub step_count: usize,
     pub updated_at: String,
+    /// Free-text memo, if one was saved. `#[serde(default)]` keeps older
+    /// consumers parsing summaries that predate the field.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// SQLite-backed Playbook repository. Shares the application's single WAL
@@ -60,12 +68,13 @@ impl PlaybookStore {
         playbook.validate()?;
         let steps = serde_json::to_string(&playbook.steps)?;
         sqlx::query(
-            "INSERT INTO playbooks(name, portal_url, steps_json, updated_at) VALUES(?, ?, ?, CURRENT_TIMESTAMP) \
-             ON CONFLICT(name) DO UPDATE SET portal_url=excluded.portal_url, steps_json=excluded.steps_json, updated_at=CURRENT_TIMESTAMP",
+            "INSERT INTO playbooks(name, portal_url, steps_json, description, updated_at) VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(name) DO UPDATE SET portal_url=excluded.portal_url, steps_json=excluded.steps_json, description=excluded.description, updated_at=CURRENT_TIMESTAMP",
         )
         .bind(&playbook.name)
         .bind(playbook.origin.as_str())
         .bind(&steps)
+        .bind(playbook.description.as_deref())
         .execute(&self.pool)
         .await?;
         let id: i64 = sqlx::query_scalar("SELECT id FROM playbooks WHERE name = ?")
@@ -82,12 +91,13 @@ impl PlaybookStore {
     /// Returns not-found, definition, serialization, or database errors.
     pub async fn load_playbook(&self, id: &str) -> Result<crate::schema::Playbook, StoreError> {
         let row_id: i64 = id.parse().map_err(|_| StoreError::NotFound)?;
-        let row: Option<(String, String, String)> =
-            sqlx::query_as("SELECT name, portal_url, steps_json FROM playbooks WHERE id = ?")
-                .bind(row_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        let (name, portal_url, steps_json) = row.ok_or(StoreError::NotFound)?;
+        let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT name, portal_url, steps_json, description FROM playbooks WHERE id = ?",
+        )
+        .bind(row_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let (name, portal_url, steps_json, description) = row.ok_or(StoreError::NotFound)?;
         let origin = url::Url::parse(&portal_url)
             .map_err(|_| StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
         let steps: Vec<crate::schema::Step> = serde_json::from_str(&steps_json)?;
@@ -96,6 +106,7 @@ impl PlaybookStore {
             name,
             origin,
             steps,
+            description,
         };
         playbook.validate()?;
         Ok(playbook)
@@ -193,22 +204,25 @@ impl PlaybookStore {
     /// # Errors
     /// Returns serialization or database errors.
     pub async fn list_playbooks(&self) -> Result<Vec<PlaybookSummary>, StoreError> {
-        let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
-            "SELECT id, name, portal_url, steps_json, updated_at FROM playbooks ORDER BY updated_at DESC, id DESC",
+        let rows: Vec<(i64, String, String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, name, portal_url, steps_json, description, updated_at FROM playbooks ORDER BY updated_at DESC, id DESC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, name, portal_url, steps_json, updated_at)| {
-                let steps: Vec<crate::schema::Step> = serde_json::from_str(&steps_json)?;
-                Ok(PlaybookSummary {
-                    id: id.to_string(),
-                    name,
-                    portal_url,
-                    step_count: steps.len(),
-                    updated_at,
-                })
-            })
+            .map(
+                |(id, name, portal_url, steps_json, description, updated_at)| {
+                    let steps: Vec<crate::schema::Step> = serde_json::from_str(&steps_json)?;
+                    Ok(PlaybookSummary {
+                        id: id.to_string(),
+                        name,
+                        portal_url,
+                        step_count: steps.len(),
+                        updated_at,
+                        description,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -289,7 +303,7 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5));
+        .busy_timeout(BUSY_TIMEOUT);
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .connect_with(options)
@@ -299,10 +313,22 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     // Single-schema store (no migrations yet): validated Playbook envelopes
     // land here via `PlaybookStore`; rows always re-validate on read.
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS playbooks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, portal_url TEXT NOT NULL, steps_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS playbooks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, portal_url TEXT NOT NULL, steps_json TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     )
     .execute(&pool)
     .await?;
+    // First additive migration: memo column for databases created before
+    // descriptions existed. PRAGMA-guarded so reopening is idempotent.
+    let has_description: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('playbooks') WHERE name = 'description'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if !has_description {
+        sqlx::query("ALTER TABLE playbooks ADD COLUMN description TEXT")
+            .execute(&pool)
+            .await?;
+    }
     // Run journal for POC metrics (reuse rates, sync outcomes). Additive and
     // idempotent like every table here: existing databases gain it on next
     // open, no ALTER or data migration involved. `completed_at` stays NULL
@@ -383,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn save_load_and_list_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = store().await?;
-        let playbook = reports_playbook()?;
+        let playbook = reports_playbook()?.with_description(Some("Monthly site report".into()));
         let id = store.save_playbook(&playbook).await?;
         let revived = store.load_playbook(&id).await?;
         assert_eq!(revived, playbook);
@@ -393,6 +419,10 @@ mod tests {
         assert_eq!(listed[0].name, "reports");
         assert_eq!(listed[0].portal_url, "https://portal.example.com/");
         assert_eq!(listed[0].step_count, 1);
+        assert_eq!(
+            listed[0].description.as_deref(),
+            Some("Monthly site report")
+        );
         assert!(!listed[0].updated_at.is_empty());
         Ok(())
     }
@@ -499,6 +529,39 @@ mod tests {
                 .fetch_all(&pool)
                 .await?;
         assert_eq!(history.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn description_migrates_legacy_databases() -> Result<(), Box<dyn std::error::Error>> {
+        // Databases created before the memo column existed gain it on next
+        // open: hand-roll the v1 table, run the real `initialize`, then
+        // save and read back a memo through the migrated schema.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("legacy.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await?;
+        sqlx::query(
+            "CREATE TABLE playbooks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, portal_url TEXT NOT NULL, steps_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+        let pool = super::initialize(&path).await?;
+        let store = PlaybookStore::new(pool);
+        let id = store
+            .save_playbook(&reports_playbook()?.with_description(Some("Migrated memo".into())))
+            .await?;
+        assert_eq!(
+            store.load_playbook(&id).await?.description.as_deref(),
+            Some("Migrated memo")
+        );
         Ok(())
     }
 

@@ -1,11 +1,12 @@
 #![deny(unsafe_code)]
 use crate::auth::{AuthPanel, ReauthReason, reason_for_signal};
 use browser_driver::{Action, LaunchOptions, ManagedBrowser};
+use futures::StreamExt;
 use orchestration_engine::{Engine, EngineError, Task, TaskEvent, TaskId, TaskRequest};
 use serde::Serialize;
 use session_sync::{FallbackReason, PreparedSync, SyncRequest};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -44,6 +45,22 @@ pub struct StorageStatus {
     /// Chrome's own elevation service can unwrap it), while Brave keeps a
     /// plain user-DPAPI key that imports instantly.
     default_browser: &'static str,
+    /// Exact startup build line journaled as the first `session_events`
+    /// row, surfaced so Session Activity names the running binary.
+    startup_build: String,
+}
+
+/// Exact binary identity for Session Activity startup telemetry, e.g.
+/// `startup_build: v0.1.0 · hash:abc1234`. Version comes from the workspace
+/// manifest; the hash is stamped by build.rs from git (or a build nonce).
+/// Single source for the journaled row and the `initialize` response so the
+/// two can never disagree.
+fn startup_build_line() -> String {
+    format!(
+        "startup_build: v{} · hash:{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CLINCH_BUILD_HASH")
+    )
 }
 
 #[derive(Serialize)]
@@ -76,6 +93,20 @@ pub struct PickerStatus {
     /// replay targets and absent browsers both report false.
     ready: bool,
 }
+
+/// App-owned background browser context state for the UI preview card.
+/// Read-only snapshot: never launches as a side effect.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextStatus {
+    /// A managed Chromium session is currently attached.
+    attached: bool,
+    /// The attached session runs without an OS window.
+    headless: bool,
+}
+
+/// Tauri event carrying one base64 JPEG viewport frame to the preview card.
+pub const SCREENCAST_EVENT: &str = "browser-screencast-frame";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +157,18 @@ struct ApprovalContent {
 /// Per-snippet budget for container fingerprints: enough to recognize a
 /// row, short enough to keep gate payloads small.
 const MAX_PREVIEW_CONTAINER_LEN: usize = 120;
+/// How long one playbook approval waits for a human decision before the
+/// gate denies by default and the run fails closed.
+const APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
+/// Bounds for one visual-picker wait: long enough to find and click an
+/// element, short enough that a forgotten armed picker cannot stall the
+/// single-operation permit indefinitely.
+const PICKER_TIMEOUT_MIN_MS: u64 = 1_000;
+const PICKER_TIMEOUT_MAX_MS: u64 = 120_000;
+/// Download staging directory under the app-data root. Both the run
+/// machinery and the file-serving guard resolve through this name so a
+/// download can never escape its per-run folder.
+const DOWNLOADS_DIR: &str = "downloads";
 
 /// Shape resolved batch candidates into gate-card previews in document
 /// order. Pure mapping — the live approval path below only forwards it.
@@ -215,6 +258,12 @@ pub struct DispatchOutcome {
     /// playbooks without reconstructing them client-side. Additive to the
     /// IPC shape: older clients ignore unknown keys.
     steps: Vec<playbook_store::Step>,
+    /// Completed-run registry key for `save_run_as_workflow`: `Some` only
+    /// when this ephemeral run completed and was remembered (the exact
+    /// executed graph plus origin, no client round-trip). `None` for saved
+    /// replays and non-completed ephemerals. Additive to the IPC shape:
+    /// older clients ignore unknown keys.
+    run_id: Option<String>,
     /// Route telemetry for the Session Activity UI: the exact
     /// `route_proposed:…` / `route_resolution_miss:…` line recorded to
     /// `session_events`, so the command bar can render it immediately
@@ -265,8 +314,30 @@ pub struct AppService {
     /// Pending playbook-run approval. Single-flight like the Sentinel gate:
     /// stale and duplicate decisions fail closed.
     playbook_gate: Mutex<Option<PendingPlaybookGate>>,
+    /// Live screencast pump forwarding viewport frames to the UI. Aborted
+    /// on release, takeover, re-acquire, and app exit — never detached.
+    screencast: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Completed ephemeral runs awaiting persistence: the executed graph
+    /// (origin plus steps) keyed by journal id, newest last. Session memory
+    /// only — `save_run_as_workflow` drains entries into durable playbooks.
+    completed_runs: Mutex<VecDeque<CompletedRun>>,
     next_playbook_run: AtomicU64,
 }
+
+/// One finished ephemeral run held for persistence: the exact executed
+/// graph plus the portal it ran under. Recorded only on terminal
+/// completion; anything else never becomes saveable. The save command
+/// supplies a fresh name, so none is stored here.
+#[derive(Clone, Debug)]
+struct CompletedRun {
+    id: String,
+    origin: url::Url,
+    steps: Vec<playbook_store::Step>,
+}
+
+/// Session cap on persistable completed runs: old entries evict
+/// first-in-first-out, so the registry can never grow with the session.
+const MAX_COMPLETED_RUNS: usize = 32;
 
 impl AppService {
     pub fn new(data: PathBuf, home: PathBuf) -> Self {
@@ -284,6 +355,8 @@ impl AppService {
             bridge: Mutex::new(None),
             bridge_task: Mutex::new(None),
             playbook_gate: Mutex::new(None),
+            screencast: Mutex::new(None),
+            completed_runs: Mutex::new(VecDeque::new()),
             next_playbook_run: AtomicU64::new(1),
         }
     }
@@ -318,6 +391,13 @@ impl AppService {
     }
 
     pub async fn initialize(&self) -> Result<StorageStatus, AppError> {
+        // Schema first, then the startup build line as the very first
+        // `session_events` row of this boot — before engine recovery or any
+        // other journal write — so Session Activity always opens with the
+        // exact binary identity and stale builds are unambiguous.
+        self.database().await?;
+        let startup_build = startup_build_line();
+        self.record(&startup_build).await?;
         self.engine().await?;
         Ok(StorageStatus {
             ready: true,
@@ -330,6 +410,7 @@ impl AppService {
             } else {
                 "chrome"
             },
+            startup_build,
         })
     }
 
@@ -427,7 +508,7 @@ impl AppService {
             .flat_map(|step| &step.output.files)
             .nth(index)
             .ok_or(AppError::InvalidInput("Unknown downloaded file."))?;
-        let root = tokio::fs::canonicalize(self.data.join("downloads").join(id.0.to_string()))
+        let root = tokio::fs::canonicalize(self.data.join(DOWNLOADS_DIR).join(id.0.to_string()))
             .await
             .map_err(|_| AppError::StorageUnavailable)?;
         let path = tokio::fs::canonicalize(&file.path)
@@ -444,32 +525,74 @@ impl AppService {
         Ok(path)
     }
 
-    async fn browser(&self, headless: bool) -> Result<Arc<ManagedBrowser>, AppError> {
+    /// Managed Chromium executable: the explicit override, else the
+    /// platform default install path.
+    fn chromium_executable() -> PathBuf {
+        std::env::var_os("CLINCH_CHROMIUM_PATH").map_or_else(default_chromium, PathBuf::from)
+    }
+
+    /// App-owned persistent profile directory. Never the user's daily profile.
+    fn browser_profile(&self) -> PathBuf {
+        self.data.join("browser-profile")
+    }
+
+    /// Acquire the managed browser for `intent`, launching lazily when no
+    /// session is attached.
+    ///
+    /// [`BrowserIntent::Background`] can never create an OS window: it
+    /// launches headless and, when a session already exists, reuses it
+    /// exactly as-is instead of restarting. Reuse-as-is matters in both
+    /// directions — a background run can neither promote a headless context
+    /// into a visible window nor demote a window the user opened with Take
+    /// Control. Only [`BrowserIntent::Interactive`] may restart a headless
+    /// session into a visible one.
+    async fn browser(&self, intent: BrowserIntent) -> Result<Arc<ManagedBrowser>, AppError> {
         let existing = self.browser.lock().map_err(|_| AppError::Internal)?.clone();
-        let executable =
-            std::env::var_os("CLINCH_CHROMIUM_PATH").map_or_else(default_chromium, PathBuf::from);
-        let profile = self.data.join("browser-profile");
-        let options = LaunchOptions { headless };
-        let browser = if let Some(browser) = existing {
-            if browser.is_headless() == headless {
+        if let Some(browser) = existing {
+            // Background takes the live session untouched; interactive only
+            // needs a restart when that session has no window.
+            if intent == BrowserIntent::Background || !browser.is_headless() {
                 return Ok(browser);
             }
-            let restarted = browser.restart(&executable, &profile, options).await;
-            if let Ok(browser) = restarted {
-                browser
-            } else {
-                *self.browser.lock().map_err(|_| AppError::Internal)? = None;
-                *self.session_origin.lock().map_err(|_| AppError::Internal)? = None;
-                return Err(AppError::BrowserUnavailable);
-            }
-        } else {
-            ManagedBrowser::launch_with_options(&executable, &profile, options)
-                .await
-                .map_err(|_| AppError::BrowserUnavailable)?
-        };
-        let browser = Arc::new(browser);
+            return self.restart_browser(&browser, intent).await;
+        }
+        let browser = Arc::new(
+            ManagedBrowser::launch_with_options(
+                &Self::chromium_executable(),
+                &self.browser_profile(),
+                intent.launch_options(),
+            )
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?,
+        );
         *self.browser.lock().map_err(|_| AppError::Internal)? = Some(browser.clone());
         Ok(browser)
+    }
+
+    /// Restart the attached session under `intent`'s window mode, carrying
+    /// cookies in memory. A failed restart clears both the handle and the
+    /// connected origin so the next acquisition starts from a clean state
+    /// rather than reusing a dead target.
+    async fn restart_browser(
+        &self,
+        browser: &ManagedBrowser,
+        intent: BrowserIntent,
+    ) -> Result<Arc<ManagedBrowser>, AppError> {
+        let restarted = browser
+            .restart(
+                &Self::chromium_executable(),
+                &self.browser_profile(),
+                intent.launch_options(),
+            )
+            .await;
+        let Ok(restarted) = restarted else {
+            *self.browser.lock().map_err(|_| AppError::Internal)? = None;
+            *self.session_origin.lock().map_err(|_| AppError::Internal)? = None;
+            return Err(AppError::BrowserUnavailable);
+        };
+        let restarted = Arc::new(restarted);
+        *self.browser.lock().map_err(|_| AppError::Internal)? = Some(restarted.clone());
+        Ok(restarted)
     }
 
     async fn record(&self, outcome: &str) -> Result<(), AppError> {
@@ -612,7 +735,7 @@ impl AppService {
             return Ok(server);
         }
         Err(AppError::InvalidInput(
-            "The companion bridge could not start. Is port 9223 already in use?",
+            "The companion bridge could not start. Is its port already in use?",
         ))
     }
 
@@ -825,7 +948,7 @@ impl AppService {
         &self,
         timeout_ms: u64,
     ) -> Result<browser_driver::PickedElement, AppError> {
-        let timeout_ms = timeout_ms.clamp(1_000, 120_000);
+        let timeout_ms = timeout_ms.clamp(PICKER_TIMEOUT_MIN_MS, PICKER_TIMEOUT_MAX_MS);
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         let browser = {
             self.browser
@@ -922,6 +1045,15 @@ impl AppService {
             .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
         let playbook = playbook_store::Playbook::new(name, portal, steps)
             .map_err(|_| AppError::InvalidInput("Check the workflow name, portal, and steps."))?;
+        self.persist_playbook(playbook).await
+    }
+
+    /// Shared persistence core: validate-then-upsert one playbook, mapping
+    /// store failures to UI errors. Returns the row id as text.
+    async fn persist_playbook(
+        &self,
+        playbook: playbook_store::Playbook,
+    ) -> Result<String, AppError> {
         self.playbooks()
             .await?
             .save_playbook(&playbook)
@@ -932,6 +1064,55 @@ impl AppService {
                 }
                 _ => AppError::StorageUnavailable,
             })
+    }
+
+    /// Record one terminally completed ephemeral run for later persistence,
+    /// evicting the oldest entries past [`MAX_COMPLETED_RUNS`]. Only
+    /// completed runs are remembered: anything else was never proven.
+    fn remember_completed_run(&self, id: &str, origin: &url::Url, steps: &[playbook_store::Step]) {
+        if let Ok(mut runs) = self.completed_runs.lock() {
+            runs.push_back(CompletedRun {
+                id: id.to_owned(),
+                origin: origin.clone(),
+                steps: steps.to_vec(),
+            });
+            while runs.len() > MAX_COMPLETED_RUNS {
+                runs.pop_front();
+            }
+        }
+    }
+
+    /// Persist a completed ephemeral run as a durable, re-runnable
+    /// playbook: the exact executed graph (entry route, batch intent, noun,
+    /// selectors) plus an optional memo, stored under `name`. The run must
+    /// still sit in the session registry — unknown ids fail closed, and
+    /// evicted graphs fail closed asking for a re-run. Returns the row id
+    /// as text for `execute_playbook`.
+    pub async fn save_run_as_workflow(
+        &self,
+        run_id: String,
+        name: String,
+        description: Option<String>,
+    ) -> Result<String, AppError> {
+        let run = self
+            .completed_runs
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .iter()
+            .find(|run| run.id == run_id)
+            .cloned();
+        let Some(run) = run else {
+            return Err(AppError::InvalidInput(
+                "Unknown or expired run. Re-run the prompt, then save the completed workflow.",
+            ));
+        };
+        let memo = description
+            .map(|memo| memo.trim().to_owned())
+            .filter(|memo| !memo.is_empty());
+        let playbook = playbook_store::Playbook::new(name, run.origin, run.steps)
+            .map_err(|_| AppError::InvalidInput("Check the workflow name, portal, and steps."))?
+            .with_description(memo);
+        self.persist_playbook(playbook).await
     }
 
     /// Newest-first stored-playbook summaries for the workflow list.
@@ -1079,7 +1260,7 @@ impl AppService {
                 }),
             });
         }
-        let approved = tokio::time::timeout(Duration::from_mins(5), receive)
+        let approved = tokio::time::timeout(APPROVAL_TIMEOUT, receive)
             .await
             .ok()
             .and_then(Result::ok)
@@ -1127,16 +1308,18 @@ impl AppService {
                     }
                     _ => AppError::StorageUnavailable,
                 })?;
-        self.run_steps(
-            playbook.origin.clone(),
-            &playbook.steps,
-            RunScope {
-                kind: playbook_store::RunKind::Saved,
-                playbook_id: Some(id),
-            },
-            emit,
-        )
-        .await
+        let (result, _) = self
+            .run_steps(
+                playbook.origin.clone(),
+                &playbook.steps,
+                RunScope {
+                    kind: playbook_store::RunKind::Saved,
+                    playbook_id: Some(id),
+                },
+                emit,
+            )
+            .await?;
+        Ok(result)
     }
 
     /// Route a free-form command to a saved playbook, a single-step
@@ -1166,9 +1349,6 @@ impl AppService {
             .map_err(|_| AppError::Internal)?
             .clone();
         match orchestration_engine::resolve_command(&prompt, connected.as_ref(), &saved) {
-            None => Err(AppError::InvalidInput(
-                "No saved workflow matches, and no portal is connected for an ad-hoc intent. Connect a portal or save a workflow first.",
-            )),
             Some(matched) => match dispatch_lane(&matched) {
                 DispatchLane::Saved => {
                     let orchestration_engine::CommandMatch::Saved { id } = matched else {
@@ -1193,7 +1373,88 @@ impl AppService {
                         .await
                 }
             },
+            None if connected.is_none() => {
+                // Ad-hoc without a connected portal: resolve against a
+                // synthetic search origin so free-form prompts still yield an
+                // ephemeral intent, then auto-acquire the browser and run
+                // via the grounded search-fallback tier. The Portal URL
+                // field stays an optional override, never a prerequisite.
+                let fallback_origin = url::Url::parse("https://www.google.com/").ok();
+                let fallback_ref = fallback_origin.as_ref();
+                match orchestration_engine::resolve_command(&prompt, fallback_ref, &saved) {
+                    Some(matched) => match dispatch_lane(&matched) {
+                        DispatchLane::Saved => Err(AppError::SessionRequired),
+                        DispatchLane::Single | DispatchLane::Batch => {
+                            let orchestration_engine::CommandMatch::Ephemeral { intent } = matched
+                            else {
+                                return Err(AppError::Internal);
+                            };
+                            self.dispatch_adhoc_auto_acquire(prompt, intent, emit).await
+                        }
+                    },
+                    None => Err(AppError::InvalidInput(
+                        "No saved workflow matches for this prompt. Try a different description.",
+                    )),
+                }
+            }
+            None => Err(AppError::InvalidInput(
+                "No saved workflow matches, and no portal is connected for an ad-hoc intent. Connect a portal or save a workflow first.",
+            )),
         }
+    }
+
+    /// Ad-hoc dispatch without a prior portal connection: auto-acquire the
+    /// browser (lazy launch), resolve the entry via the tiered resolver
+    /// (table → adapter → grounded search fallback), journal the target,
+    /// `ensure_at_entry_url`, then `reanchor_portal` before running.
+    /// The derived entry origin becomes the run portal, so the Portal URL
+    /// input stays an optional override.
+    async fn dispatch_adhoc_auto_acquire(
+        &self,
+        prompt: String,
+        mut intent: macro_engine::SemanticIntent,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        // Tiered resolution first so the destination is journaled even when
+        // the browser cannot start (mirrors the connected lane ordering).
+        // `propose_entry_url` validates every tier (https, no credentials,
+        // allowlisted host) and journals `route_fallback: search` for the
+        // grounded template.
+        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
+        let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
+            "The derived intent is not runnable.",
+        ))?;
+        let entry_url = url::Url::parse(&entry)
+            .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        // Strict validation before any navigation or session write.
+        orchestration_engine::validate_proposed_url(entry_url.as_str())
+            .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        // The entry origin becomes the run portal; record it as the session
+        // so the shared run machinery's origin check passes without a prior
+        // manual Portal URL. Query/fragment never enter the session origin.
+        let mut portal = entry_url.clone();
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
+        // Delegate to the connected lanes: they auto-acquire the browser
+        // (`browser(false)` lazy-launches when dormant), journal the target,
+        // `ensure_at_entry_url` via pre-navigation, and `reanchor_portal`
+        // before snapshotting. Batch intents keep the batch lane so plural
+        // prompts never truncate to one click. The first proposal line is
+        // preserved because the delegate sees `entry_url` already set and
+        // returns `route_log: None`.
+        let mut outcome = if intent.is_plural {
+            self.dispatch_plural_batch(portal, prompt, intent, emit)
+                .await?
+        } else {
+            self.dispatch_single_ephemeral(portal, prompt, intent, emit)
+                .await?
+        };
+        if outcome.route_log.is_none() {
+            outcome.route_log = route_log;
+        }
+        Ok(outcome)
     }
 
     /// Run a stored playbook by row id with the shared run machinery.
@@ -1214,7 +1475,7 @@ impl AppService {
                     _ => AppError::StorageUnavailable,
                 })?;
         let name = playbook.name.clone();
-        let result = self
+        let (result, _) = self
             .run_steps(
                 playbook.origin.clone(),
                 &playbook.steps,
@@ -1230,6 +1491,8 @@ impl AppService {
             name,
             result,
             steps: playbook.steps.clone(),
+            // Saved replays are already durable: nothing to remember.
+            run_id: None,
             route_log: None,
             telemetry_log: None,
         })
@@ -1253,22 +1516,48 @@ impl AppService {
             return None;
         }
         // Production wires no account directory (no stored credential backs
-        // one) and no LLM adapter: only the curated table tier can fire.
+        // one) and no LLM adapter: the curated table tier fires first, with
+        // grounded search fallback when it misses.
         let ctx = orchestration_engine::ResolutionContext {
             account_dir: None,
             llm: None,
         };
         // Try the label first, then the primary target noun when it differs:
         // both are prompt-derived topic words, so neither inspects tab state.
-        let mut resolved =
+        // Table/entity hits win over search: a search fallback from the
+        // label never shadows a table hit from the noun.
+        let label_resolved =
             orchestration_engine::resolve_entry_url(prompt, &intent.label_query, &ctx);
-        if resolved.is_none()
-            && let Some(noun) = intent.primary_target_noun.as_deref()
+        let mut resolved = label_resolved;
+        if let Some(noun) = intent.primary_target_noun.as_deref()
             && !noun.eq_ignore_ascii_case(&intent.label_query)
         {
-            resolved = orchestration_engine::resolve_entry_url(prompt, noun, &ctx);
+            let noun_resolved = orchestration_engine::resolve_entry_url(prompt, noun, &ctx);
+            let label_is_search = resolved.as_ref().is_some_and(|route| {
+                route.source == orchestration_engine::RouteSource::SearchFallback
+            });
+            let noun_is_strong = noun_resolved.as_ref().is_some_and(|route| {
+                route.source != orchestration_engine::RouteSource::SearchFallback
+            });
+            if resolved.is_none() || (label_is_search && noun_is_strong) {
+                resolved = noun_resolved;
+            }
         }
         if let Some(route) = resolved {
+            // Grounded search fallback journals its own line (query string
+            // included) so Session Activity shows the template, never a
+            // guessed TLD. Dispatcher navigates to the search page and
+            // grounds the top result link from the live AX tree.
+            if route.source == orchestration_engine::RouteSource::SearchFallback {
+                let query = route.url.query().unwrap_or("").to_owned();
+                let line = format!(
+                    "route_fallback: search q='{query}' · url={}",
+                    route.url.as_str()
+                );
+                let _ = self.record(&line).await;
+                intent.entry_url = Some(route.url.as_str().to_owned());
+                return Some(line);
+            }
             let line = format!(
                 "route_proposed:{}{} · source: {:?}",
                 route.url.host_str().unwrap_or("?"),
@@ -1403,9 +1692,9 @@ impl AppService {
         Self::pre_navigate_to_step(&browser, &playbook.steps).await?;
         let telemetry_log = self.reanchor_to_entry(&browser, &playbook.steps).await;
         self.verify_bridge_auth(&portal).await?;
-        let result = self
+        let (result, journal_id) = self
             .run_steps(
-                portal,
+                portal.clone(),
                 &playbook.steps,
                 RunScope {
                     kind: playbook_store::RunKind::Ephemeral,
@@ -1414,11 +1703,20 @@ impl AppService {
                 emit,
             )
             .await?;
+        if result.status == orchestration_engine::SequenceStatus::Completed {
+            self.remember_completed_run(&journal_id, &portal, &playbook.steps);
+        }
+        // The registry key travels only when the run was remembered, so the
+        // Save button can offer one-click persistence without re-asking the
+        // portal or round-tripping steps through the client.
+        let run_id = (result.status == orchestration_engine::SequenceStatus::Completed)
+            .then(|| journal_id.clone());
         Ok(DispatchOutcome {
             kind: "ephemeral",
             name,
             result,
             steps: playbook.steps.clone(),
+            run_id,
             route_log,
             // Per-snapshot lines live inside the macro engine here, which
             // has no journal access — but the re-anchor line (if the anchor
@@ -1477,6 +1775,7 @@ impl AppService {
                 status,
                 completed,
                 stopped,
+                &journal_id,
                 route_log.clone(),
                 telemetry_log.clone(),
             )
@@ -1515,6 +1814,7 @@ impl AppService {
                     run_id,
                     orchestration_engine::SequencePhase::Completed,
                 );
+                self.remember_completed_run(&journal_id, &portal, &steps);
                 Ok(outcome(
                     orchestration_engine::SequenceStatus::Completed,
                     1,
@@ -1534,11 +1834,7 @@ impl AppService {
                 Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", clicks_completed)
                     .await;
                 let _ = self.record("batch:halted:UrlDriftDetected").await;
-                Self::emit_batch_phase(
-                    &events,
-                    run_id,
-                    orchestration_engine::SequencePhase::Blocked,
-                );
+                Self::emit_batch_blocked(&events, run_id);
                 Ok(outcome(
                     orchestration_engine::SequenceStatus::Failed,
                     clicks_completed,
@@ -1547,11 +1843,7 @@ impl AppService {
             }
             Err(_) => {
                 Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", 0).await;
-                Self::emit_batch_phase(
-                    &events,
-                    run_id,
-                    orchestration_engine::SequencePhase::Blocked,
-                );
+                Self::emit_batch_blocked(&events, run_id);
                 Ok(outcome(
                     orchestration_engine::SequenceStatus::Failed,
                     0,
@@ -1864,15 +2156,29 @@ impl AppService {
         }
     }
 
+    /// Terminal Blocked phase for batch runs that never completed: denied,
+    /// drift-halted, and failed executions all park the progress UI the
+    /// same way.
+    fn emit_batch_blocked(
+        events: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
+        run_id: u64,
+    ) {
+        Self::emit_batch_phase(events, run_id, orchestration_engine::SequencePhase::Blocked);
+    }
+
     /// Terminal batch outcome: one ephemeral step carrying N actions, plus
     /// the route-proposal and snapshot-telemetry lines for immediate
     /// Session Activity render.
+    // Eight plain data params on a pure value constructor: bundling would
+    // obscure the IPC-mapped fields for no coupling gain.
+    #[allow(clippy::too_many_arguments)]
     fn batch_outcome(
         name: String,
         steps: Vec<playbook_store::Step>,
         status: orchestration_engine::SequenceStatus,
         completed: usize,
         stopped: Option<usize>,
+        journal_id: &str,
         route_log: Option<String>,
         telemetry_log: Option<String>,
     ) -> DispatchOutcome {
@@ -1886,6 +2192,10 @@ impl AppService {
                 stopped_at: stopped,
             },
             steps,
+            // Only completed batches sit in the registry; every other
+            // terminal state carries no key, so the UI offers no save.
+            run_id: (status == orchestration_engine::SequenceStatus::Completed)
+                .then(|| journal_id.to_owned()),
             route_log,
             telemetry_log,
         }
@@ -1893,14 +2203,16 @@ impl AppService {
 
     /// Shared run machinery for stored and ephemeral playbooks: session
     /// contract, semaphore, headed browser, per-run output dir, approval
-    /// gates, and progress streaming.
+    /// gates, and progress streaming. Returns the terminal outcome plus the
+    /// journal id, so ephemeral lanes can key completed runs for later
+    /// persistence.
     async fn run_steps(
         &self,
         portal: url::Url,
         steps: &[playbook_store::Step],
         scope: RunScope,
         mut emit: impl FnMut(PlaybookEvent) + Send,
-    ) -> Result<orchestration_engine::SequenceOutcome, AppError> {
+    ) -> Result<(orchestration_engine::SequenceOutcome, String), AppError> {
         let connected = self
             .session_origin
             .lock()
@@ -1911,10 +2223,16 @@ impl AppService {
         }
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         let browser = self.browser(false).await?;
+        // Saved cross-domain playbooks replay from their entry route, not
+        // the connected portal: navigate first (no-op when already there),
+        // then bind confinement to the intentional destination so snapshots
+        // evaluate the entry origin. Legacy steps without entries skip both.
+        Self::pre_navigate_to_step(&browser, steps).await?;
+        let _ = self.reanchor_to_entry(&browser, steps).await;
         let run_id = self.next_playbook_run.fetch_add(1, Ordering::Relaxed);
         let output = self
             .data
-            .join("downloads")
+            .join(DOWNLOADS_DIR)
             .join(format!("playbook-{run_id}"));
         let total_steps = steps.len();
         // Telemetry is fail-open by design: a journal write must never fail a
@@ -1994,7 +2312,7 @@ impl AppService {
                 .record_run_finish(&journal_id, status, outcome.completed_steps)
                 .await;
         }
-        Ok(outcome)
+        Ok((outcome, journal_id))
     }
 
     pub async fn close_browser(&self) -> Result<(), AppError> {
@@ -2011,11 +2329,108 @@ impl AppService {
     }
 
     pub fn terminate_browser(&self) {
+        if let Ok(mut pump) = self.screencast.lock()
+            && let Some(handle) = pump.take()
+        {
+            handle.abort();
+        }
         if let Ok(guard) = self.browser.lock()
             && let Some(browser) = guard.as_ref()
         {
             browser.terminate();
         }
+    }
+
+    /// Read-only background-context state for the UI preview card. Never
+    /// launches a browser as a side effect — the setup hook and polling
+    /// views own no process handle.
+    pub fn context_status(&self) -> Result<ContextStatus, AppError> {
+        let guard = self.browser.lock().map_err(|_| AppError::Internal)?;
+        Ok(match guard.as_ref() {
+            Some(browser) => ContextStatus {
+                attached: true,
+                headless: browser.is_headless(),
+            },
+            None => ContextStatus {
+                attached: false,
+                headless: true,
+            },
+        })
+    }
+
+    /// Lazily attach the app-owned background Chromium (headless: no OS
+    /// window, dedicated Clinch profile) and stream its viewport into
+    /// `emit` until released, retaken, or re-acquired. Reuses the live
+    /// session when one is already attached. Nothing launches on startup
+    /// or on status reads — only dispatch, sync flows, and this call
+    /// attach. Fails closed when Chromium cannot start.
+    pub async fn acquire_context(
+        &self,
+        emit: impl Fn(browser_driver::ScreencastFrame) + Send + 'static,
+    ) -> Result<ContextStatus, AppError> {
+        let browser = self.browser(true).await?;
+        browser
+            .start_screencast()
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        let mut frames = browser
+            .screencast_frames()
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        if let Ok(mut pump) = self.screencast.lock() {
+            if let Some(handle) = pump.take() {
+                handle.abort();
+            }
+            let forwarding = browser.clone();
+            *pump = Some(tokio::spawn(async move {
+                while let Some(event) = frames.next().await {
+                    let frame = browser_driver::ScreencastFrame {
+                        data: String::from(event.data.clone()),
+                        session_id: event.session_id,
+                    };
+                    emit(frame);
+                    let _ = forwarding.ack_screencast_frame(event.session_id).await;
+                }
+                let _ = forwarding.stop_screencast().await;
+            }));
+        }
+        Ok(ContextStatus {
+            attached: true,
+            headless: browser.is_headless(),
+        })
+    }
+
+    /// Gracefully idle the background context: stop the frame pump, end the
+    /// screencast, and shut the browser process down. Session intent
+    /// (`session_origin`) is preserved, so the next acquire re-attaches
+    /// lazily. Never fails an already-idle context.
+    pub async fn release_context(&self) -> Result<(), AppError> {
+        if let Ok(mut pump) = self.screencast.lock()
+            && let Some(handle) = pump.take()
+        {
+            handle.abort();
+        }
+        let browser = self.browser.lock().map_err(|_| AppError::Internal)?.take();
+        if let Some(browser) = browser {
+            let _ = browser.stop_screencast().await;
+            browser
+                .shutdown()
+                .await
+                .map_err(|_| AppError::BrowserUnavailable)?;
+        }
+        Ok(())
+    }
+
+    /// Hand the managed browser to the user: switch to a headed window on
+    /// the same profile (cookies preserved by the restart path) so it is
+    /// directly interactive. Streaming, if active, keeps running for the
+    /// preview card.
+    pub async fn take_control(&self) -> Result<ContextStatus, AppError> {
+        let browser = self.browser(false).await?;
+        Ok(ContextStatus {
+            attached: true,
+            headless: browser.is_headless(),
+        })
     }
 
     pub fn preview_approval(&self) -> Result<ApprovalPreview, AppError> {
@@ -2098,7 +2513,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "initialize")?;
-        let root = dir.path().join("downloads/1");
+        let root = dir.path().join(DOWNLOADS_DIR).join("1");
         tokio::fs::create_dir_all(&root).await?;
         let file = root.join("download.dat");
         let outside = dir.path().join("outside.dat");
@@ -2211,6 +2626,63 @@ mod tests {
             service.picker_disable().await,
             Err(AppError::SessionRequired)
         ));
+        Ok(())
+    }
+
+    /// Restores `CLINCH_CHROMIUM_PATH` on drop so the hermetic launch
+    /// failure below never leaks into other tests sharing the process.
+    struct ChromiumEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    #[allow(unsafe_code)]
+    impl ChromiumEnvGuard {
+        fn hold_bogus() -> Self {
+            let prior = std::env::var_os("CLINCH_CHROMIUM_PATH");
+            // Edition 2024 marks env mutation unsafe (process-wide); no
+            // other test here launches a browser, so nothing else reads the
+            // variable during the guard's lifetime.
+            unsafe {
+                std::env::set_var("CLINCH_CHROMIUM_PATH", "nonexistent-chromium-hermetic-test");
+            }
+            Self { prior }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for ChromiumEnvGuard {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                unsafe {
+                    std::env::set_var("CLINCH_CHROMIUM_PATH", prior);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("CLINCH_CHROMIUM_PATH");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_context_lifecycle_stays_dormant_until_acquired()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Dormant by default: status reads and releases attach nothing —
+        // no Chrome process exists until a task or acquire call needs one.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        assert!(!service.context_status().map_err(|_| "status")?.attached);
+        service.release_context().await.map_err(|_| "release")?;
+        assert!(!service.context_status().map_err(|_| "status")?.attached);
+        // Failed acquisition leaves no lingering handle: the launch fails
+        // fast, the status stays detached, and a second release is still a
+        // clean no-op.
+        let _chromium = ChromiumEnvGuard::hold_bogus();
+        assert!(matches!(
+            service.acquire_context(|_| {}).await,
+            Err(AppError::BrowserUnavailable)
+        ));
+        assert!(!service.context_status().map_err(|_| "status")?.attached);
+        service.release_context().await.map_err(|_| "release")?;
         Ok(())
     }
 
@@ -2523,14 +2995,20 @@ mod tests {
             intent.entry_url.as_deref(),
             Some("https://github.com/account/billing/history")
         );
-        // Non-matching prompts and pre-set entries stay untouched.
+        // Table misses advance to grounded search fallback (never a bare
+        // miss): unknown prompts carry the fixed template, no guessed TLDs.
         let mut other = intent.clone();
         other.label_query = "dashboard".into();
+        other.primary_target_noun = None;
         other.entry_url = None;
-        service
+        let line = service
             .propose_entry_url("open the dashboard", &mut other)
             .await;
-        assert_eq!(other.entry_url, None);
+        assert_eq!(
+            other.entry_url.as_deref(),
+            Some("https://www.google.com/search?q=open+the+dashboard")
+        );
+        assert!(line.is_some_and(|line| line.starts_with("route_fallback: search")));
         let mut preset = intent.clone();
         preset.entry_url = Some("https://github.com/account/billing/history".into());
         service
@@ -2604,6 +3082,150 @@ mod tests {
         Ok(())
     }
 
+    /// Shared front half for the persist/replay test: a service with a
+    /// connected portal, plus the invoice fixture saved through the IPC
+    /// command under test. Returns the playbook id and its saved intent.
+    async fn persist_invoice_fixture()
+    -> Result<(AppService, String, macro_engine::SemanticIntent), Box<dyn std::error::Error>> {
+        // Real dispatch path, minus the browser: resolve the ephemeral
+        // intent and propose its entry route purely.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://github.com/")?;
+        service
+            .test_connect(portal.clone())
+            .map_err(|_| "connect")?;
+        let prompt = "download all my invoices from github";
+        let saved = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .list_playbooks()
+            .await
+            .map_err(|_| "list")?;
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
+            orchestration_engine::resolve_command(prompt, Some(&portal), &saved)
+        else {
+            panic!("ad-hoc prompt resolves ephemeral");
+        };
+        service.propose_entry_url(prompt, &mut intent).await;
+        assert_eq!(
+            intent.entry_url.as_deref(),
+            Some("https://github.com/account/billing/history")
+        );
+        assert!(intent.is_plural);
+        assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
+        // Terminal completion records the exact executed graph, as the batch
+        // lane does on `Completed`.
+        let steps = vec![playbook_store::Step::Semantic {
+            intent: intent.clone(),
+        }];
+        service.remember_completed_run("run-1-test", &portal, &steps);
+        // Persist through the IPC command under test, with a memo. Unknown
+        // ids fail closed without touching storage.
+        let playbook_id = service
+            .save_run_as_workflow(
+                "run-1-test".into(),
+                "github-download-invoices".into(),
+                Some("Monthly run".into()),
+            )
+            .await
+            .map_err(|_| "save")?;
+        assert!(matches!(
+            service
+                .save_run_as_workflow("missing".into(), "x".into(), None)
+                .await,
+            Err(AppError::InvalidInput(_))
+        ));
+        let playbook = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .load_playbook(&playbook_id)
+            .await
+            .map_err(|_| "load")?;
+        let [playbook_store::Step::Semantic { intent: saved }] = playbook.steps.as_slice() else {
+            panic!("single semantic step");
+        };
+        Ok((service, playbook_id, saved.clone()))
+    }
+
+    #[tokio::test]
+    async fn test_persist_ephemeral_run_to_playbook_and_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use browser_driver::test_utils::fake_cdp::{FakeCdpClient, FakeCdpServer, ScriptStep};
+        use std::time::Duration;
+        let (service, playbook_id, saved) = persist_invoice_fixture().await?;
+        // SQLite persistence: origin, entry route, noun, and memo.
+        let portal = url::Url::parse("https://github.com/")?;
+        let playbook = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .load_playbook(&playbook_id)
+            .await
+            .map_err(|_| "load")?;
+        assert_eq!(playbook.origin, portal);
+        assert_eq!(
+            saved.entry_url.as_deref(),
+            Some("https://github.com/account/billing/history")
+        );
+        assert!(saved.is_plural);
+        assert_eq!(saved.primary_target_noun.as_deref(), Some("invoice"));
+        let listed = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .list_playbooks()
+            .await
+            .map_err(|_| "list")?;
+        let summary = listed
+            .iter()
+            .find(|summary| summary.id == playbook_id)
+            .ok_or("listed")?;
+        assert_eq!(summary.description.as_deref(), Some("Monthly run"));
+        // Replay end-to-end against scripted billing traffic: the saved
+        // intent deterministically batches all three invoice rows — no
+        // prompt router, no model, pure scoring over the fake's tree.
+        let fake = FakeCdpServer::start(vec![ScriptStep::reply(
+            "Accessibility.getFullAXTree",
+            browser_driver::test_utils::fake_cdp::billing_history_tree(),
+        )])
+        .await
+        .map_err(|error| format!("fake server failed to start: {error}"))?;
+        let run = async {
+            let mut client = FakeCdpClient::connect(fake.url()).await?;
+            let tree = client
+                .call("Accessibility.getFullAXTree", serde_json::json!({}))
+                .await?;
+            let nodes: Vec<browser_driver::AxNode> =
+                serde_json::from_value(tree.get("nodes").cloned().unwrap_or_default())
+                    .map_err(|error| format!("bad tree: {error}"))?;
+            let elements = browser_driver::interactive_elements(&nodes);
+            let macro_engine::ResolveOutcome::BatchMatch(batch) =
+                macro_engine::resolve_batch(&elements, &saved)
+            else {
+                panic!("saved intent replays every invoice row");
+            };
+            assert_eq!(
+                batch
+                    .iter()
+                    .map(|element| element.backend_node_id)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(fake.received_methods(), vec!["Accessibility.getFullAXTree"]);
+            assert!(fake.violations().is_empty());
+            client.close().await;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run).await;
+        fake.shutdown();
+        outcome.map_err(|_| "fake CDP roundtrip timed out")??;
+        Ok(())
+    }
+
     #[test]
     fn snapshot_telemetry_counts_noun_mentions_case_insensitively() {
         // Pure line shape: exact example format, mixed-case evidence all
@@ -2670,6 +3292,40 @@ mod tests {
         assert!(combined.lines().count() == lines.len());
         // Paths that never snapshot stay silent instead of emitting empties.
         assert_eq!(AppService::combine_telemetry(&[]), None);
+    }
+
+    #[test]
+    fn batch_outcome_keys_registry_only_for_completed_runs() {
+        // The UI's Save button keys off `runId`: completed batches carry
+        // the journal id straight to `save_run_as_workflow`, while every
+        // other terminal state offers no save (nothing was remembered).
+        let completed = AppService::batch_outcome(
+            "invoices".into(),
+            vec![],
+            orchestration_engine::SequenceStatus::Completed,
+            1,
+            None,
+            "run-7-test",
+            None,
+            None,
+        );
+        assert_eq!(completed.run_id.as_deref(), Some("run-7-test"));
+        for status in [
+            orchestration_engine::SequenceStatus::Failed,
+            orchestration_engine::SequenceStatus::Denied,
+        ] {
+            let outcome = AppService::batch_outcome(
+                "invoices".into(),
+                vec![],
+                status,
+                0,
+                Some(0),
+                "run-7-test",
+                None,
+                None,
+            );
+            assert_eq!(outcome.run_id, None);
+        }
     }
 
     #[test]
@@ -2819,22 +3475,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn natural_commands_reject_empties_and_dead_ends()
+    async fn natural_commands_reject_empties_and_auto_acquire_adhoc()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
         // Empty prompts fail before touching storage.
         assert!(matches!(
             service.dispatch_natural_command("   ".into(), |_| {}).await,
             Err(AppError::InvalidInput(_))
         ));
-        // No saved match and no connected portal: honest dead end, no browser I/O.
+        // No connected portal: ad-hoc prompts auto-acquire the browser via
+        // the grounded search fallback instead of dying as a miss. With no
+        // Chromium present the launch fails closed, but the fallback is
+        // already journaled and the session points at the search origin.
+        let _chromium = ChromiumEnvGuard::hold_bogus();
         assert!(matches!(
             service
                 .dispatch_natural_command("download my report".into(), |_| {})
                 .await,
-            Err(AppError::InvalidInput(_))
+            Err(AppError::BrowserUnavailable)
         ));
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            events
+                .iter()
+                .any(|outcome| outcome.starts_with("route_fallback: search")),
+            "route_fallback logged, got {events:?}"
+        );
+        let connected = service
+            .session_origin
+            .lock()
+            .map_err(|_| "session")?
+            .clone();
+        assert_eq!(
+            connected.as_ref().and_then(|url| url.host_str()),
+            Some("www.google.com")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adhoc_search_fallback_never_guesses_tlds() -> Result<(), Box<dyn std::error::Error>> {
+        // Hermetic proof: unknown prompts advance to the fixed search
+        // template without inventing amazon.com / amazon.in. No browser
+        // needed — pure tiered resolution plus journaling.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let mut intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "amazon".into(),
+            container_query: None,
+            raw_prompt: "open amazon for me".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: Some("amazon".into()),
+        };
+        let line = service
+            .propose_entry_url("open amazon for me", &mut intent)
+            .await;
+        assert_eq!(
+            intent.entry_url.as_deref(),
+            Some("https://www.google.com/search?q=open+amazon+for+me")
+        );
+        let line = line.ok_or("route line")?;
+        assert!(line.starts_with("route_fallback: search"), "got {line:?}");
+        assert!(
+            line.contains("open+amazon+for+me"),
+            "query journaled, got {line:?}"
+        );
+        assert!(
+            !intent
+                .entry_url
+                .as_deref()
+                .unwrap_or("")
+                .contains("amazon.com")
+        );
+        assert!(
+            !intent
+                .entry_url
+                .as_deref()
+                .unwrap_or("")
+                .contains("amazon.in")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adhoc_dispatch_auto_acquires_navigates_and_reanchors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Hermetic ad-hoc proof without a real Chromium binary:
+        // - `dispatch_natural_command` with no session auto-acquires (lazy
+        //   launch attempted → `BrowserUnavailable` with bogus executable),
+        // - the grounded search entry is journaled (`route_fallback`),
+        // - the session re-anchors to the new origin (`portal_reanchored`
+        //   journaled via the same `journal_line` + `reanchor_portal` path
+        //   the live lane uses after `ensure_at_entry_url`).
+        // CDP navigation itself needs a real browser (covered by the
+        // Chromium-gated fixtures); here we prove the dispatch wiring that
+        // precedes and follows it.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let _chromium = ChromiumEnvGuard::hold_bogus();
+        assert!(matches!(
+            service
+                .dispatch_natural_command("open amazon for me".into(), |_| {})
+                .await,
+            Err(AppError::BrowserUnavailable)
+        ));
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            events.iter().any(|outcome| outcome
+                == "route_fallback: search q='q=open+amazon+for+me' · url=https://www.google.com/search?q=open+amazon+for+me"),
+            "search fallback journaled, got {events:?}"
+        );
+        // Session auto-anchored to the search origin (Portal URL was never
+        // required).
+        let connected = service
+            .session_origin
+            .lock()
+            .map_err(|_| "session")?
+            .clone();
+        let connected = connected.ok_or("session auto-set")?;
+        assert_eq!(connected.host_str(), Some("www.google.com"));
+        // Re-anchor emission uses the driver helper every dynamic
+        // navigation runs: journal one transition and prove it lands.
+        let previous: Option<url::Url> = None;
+        let line = service
+            .journal_line(browser_driver::portal_reanchored_line(
+                previous.as_ref(),
+                &connected,
+            ))
+            .await;
+        assert!(
+            line.starts_with("portal_reanchored: none → "),
+            "got {line:?}"
+        );
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            events
+                .iter()
+                .any(|outcome| outcome.starts_with("portal_reanchored:")),
+            "portal_reanchored emitted, got {events:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialize_records_startup_build_first() -> Result<(), Box<dyn std::error::Error>> {
+        // Startup telemetry: the build line is the first `session_events`
+        // row of the boot, and the `initialize` response carries the exact
+        // same string the UI renders at the top of Session Activity.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        let status = service.initialize().await.map_err(|_| "initialize")?;
+        assert!(status.ready);
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        let first = events.first().ok_or("expected a startup row")?;
+        assert!(
+            first.starts_with("startup_build: v"),
+            "versioned prefix, got {first:?}"
+        );
+        assert!(first.contains(" · hash:"), "hash suffix, got {first:?}");
+        let hash = first.rsplit("hash:").next().ok_or("hash part")?;
+        assert!(!hash.trim().is_empty(), "non-empty hash, got {first:?}");
+        assert_eq!(status.startup_build, *first);
         Ok(())
     }
 

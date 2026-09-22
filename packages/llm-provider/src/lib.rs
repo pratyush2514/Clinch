@@ -29,6 +29,10 @@ pub trait SelectorProvider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Candidate, ProviderError>> + Send + 'a>>;
 }
 
+/// Upper bound on one provider round-trip (spawn, stdin, stdout, exit):
+/// a wedged helper must fail the repair, never stall the run.
+const PROVIDER_TIMEOUT_SECS: u64 = 30;
+
 /// An explicitly configured local model adapter. No shell or implicit cloud egress.
 pub struct LocalProvider;
 impl SelectorProvider for LocalProvider {
@@ -50,33 +54,36 @@ impl SelectorProvider for LocalProvider {
                 .kill_on_drop(true)
                 .spawn()
                 .map_err(|_| ProviderError)?;
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let bytes = serde_json::to_vec(context).map_err(|_| ProviderError)?;
-                let mut stdin = child.stdin.take().ok_or(ProviderError)?;
-                stdin.write_all(&bytes).await.map_err(|_| ProviderError)?;
-                drop(stdin);
-                let mut bytes = Vec::new();
-                child
-                    .stdout
-                    .take()
-                    .ok_or(ProviderError)?
-                    .take(4097)
-                    .read_to_end(&mut bytes)
-                    .await
-                    .map_err(|_| ProviderError)?;
-                if bytes.len() > 4096 {
-                    return Err(ProviderError);
-                }
-                if !child.wait().await.map_err(|_| ProviderError)?.success() {
-                    return Err(ProviderError);
-                }
-                let candidate: Candidate =
-                    serde_json::from_slice(&bytes).map_err(|_| ProviderError)?;
-                if candidate.selector.trim().is_empty() || candidate.selector.len() > 2048 {
-                    return Err(ProviderError);
-                }
-                Ok(candidate)
-            })
+            tokio::time::timeout(
+                std::time::Duration::from_secs(PROVIDER_TIMEOUT_SECS),
+                async {
+                    let bytes = serde_json::to_vec(context).map_err(|_| ProviderError)?;
+                    let mut stdin = child.stdin.take().ok_or(ProviderError)?;
+                    stdin.write_all(&bytes).await.map_err(|_| ProviderError)?;
+                    drop(stdin);
+                    let mut bytes = Vec::new();
+                    child
+                        .stdout
+                        .take()
+                        .ok_or(ProviderError)?
+                        .take(4097)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|_| ProviderError)?;
+                    if bytes.len() > 4096 {
+                        return Err(ProviderError);
+                    }
+                    if !child.wait().await.map_err(|_| ProviderError)?.success() {
+                        return Err(ProviderError);
+                    }
+                    let candidate: Candidate =
+                        serde_json::from_slice(&bytes).map_err(|_| ProviderError)?;
+                    if candidate.selector.trim().is_empty() || candidate.selector.len() > 2048 {
+                        return Err(ProviderError);
+                    }
+                    Ok(candidate)
+                },
+            )
             .await
             .map_err(|_| ProviderError)?
         })

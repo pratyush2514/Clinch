@@ -3,6 +3,13 @@ use crate::{BrowserSource, Cookie, SyncError, ValidatedRequest, read_profile};
 use serde::Serialize;
 use std::{path::Path, time::Duration};
 
+/// Upper bound on unlocking the OS keychain entry: the OS may prompt for
+/// elevation, so this comfortably exceeds unattended unlocks without
+/// stalling session sync forever on a dismissed prompt.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_mins(2);
+/// Upper bound on reading one browser profile's cookie store from disk.
+const PROFILE_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
@@ -48,7 +55,7 @@ pub async fn prepare(request: &ValidatedRequest, home: &Path) -> PreparedSync {
         BrowserSource::Edge => credential_vault::BrowserKey::Edge,
     };
     let secret = match tokio::time::timeout(
-        Duration::from_mins(2),
+        KEYCHAIN_TIMEOUT,
         credential_vault::browser_safe_storage(browser),
     )
     .await
@@ -88,7 +95,7 @@ pub async fn prepare(request: &ValidatedRequest, home: &Path) -> PreparedSync {
         Err(error) => return PreparedSync::ManualLogin(FallbackReason::from(&error)),
     };
     let result = tokio::time::timeout(
-        Duration::from_secs(15),
+        PROFILE_READ_TIMEOUT,
         read_profile(&profile_dir, host, secret),
     )
     .await;

@@ -4,12 +4,18 @@ pub mod a11y;
 mod actions;
 mod picker;
 mod preview;
+mod screencast;
 mod session;
 mod som;
+pub mod test_utils;
 pub use a11y::{
     AX_TARGET_RESYNC_LINE, AxElement, AxResyncCheck, interactive_elements, render_semantic_list,
 };
 pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
+/// Raw accessibility node: the wire shape [`interactive_elements`] flattens.
+/// Re-exported so integration tests can parse scripted trees without
+/// reaching into the CDP bindings directly.
+pub use chromiumoxide::cdp::browser_protocol::accessibility::AxNode;
 use chromiumoxide::{
     Browser, Page,
     cdp::browser_protocol::network::{
@@ -22,6 +28,7 @@ pub use picker::{
     PICKER_BINDING, PickedElement, PickerRect, parse_binding_payload, rank_selectors_from_attrs,
 };
 pub use preview::{DomRegion, Viewport};
+pub use screencast::{SCREENCAST_JPEG_QUALITY, ScreencastFrame};
 pub use session::{AuthSignal, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
@@ -33,6 +40,12 @@ use tokio::{
 use url::Url;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Poll interval while waiting for the launched Chromium to publish its
+/// `DevTools` endpoint file.
+const ENDPOINT_POLL_MS: u64 = 100;
+/// Grace period for orderly Chromium shutdown (Browser.close, then process
+/// wait) before falling back to killing the child.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -144,6 +157,21 @@ pub fn portal_reanchored_line(previous: Option<&Url>, current: &Url) -> String {
     )
 }
 
+/// Lightweight first paint for fresh background browsers: a `data:` page
+/// rendering `Browser Ready` on a clean background so the screencast
+/// preview canvas paints immediately instead of showing a black `about:blank`
+/// rectangle. Never navigated via `url_policy` (data scheme is portal-only
+/// here); direct `page.goto` only.
+pub const BROWSER_READY_URL_STR: &str = "data:text/html,<html><body%20style=\"background:%23f7f7f2;color:%23252722;font-family:sans-serif\">Browser%20Ready</body></html>";
+
+/// Parse the ready-paint URL. `None` only when the constant itself is
+/// malformed (never for the checked-in value); callers fall back to
+/// `about:blank` instead of failing launch.
+#[must_use]
+pub fn browser_ready_url() -> Option<Url> {
+    Url::parse(BROWSER_READY_URL_STR).ok()
+}
+
 // No Debug: CDP objects may contain session data.
 pub struct ManagedBrowser {
     headless: bool,
@@ -222,7 +250,7 @@ impl ManagedBrowser {
                         return format!("ws://127.0.0.1:{port}{path}");
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(ENDPOINT_POLL_MS)).await;
             }
         })
         .await
@@ -264,6 +292,12 @@ impl ManagedBrowser {
             .await
             .map_err(|_| BrowserError::Timeout)?
             .map_err(|_| BrowserError::Connection)?;
+        // Initial paint so the screencast preview never shows a black box:
+        // best-effort by design — a failed ready paint leaves `about:blank`
+        // rather than failing launch.
+        if let Some(ready) = browser_ready_url() {
+            let _ = tokio::time::timeout(IO_TIMEOUT, managed.page.goto(ready.as_str())).await;
+        }
         Ok(managed)
     }
 
@@ -411,27 +445,6 @@ impl ManagedBrowser {
         Ok(())
     }
 
-    /// Probe whether the live page body text contains `needle`
-    /// (case-insensitive substring over `document.body.innerText`).
-    /// Read-only readiness signal for content-settle polling: never
-    /// navigates, never mutates. Fails closed on CDP, timeout, or parse
-    /// errors so settle loops can tell "not ready" from "ready".
-    ///
-    /// # Errors
-    /// Reports connection, timeout, evaluation, or invalid-needle failures.
-    pub async fn page_text_contains(&self, needle: &str) -> Result<bool, BrowserError> {
-        let needle = serde_json::to_string(needle).map_err(|_| BrowserError::InvalidAction)?;
-        let expression = format!(
-            "(() => {{ const n={needle}; const t=(document.body && document.body.innerText)||''; return t.toLowerCase().includes(n.toLowerCase()); }})()"
-        );
-        tokio::time::timeout(IO_TIMEOUT, self.page.evaluate(expression))
-            .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?
-            .into_value::<bool>()
-            .map_err(|_| BrowserError::InvalidAction)
-    }
-
     /// Stop and reap the managed child before its profile can be reopened.
     ///
     /// # Errors
@@ -446,13 +459,13 @@ impl ManagedBrowser {
             // A closing socket may not acknowledge Browser.close. Process exit is
             // the authoritative result; prefer graceful exit to flush profile data.
             let _ = tokio::time::timeout(
-                Duration::from_secs(5),
+                SHUTDOWN_GRACE,
                 self.browser
                     .execute(chromiumoxide::cdp::browser_protocol::browser::CloseParams::default()),
             )
             .await;
             if !matches!(
-                tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
+                tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await,
                 Ok(Ok(_))
             ) {
                 tokio::time::timeout(IO_TIMEOUT, child.kill())
@@ -549,6 +562,21 @@ mod tests {
         assert!(LaunchOptions::replay().headless);
         assert!(!LaunchOptions::interactive().headless);
         assert!(!LaunchOptions::default().headless);
+    }
+
+    #[test]
+    fn browser_ready_paint_is_lightweight_data_page() {
+        // Initial screencast paint: data scheme (never via url_policy),
+        // carries the ready marker, and never touches the network.
+        let Some(ready) = browser_ready_url() else {
+            panic!("ready URL parses");
+        };
+        assert_eq!(ready.scheme(), "data");
+        assert!(
+            BROWSER_READY_URL_STR.contains("Browser%20Ready"),
+            "ready marker, got {BROWSER_READY_URL_STR}"
+        );
+        assert!(BROWSER_READY_URL_STR.starts_with("data:text/html,"));
     }
 
     #[test]

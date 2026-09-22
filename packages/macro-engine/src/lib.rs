@@ -17,6 +17,9 @@ use url::Url;
 
 const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 1_048_576;
+/// Upper bound on one selector-repair provider call: healing must stay a
+/// bounded detour, never stall a run on a wedged model.
+const REPAIR_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MacroError {
@@ -290,7 +293,7 @@ impl HealingReplay<'_> {
             bounds: region.bounds,
         };
         let candidate = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(REPAIR_TIMEOUT_SECS),
             self.provider.repair(&context),
         )
         .await

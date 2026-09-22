@@ -10,6 +10,9 @@ use zeroize::Zeroizing;
 
 const CHROME_EPOCH_SECONDS: i64 = 11_644_473_600;
 const MAX_COOKIES: i64 = 2_000;
+/// `SQLite` busy timeout on the read-only shadow copy: the live browser may
+/// briefly hold its cookie database while we snapshot it.
+const SHADOW_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Monotonic suffix so concurrent syncs never share a shadow-copy path.
 static SHADOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -212,7 +215,7 @@ pub async fn read_profile(
     let options = SqliteConnectOptions::new()
         .filename(shadow.path())
         .read_only(true)
-        .busy_timeout(Duration::from_secs(2));
+        .busy_timeout(SHADOW_BUSY_TIMEOUT);
     let mut conn = SqliteConnection::connect_with(&options).await?;
     let mut tx = conn.begin().await?;
     let version: i64 =

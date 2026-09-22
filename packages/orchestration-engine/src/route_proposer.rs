@@ -11,10 +11,16 @@
 //! 3. Curated portal route table (`portal_routes`).
 //! 4. LLM fallback, only with a configured adapter — and its output is
 //!    untrusted input, validated like every other tier.
+//! 5. Grounded search fallback — fixed `https://www.google.com/search?q=…`
+//!    template over the raw prompt. Never guesses TLDs; the dispatcher
+//!    navigates to the search page and grounds the top result link from the
+//!    live AX tree.
 //!
 //! Every tier's output passes through `url_policy` validation, including
 //! the route table itself. Any validation failure returns `None`
-//! immediately — a corrupt tier never falls through to a weaker one.
+//! immediately — a corrupt tier never falls through to a weaker one. The
+//! search tier only runs when no stronger tier proposed anything; an
+//! invalid stronger proposal still fails closed without falling through.
 
 use crate::{
     entity_resolver::{AccountDirectory, resolve_repo_entity},
@@ -29,6 +35,32 @@ pub enum RouteSource {
     AccountEntity,
     PortalRouteTable,
     LlmFallback,
+    SearchFallback,
+}
+
+/// Fixed grounded search entry: the only dynamic URL the resolver ever
+/// invents, and it invents no host — always `www.google.com/search`.
+/// The raw prompt becomes the `q` value; downstream grounding clicks a
+/// real AX result link, never a guessed TLD.
+const SEARCH_BASE: &str = "https://www.google.com/search";
+
+/// Build the grounded search-fallback URL for an ad-hoc prompt.
+/// `None` for empty prompts (no query to ground), so callers keep the
+/// `route_resolution_miss` dead-end instead of navigating to an empty
+/// search. Never derives hosts from prompt words — the host is fixed.
+#[must_use]
+pub fn search_fallback_url(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `form_urlencoded` byte-serializes spaces as `+`, matching the
+    // `?q=open+amazon+for+me` contract.
+    let query: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+    if query.is_empty() {
+        return None;
+    }
+    Some(format!("{SEARCH_BASE}?q={query}"))
 }
 
 /// A validated navigation target plus its provenance.
@@ -96,9 +128,11 @@ pub fn propose_route(
 /// Resolve an entry URL for an ad-hoc prompt and intent class (the
 /// caller's normalized topic word — today, the ephemeral label or primary
 /// target noun).
-/// Deterministic, offline unless an adapter is configured, and total on
-/// failure: `None` keeps current behavior (manual/portal flow, no silent
-/// navigation). Tab-independent: no current-tab URL is inspected.
+/// Deterministic, offline unless an adapter is configured. Tier 5 (search
+/// fallback) guarantees a grounded entry for any non-empty prompt, so
+/// `None` now means only empty prompts or fail-closed validation —
+/// table misses advance instead of terminating.
+/// Tab-independent: no current-tab URL is inspected.
 #[must_use]
 pub fn resolve_entry_url(
     prompt: &str,
@@ -122,6 +156,12 @@ pub fn resolve_entry_url(
         && let Some(url) = llm.propose_url(prompt)
     {
         return accept(&url, RouteSource::LlmFallback);
+    }
+    // Tier 5: grounded search fallback — fixed template, no TLD guessing.
+    // Only runs when no stronger tier proposed anything; invalid stronger
+    // proposals already returned `None` above without falling through.
+    if let Some(url) = search_fallback_url(prompt) {
+        return accept(&url, RouteSource::SearchFallback);
     }
     None
 }
@@ -193,17 +233,102 @@ mod tests {
     }
 
     #[test]
-    fn entity_resolver_returns_none_without_connected_account() {
+    fn entity_resolver_falls_through_to_search_without_connected_account() {
         // No directory wired: entity-dependent prompts fall past tier 2.
-        // The class here matches no table row either, so nothing resolves.
+        // The class here matches no table row either, so tier 5 (grounded
+        // search) resolves instead of terminating as a miss.
+        let Some(resolved) = resolve_entry_url(
+            "check out my portopsy on github",
+            "repositories",
+            &empty_ctx(),
+        ) else {
+            panic!("search fallback resolves");
+        };
+        assert_eq!(resolved.source, RouteSource::SearchFallback);
+        assert!(
+            resolved
+                .url
+                .as_str()
+                .starts_with("https://www.google.com/search?q=")
+        );
+    }
+
+    #[test]
+    fn unknown_prompts_advance_to_search_template_without_tld_guessing() {
+        // Regression: "open amazon for me" must never become amazon.com /
+        // amazon.in — the only dynamic URL is the fixed search template.
+        let Some(resolved) = resolve_entry_url("open amazon for me", "amazon", &empty_ctx()) else {
+            panic!("unknown prompt advances to search");
+        };
+        assert_eq!(resolved.source, RouteSource::SearchFallback);
         assert_eq!(
-            resolve_entry_url(
-                "check out my portopsy on github",
-                "repositories",
-                &empty_ctx()
-            ),
+            resolved.url.as_str(),
+            "https://www.google.com/search?q=open+amazon+for+me"
+        );
+        assert!(!resolved.url.as_str().contains("amazon.com"));
+        assert!(!resolved.url.as_str().contains("amazon.in"));
+        // Search template helper is pure and total on non-empty prompts.
+        assert_eq!(
+            search_fallback_url("open amazon for me").as_deref(),
+            Some("https://www.google.com/search?q=open+amazon+for+me")
+        );
+        assert_eq!(search_fallback_url("   "), None);
+        assert_eq!(search_fallback_url(""), None);
+        // Empty prompts keep the miss dead-end (no empty search navigation).
+        assert_eq!(resolve_entry_url("   ", "amazon", &empty_ctx()), None);
+    }
+
+    #[test]
+    fn validation_rejects_credentials_and_non_https_across_all_tiers() {
+        // Entity tier with a hostile directory URL fails closed without
+        // falling through to search.
+        struct EvilDirectory;
+        impl AccountDirectory for EvilDirectory {
+            fn github_repos(&self) -> Result<Vec<RepoRef>, DirectoryError> {
+                Ok(vec![RepoRef {
+                    owner: "evil".into(),
+                    name: "portopsy".into(),
+                    html_url: "https://user:secret@github.com/evil/portopsy".into(),
+                }])
+            }
+        }
+        let evil_dir = EvilDirectory;
+        let ctx = ResolutionContext {
+            account_dir: Some(&evil_dir),
+            llm: None,
+        };
+        assert_eq!(
+            resolve_entry_url("check out my portopsy on github", "portopsy", &ctx),
             None
         );
+        // LLM tier: credentials and non-https both fail closed.
+        for answer in [
+            "https://user:pass@github.com/settings/billing",
+            "http://github.com/settings/billing",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+        ] {
+            let evil = MockLlm {
+                answer: Some(answer.into()),
+            };
+            let ctx = ResolutionContext {
+                account_dir: None,
+                llm: Some(&evil),
+            };
+            assert_eq!(
+                resolve_entry_url("open the dashboard thing on github", "dashboard", &ctx),
+                None,
+                "{answer} must fail closed"
+            );
+        }
+        // Search tier itself never emits credentials or non-https: fixed
+        // https template over an allowlisted host.
+        let Some(resolved) = resolve_entry_url("open amazon for me", "amazon", &empty_ctx()) else {
+            panic!("search resolves");
+        };
+        assert_eq!(resolved.url.scheme(), "https");
+        assert!(resolved.url.username().is_empty());
+        assert!(crate::url_policy::validate_proposed_url(resolved.url.as_str()).is_ok());
     }
 
     #[test]

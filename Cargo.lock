@@ -406,6 +406,7 @@ dependencies = [
 name = "browser-driver"
 version = "0.1.0"
 dependencies = [
+ "async-tungstenite",
  "chromiumoxide",
  "filesystem-tool",
  "futures",

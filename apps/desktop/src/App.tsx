@@ -10,7 +10,7 @@ import AuthPanel, { type AuthPanelState } from "./AuthPanel";
 type SessionStatus = { state: "cookies_imported"; count: number }
   | { state: "manual_login"; reason: string | null };
 
-type StorageStatus = { ready: boolean; cookieImportSupported: boolean; defaultBrowser: string };
+type StorageStatus = { ready: boolean; cookieImportSupported: boolean; defaultBrowser: string; startupBuild: string };
 
 function message(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
@@ -44,6 +44,9 @@ export default function App() {
   useEffect(() => {
     if (!isTauri()) { setStatus("Browser preview. Start the Tauri app to access local storage and session sync."); return; }
     invoke<StorageStatus>("initialize").then(result => {
+      // First report of the boot lands at the top of Session Activity and
+      // names the exact binary (stale builds stay unambiguous).
+      report(result.startupBuild);
       setReady(result.ready); setSupported(result.cookieImportSupported);
       // The backend preselects the most reliable source browser per OS
       // (Brave on Windows — Chrome 127+ seals its key with App-Bound
@@ -117,7 +120,7 @@ export default function App() {
   return <main>
     <header><div><strong>Clinch<span className="dot">.</span></strong><span className="subtitle">Local action studio</span></div>
       <button onClick={() => setCommandOpen(true)}>Commands <kbd>⌘ K</kbd></button></header>
-    <div className="stage"><span>PHASE 0 / STEPS 3–4</span><span>{ready ? "SQLite ready · WAL" : "Desktop shell preview"}</span></div>
+    <div className="stage"><span>LOCAL-FIRST · NATIVE CDP</span><span>{ready ? "SQLite ready · WAL" : "Desktop shell preview"}</span></div>
     <CommandBar ready={ready} busy={busy} portal={portal} report={report} errorMessage={message} />
     <Group orientation="horizontal" className="workspace">
       <Panel defaultSize="55%" minSize="35%">
@@ -127,7 +130,7 @@ export default function App() {
           <p>Connect one portal using your local browser session, or sign in directly in Clinch’s own profile.</p>
           <BrowserViewport ready={ready} highlight={highlight} />
           <form onSubmit={event => { event.preventDefault(); void connect(false); }}>
-            <label>Portal URL<input type="url" required placeholder="https://portal.example.com" value={portal} onChange={event => { setPortal(event.target.value); setConsent(false); }} /></label>
+            <label>Portal URL (optional override for runs)<input type="url" placeholder="https://github.com/account/billing/history" value={portal} onChange={event => { setPortal(event.target.value); setConsent(false); }} /></label>
             <div className="fields"><label>Source browser<select value={browser} onChange={event => { setBrowser(event.target.value); setConsent(false); }}><option value="chrome">Google Chrome</option><option value="brave">Brave</option><option value="edge">Microsoft Edge</option></select></label>
               <label>Profile folder<input value={profile} onChange={event => { setProfile(event.target.value); setConsent(false); }} placeholder="Default" /></label></div>
             <label className="consent"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />
@@ -150,7 +153,6 @@ export default function App() {
           <p role="status" aria-live="polite" className="status">{status}</p>
           <ol>{events.map((event, index) => <li key={index}><span>{String(index + 1).padStart(2, "0")}</span>{event}</li>)}</ol>
           <TaskWorkspace onHighlight={setHighlight} ready={ready} busy={busy} portal={portal} setBusy={setBusy} report={report} errorMessage={message} />
-          <div className="gate-card"><div className="eyebrow">SENTINEL GATE</div><h3>A human decision.</h3><p>Clicks, typing, and form submissions pause here for your approval. Review Details keeps the task paused; Reject stops execution.</p></div>
         </section>
       </Panel>
     </Group>
