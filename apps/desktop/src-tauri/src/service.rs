@@ -761,9 +761,21 @@ impl AppService {
             }
             AcquireAction::Launch => {}
         }
+        let executable = Self::chromium_executable();
+        // A missing binary is the one launch failure with a precise fix:
+        // fail here with directions instead of the generic
+        // `BrowserUnavailable` copy, which blames the path for every
+        // launch failure including transient ones. Bare names
+        // (`google-chrome`) resolve through PATH at spawn, so only check
+        // paths that name a location.
+        if executable.components().count() > 1 && !executable.exists() {
+            return Err(AppError::InvalidInput(
+                "Chromium executable not found. Set CLINCH_CHROMIUM_PATH to your Chrome or Chromium binary, then retry.",
+            ));
+        }
         let browser = Arc::new(
             ManagedBrowser::launch_with_options(
-                &Self::chromium_executable(),
+                &executable,
                 &self.browser_profile(),
                 intent.launch_options(),
             )

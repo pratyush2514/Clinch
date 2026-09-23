@@ -736,6 +736,13 @@ const ACTION_VERBS: &[&str] = &[
     "turn", "run", "go", "navigate", "visit", "launch",
 ];
 
+/// Whether a token is a clause verb rather than a nameable noun. The
+/// grounder fence uses this so a verb can never become a site slot —
+/// grounding `open` would otherwise navigate to `open.com`.
+pub(crate) fn is_action_verb(token: &str) -> bool {
+    ACTION_VERBS.contains(&token)
+}
+
 /// Words that open a subordinate clause, which means the prompt is not a
 /// plain imperative. `"pull up what I owe on aws"` reads structurally like
 /// `"<verb> … <clause> on <site>"`, and the clause body (`owe`) is a verb
@@ -936,14 +943,54 @@ pub fn parse_grammar(prompt: &str, connected_origin: Option<&url::Url>) -> Parse
     let target_noun = words
         .iter()
         .rev()
-        .find(|token| is_noun(token))
-        .map(|token| singular_stem(token));
+        // Verbs are excluded like the prepositional branch excludes them:
+        // the shared tokenizer drops one-character tokens, so in
+        // `open x for me` the site (`x`) is invisible and the verb would
+        // otherwise survive the content filter as the target noun —
+        // grounding `open` → `open.com`.
+        .find(|token| is_noun(token) && !is_action_verb(token))
+        .map(|token| singular_stem(token))
+        // One-character site names never survive `tokens`: recover the raw
+        // word after the clause's open-verb (`open x for me` → `x`).
+        .or_else(|| direct_object_token(prompt).map(|token| singular_stem(&token)));
     ParsedGrammar {
         artifact_noun: None,
         site_context: None,
         confidence: confidence(target_noun.is_some()),
         target_noun,
     }
+}
+
+/// Raw direct-object token for open-shaped prompts whose destination is
+/// invisible to [`tokens`]: one-character site names (`open x for me` →
+/// `x`). Scans the raw words after the clause's leading open-verb,
+/// skipping stopwords and verbs, and keeps only a sanitized bare token —
+/// the same shape [`crate::ParsedSlots::sanitized`] enforces, so the
+/// grounder fence is unchanged. `None` when there is no such word (`open`
+/// alone, `open the`).
+fn direct_object_token(prompt: &str) -> Option<String> {
+    let raw: Vec<String> = prompt
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let verb_at = raw
+        .iter()
+        .position(|word| OPEN_VERBS.contains(&word.as_str()))?;
+    raw.iter().skip(verb_at + 1).find_map(|word| {
+        if STOPWORDS.contains(&word.as_str()) || is_action_verb(word) {
+            return None;
+        }
+        let bytes = word.as_bytes();
+        (bytes.len() <= 64
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-'))
+        .then(|| word.clone())
+    })
 }
 
 /// Primary target noun for the ephemeral intent: the grammar's artifact
@@ -2457,5 +2504,44 @@ mod tests {
         // A subordinate clause is not a plain imperative.
         let grammar = parse_grammar("pull up what I owe on aws", None);
         assert!(!is_direct_open("pull up what I owe on aws", &grammar));
+    }
+
+    #[test]
+    fn direct_open_never_fills_the_site_slot_with_a_verb() {
+        // Regression: `tokens` drops one-character tokens, so in
+        // `open x for me` the site (`x`) was invisible and the verb
+        // survived as the target noun — grounding `open` → `open.com`.
+        for (prompt, site) in [
+            ("open x for me", "x"),
+            ("open the x for me", "x"),
+            ("please open x", "x"),
+            ("go to x", "x"),
+        ] {
+            let grammar = parse_grammar(prompt, None);
+            assert_eq!(grammar.target_noun.as_deref(), Some(site), "{prompt}");
+            assert!(grammar.confidence.is_high(), "{prompt}");
+            assert!(is_direct_open(prompt, &grammar), "{prompt}");
+        }
+        // A lone verb is not a destination: honest miss, never a verb slot.
+        for prompt in ["open", "open the", "launch"] {
+            let grammar = parse_grammar(prompt, None);
+            assert_eq!(grammar.target_noun, None, "{prompt}");
+            assert!(!is_direct_open(prompt, &grammar), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn direct_open_keeps_multi_character_targets_unchanged() {
+        // The single-character fallback must not disturb the normal path.
+        for (prompt, site) in [
+            ("open claude for me", "claude"),
+            ("open the claude for me", "claude"),
+            ("open gemini for me", "gemini"),
+            ("open amazon for me", "amazon"),
+        ] {
+            let grammar = parse_grammar(prompt, None);
+            assert_eq!(grammar.target_noun.as_deref(), Some(site), "{prompt}");
+            assert!(is_direct_open(prompt, &grammar), "{prompt}");
+        }
     }
 }

@@ -110,12 +110,18 @@ const CHALLENGE_TITLE_MARKERS: [&str; 4] = [
     "verify you are human",
     "security verification",
 ];
-const CHALLENGE_BODY_MARKERS: [&str; 5] = [
+const CHALLENGE_BODY_MARKERS: [&str; 8] = [
     "verifying you are human",
     "verify you are human",
     "i'm not a robot",
     "confirm you are human",
     "complete the security check",
+    // Cloudflare's "Performing security verification" interstitial copy
+    // (observed on claude.ai): neither the classic title nor the body
+    // markers above match it, so the run completed silently on the gate.
+    "verifies you are not a bot",
+    "performing security verification",
+    "protect against malicious bots",
 ];
 
 fn is_challenge_page(title: &str, url: &Url, body_text: &str) -> bool {
@@ -471,6 +477,13 @@ mod tests {
             "example",
             &url("https://example.com/cdn-cgi/challenge-platform/h/b")?,
             "ordinary copy",
+        ));
+        // Cloudflare's "Performing security verification" interstitial
+        // copy (observed live on claude.ai): the classic markers miss it.
+        assert!(is_challenge_page(
+            "claude.ai",
+            &url("https://claude.ai/")?,
+            "claude.ai\nPerforming security verification\nThis website uses a security service to protect against malicious bots. This page is displayed while the website verifies you are not a bot.",
         ));
         Ok(())
     }

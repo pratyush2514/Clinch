@@ -469,6 +469,13 @@ impl DomainGrounder for LlmDomainGrounder {
         if site.is_empty() {
             return None;
         }
+        // A verb is never a site name: grounding `open` would navigate to
+        // `open.com`. Decline without touching the network — the grammar
+        // normally prevents this, and the fence holds even if a future
+        // parser seam slips one through.
+        if crate::intent_resolver::is_action_verb(&site.to_ascii_lowercase()) {
+            return None;
+        }
         let content = match self.provider {
             GrounderProvider::Groq => self.groq_completion(site, region_hint.trim()),
             GrounderProvider::Ollama => self.ollama_generate(site, region_hint.trim()),
@@ -879,6 +886,19 @@ mod tests {
         assert_eq!(grounder.ground_domain("   ", "IN"), None);
         let grounder = LlmDomainGrounder::ollama("http://127.0.0.1:9", "model");
         assert_eq!(grounder.ground_domain("", ""), None);
+    }
+
+    #[test]
+    fn verb_site_name_declines_without_network() {
+        // A verb is never a site name: `open` must decline before any
+        // socket is opened, so a parser slip can never ground
+        // `open` → `open.com`. Unroutable port proves no request is made.
+        let grounder = LlmDomainGrounder::groq("key", "http://127.0.0.1:9", "model");
+        assert_eq!(grounder.ground_domain("open", "IN"), None);
+        assert_eq!(grounder.last_error(), None);
+        let grounder = LlmDomainGrounder::ollama("http://127.0.0.1:9", "model");
+        assert_eq!(grounder.ground_domain("launch", "IN"), None);
+        assert_eq!(grounder.last_error(), None);
     }
 
     #[test]

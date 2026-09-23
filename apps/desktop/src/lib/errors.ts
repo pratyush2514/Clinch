@@ -16,7 +16,7 @@ export function errorCode(error: unknown): string | null {
 export function message(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
     if (error.code === "browser_unavailable")
-      return "Could not open Chromium. Check CLINCH_CHROMIUM_PATH, then close and retry.";
+      return "Chromium could not be started. If this keeps happening, check CLINCH_CHROMIUM_PATH, then close and retry.";
     if (error.code === "busy") return "An operation is already in progress.";
     if (error.code === "storage_unavailable")
       return "Local storage is unavailable. Check app data permissions.";
