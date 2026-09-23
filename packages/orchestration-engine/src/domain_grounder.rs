@@ -285,19 +285,31 @@ impl LlmDomainGrounder {
     /// cause recorded for [`Self::last_error`]).
     fn groq_completion(&self, site: &str, region: &str) -> Option<String> {
         let auth = format!("Bearer {}", self.api_key.as_str());
+        // gpt-oss is a reasoning model: its reasoning tokens draw from
+        // max_tokens before any content is emitted. A 32-token budget was
+        // consumed entirely by reasoning — Groq answered HTTP 200 with
+        // finish_reason "length" and an empty content string. 256 leaves
+        // headroom for the ~10-token JSON answer; the cost is negligible.
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 256,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": format!("site: {site}\nregion: {region}")},
+            ],
+        });
+        // reasoning_effort is a 400 on models that cannot reason — gate it
+        // on the gpt-oss family, whose default "medium" effort would
+        // otherwise spend the budget thinking instead of answering.
+        if self.model.contains("gpt-oss") {
+            body["reasoning_effort"] = serde_json::Value::String("low".to_owned());
+        }
         let payload = match self.post_json(
             "groq",
             &format!("{}/chat/completions", self.base_url),
             Some(auth.as_str()),
-            serde_json::json!({
-                "model": self.model,
-                "temperature": 0,
-                "max_tokens": 32,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": format!("site: {site}\nregion: {region}")},
-                ],
-            }),
+            body,
         ) {
             Ok(payload) => payload,
             Err(detail) => {
@@ -305,21 +317,36 @@ impl LlmDomainGrounder {
                 return None;
             }
         };
-        let content: Option<String> = (|| {
-            payload
-                .get("choices")?
-                .as_array()?
-                .first()?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(str::to_owned)
-        })();
-        if let Some(content) = content {
-            Some(content)
-        } else {
-            self.record_error("groq malformed response (no choices/message/content)".to_owned());
-            None
+        let first_choice = payload
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first());
+        let content: Option<String> = first_choice
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .map(str::to_owned);
+        match content {
+            Some(content) if !content.trim().is_empty() => Some(content),
+            Some(_) => {
+                // HTTP 200 with an empty string: the model spent its token
+                // budget reasoning. finish_reason names the cause without
+                // any model output, so there is nothing to sanitize.
+                let reason = first_choice
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(|reason| reason.as_str())
+                    .unwrap_or("unknown");
+                self.record_error(format!(
+                    "groq returned empty content (finish_reason: {reason})"
+                ));
+                None
+            }
+            None => {
+                self.record_error(
+                    "groq malformed response (no choices/message/content)".to_owned(),
+                );
+                None
+            }
         }
     }
 
@@ -477,8 +504,13 @@ mod tests {
     /// `application/json`, then exits. Returns the base URL to point the
     /// adapter at — hermetic: no internet, no fixed port. `None` when the
     /// loopback bind itself fails (the test then fails closed with a
-    /// clear panic instead of an `expect`).
-    fn mock_server(status: u16, response_body: String) -> Option<String> {
+    /// clear panic instead of an `expect`). When `captured_body` is given,
+    /// the raw request body is stored there for assertion.
+    fn mock_server(
+        status: u16,
+        response_body: String,
+        captured_body: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    ) -> Option<String> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let addr = listener.local_addr().ok()?;
         std::thread::spawn(move || {
@@ -520,7 +552,14 @@ mod tests {
                 if n == 0 {
                     break;
                 }
+                buf.extend_from_slice(&chunk[..n]);
                 body_read += n;
+            }
+            if let Some(sink) = captured_body
+                && let Ok(mut guard) = sink.lock()
+            {
+                let end = (header_end + content_length).min(buf.len());
+                guard.extend_from_slice(&buf[header_end..end]);
             }
             let response = format!(
                 "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
@@ -535,7 +574,7 @@ mod tests {
     /// Bind a mock server or fail the test with a clear message. Keeps the
     /// happy-path tests readable without `expect`.
     fn mock_base(response_body: String) -> String {
-        match mock_server(200, response_body) {
+        match mock_server(200, response_body, None) {
             Some(base) => base,
             None => panic!("loopback mock failed to bind"),
         }
@@ -544,10 +583,32 @@ mod tests {
     /// Bind a mock server answering with an HTTP error status (Groq error
     /// envelope when `response_body` carries one).
     fn mock_status(status: u16, response_body: String) -> String {
-        match mock_server(status, response_body) {
+        match mock_server(status, response_body, None) {
             Some(base) => base,
             None => panic!("loopback mock failed to bind"),
         }
+    }
+
+    /// Bind a mock server that also captures the raw request body for
+    /// assertion. Returns the base URL and the capture buffer.
+    fn mock_server_capturing(
+        status: u16,
+        response_body: String,
+    ) -> Option<(String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>)> {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = mock_server(status, response_body, Some(captured.clone()))?;
+        Some((base, captured))
+    }
+
+    /// Read the captured request body as JSON, or fail the test.
+    fn captured_json(captured: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> serde_json::Value {
+        let Ok(guard) = captured.lock() else {
+            panic!("capture mutex is poisoned");
+        };
+        let Ok(body) = serde_json::from_slice(&guard) else {
+            panic!("request body is not JSON");
+        };
+        body
     }
 
     #[test]
@@ -642,6 +703,75 @@ mod tests {
         assert!(
             !err.contains("test-key"),
             "detail must never echo credentials"
+        );
+    }
+
+    #[test]
+    fn groq_empty_content_records_finish_reason() {
+        // The gpt-oss empty-response failure: HTTP 200, empty string
+        // content, finish_reason "length" (the reasoning trace consumed the
+        // token budget). Must decline with a diagnostic naming the cause —
+        // not a silent miss, and not a confusing "unparseable" preview.
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        })
+        .to_string();
+        let base = mock_base(envelope);
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "openai/gpt-oss-20b");
+        assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        let Some(err) = grounder.last_error() else {
+            panic!("empty content records a diagnostic");
+        };
+        assert!(
+            err.contains("finish_reason: length"),
+            "unexpected detail: {err}"
+        );
+        assert!(
+            !err.contains("test-key"),
+            "detail must never echo credentials"
+        );
+    }
+
+    #[test]
+    fn groq_sends_low_reasoning_effort_for_gpt_oss() {
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": "{\"domain\": \"amazon.in\"}"}}],
+        })
+        .to_string();
+        let Some((base, captured)) = mock_server_capturing(200, envelope) else {
+            panic!("loopback mock failed to bind");
+        };
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "openai/gpt-oss-20b");
+        assert_eq!(
+            grounder.ground_domain("amazon", "IN").as_deref(),
+            Some("amazon.in")
+        );
+        let body = captured_json(&captured);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_tokens"], 256);
+    }
+
+    #[test]
+    fn groq_omits_reasoning_effort_for_non_reasoning_models() {
+        // reasoning_effort is a 400 on models that cannot reason; it must
+        // never leak into requests for other models (e.g. a CLINCH_GROQ_MODEL
+        // override).
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": "{\"domain\": \"amazon.in\"}"}}],
+        })
+        .to_string();
+        let Some((base, captured)) = mock_server_capturing(200, envelope) else {
+            panic!("loopback mock failed to bind");
+        };
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "llama-3.1-8b-instant");
+        assert_eq!(
+            grounder.ground_domain("amazon", "IN").as_deref(),
+            Some("amazon.in")
+        );
+        let body = captured_json(&captured);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must not be sent to non-reasoning models"
         );
     }
 
