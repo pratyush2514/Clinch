@@ -124,6 +124,8 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
       onTakeControl={vi.fn()}
       onRelease={vi.fn()}
       onConnect={vi.fn()}
+      onSaveShortcut={vi.fn()}
+      onDismissShortcut={vi.fn()}
       {...overrides}
     />,
   );
@@ -228,5 +230,68 @@ describe("ActionThread", () => {
     view([]);
     expect(screen.queryByRole("article")).toBeNull();
     expect(screen.getByText(/download all my invoices from github/)).toBeDefined();
+  });
+
+  it("renders the Save as Shortcut card only after the post-landing offer line", () => {
+    const landed = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "open amazon for me", at: 1_000 },
+      {
+        type: "notes",
+        id: "e1",
+        lines: [
+          "route_proposed:www.amazon.in/ · source: DomainGrounded",
+          "shortcut_offer: 'amazon' → https://www.amazon.in · save to skip grounding next time",
+        ],
+      },
+    ]);
+    view(landed);
+    const card = screen.getByLabelText("Save shortcut offer");
+    expect(card.textContent).toContain("amazon");
+    expect(card.textContent).toContain("https://www.amazon.in");
+    expect(screen.getByRole("button", { name: "Save shortcut" })).toBeDefined();
+  });
+
+  it("shows no shortcut card when the journal never offered one", () => {
+    const entries = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "open amazon for me", at: 1_000 },
+      {
+        type: "notes",
+        id: "e1",
+        lines: ["route_proposed:www.amazon.in/ · source: DomainGrounded"],
+      },
+    ]);
+    view(entries);
+    expect(screen.queryByLabelText("Save shortcut offer")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save shortcut" })).toBeNull();
+  });
+
+  it("accepting the card saves the shortcut for that entry", () => {
+    const onSaveShortcut = vi.fn();
+    const entries = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "open amazon for me", at: 1_000 },
+      {
+        type: "notes",
+        id: "e1",
+        lines: ["shortcut_offer: 'amazon' → https://www.amazon.in · save to skip grounding next time"],
+      },
+    ]);
+    view(entries, { onSaveShortcut });
+    screen.getByRole("button", { name: "Save shortcut" }).click();
+    expect(onSaveShortcut).toHaveBeenCalledWith("e1");
+  });
+
+  it("declining the card dismisses it for that entry", () => {
+    const onDismissShortcut = vi.fn();
+    const entries = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "open amazon for me", at: 1_000 },
+      {
+        type: "notes",
+        id: "e1",
+        lines: ["shortcut_offer: 'amazon' → https://www.amazon.in · save to skip grounding next time"],
+      },
+    ]);
+    view(entries, { onDismissShortcut });
+    screen.getByRole("button", { name: "Not now" }).click();
+    expect(onDismissShortcut).toHaveBeenCalledWith("e1");
   });
 });

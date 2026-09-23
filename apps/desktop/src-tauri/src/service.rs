@@ -293,6 +293,34 @@ struct ProposedEntry {
     /// shortcut, no typed domain, no directory hit. Dispatch turns this
     /// into ask-and-learn guidance instead of the generic "not runnable".
     direct_open_miss: bool,
+    /// A domain-grounder hit worth remembering: the site slot the prompt
+    /// named and the URL the grounder resolved it to. Carried on the
+    /// proposal — never journaled there — so dispatch can offer it as a
+    /// shortcut only *after* navigation to the grounded URL completes. A
+    /// proposal that never lands must not offer anything.
+    grounder_hit: Option<GrounderHit>,
+}
+
+/// A `RouteSource::DomainGrounded` resolution the Action Thread may offer to
+/// keep: the bare site slot plus the exact URL the grounder returned.
+#[derive(Clone, Debug, Default)]
+struct GrounderHit {
+    site: String,
+    url: String,
+}
+
+/// Everything the batch dispatch lane needs after its preamble: the
+/// attached browser, the run's journal handles, the proposed route's log
+/// line, and the post-landing shortcut offer (when the ladder grounded one).
+struct BatchPreamble {
+    browser: std::sync::Arc<browser_driver::ManagedBrowser>,
+    run_id: u64,
+    journal_id: String,
+    journal: Option<playbook_store::PlaybookStore>,
+    name: String,
+    steps: Vec<playbook_store::Step>,
+    route_log: Option<String>,
+    shortcut_offer: Option<String>,
 }
 
 impl ProposedEntry {
@@ -1751,6 +1779,13 @@ impl AppService {
         if outcome.route_log.is_none() {
             outcome.route_log = route_log;
         }
+        // Landing detection for the auto-acquire lane: the delegate ran its
+        // own pre-navigation (its `?` fails the run otherwise), so reaching
+        // here means the outer proposal's grounded URL landed. The
+        // delegate's own proposal was skipped (`entry_url` was preset), so
+        // it carries no hit — the offer fires exactly once, from here.
+        let offer = self.offer_shortcut_after_landing(&proposed).await;
+        outcome.telemetry_log = Self::with_shortcut_offer(offer, outcome.telemetry_log.take());
         // The follow line rides the same channel as snapshot telemetry so
         // Session Activity shows the destination it landed on.
         if let Some(line) = follow_log {
@@ -1922,6 +1957,34 @@ impl AppService {
         }
     }
 
+    /// Landing detection for the learning loop: journal the "Save as
+    /// Shortcut" offer for a domain-grounded proposal and return the line so
+    /// dispatch can surface it on the outcome's telemetry log (journal lines
+    /// alone don't reach the Action Thread). Call only after navigation to
+    /// the grounded URL completed — a proposal that failed to land must not
+    /// offer anything, so every call site sits behind a successful
+    /// pre-navigation `?`. `None` when the proposal carried no grounder hit.
+    async fn offer_shortcut_after_landing(&self, proposed: &ProposedEntry) -> Option<String> {
+        let hit = proposed.grounder_hit.as_ref()?;
+        let line = format!(
+            "shortcut_offer: '{}' → {} · save to skip grounding next time",
+            hit.site, hit.url
+        );
+        let _ = self.record(&line).await;
+        Some(line)
+    }
+
+    /// Prepend a post-landing shortcut offer (when any) to a telemetry log.
+    /// Journal order is proposal → landing → everything after; the
+    /// outcome's telemetry mirrors it so the thread reads chronologically.
+    fn with_shortcut_offer(offer: Option<String>, telemetry: Option<String>) -> Option<String> {
+        match (offer, telemetry) {
+            (Some(offer), Some(rest)) => Some(format!("{offer}\n{rest}")),
+            (Some(offer), None) => Some(offer),
+            (None, rest) => rest,
+        }
+    }
+
     /// Fail a direct-open miss with ask-and-learn guidance. `Some(err)`
     /// when the ladder ran and found nothing; `None` otherwise.
     fn direct_open_miss_error(proposed: &ProposedEntry) -> Option<AppError> {
@@ -2037,6 +2100,7 @@ impl AppService {
                     log: Some(line),
                     source: Some(route.source),
                     direct_open_miss: false,
+                    ..ProposedEntry::default()
                 };
             }
             let line = format!(
@@ -2047,28 +2111,28 @@ impl AppService {
             );
             let _ = self.record(&line).await;
             intent.entry_url = Some(route.url.as_str().to_owned());
-            // Learning loop: a domain-grounded hit is a candidate shortcut.
-            // Journal the suggestion so the Action Thread can render the
-            // "Save as Shortcut" card; accepting stores
-            // `site name → https://domain` via the existing
-            // `save_site_shortcut` command, so the next run hits the
-            // shortcut rung with zero tokens.
-            if route.source == orchestration_engine::RouteSource::DomainGrounded {
+            // Learning loop: a domain-grounded hit is a shortcut candidate,
+            // but the offer is journaled only after navigation completes
+            // (`offer_shortcut_after_landing`) — a proposal that never lands
+            // must not offer anything. The hit rides the proposal so every
+            // dispatch lane can reach it without re-parsing the prompt.
+            let grounder_hit = if route.source == orchestration_engine::RouteSource::DomainGrounded
+            {
                 let site = orchestration_engine::parse_grammar(prompt, connected_origin)
                     .target_noun
                     .unwrap_or_default();
-                if !site.is_empty() {
-                    let suggest = format!(
-                        "suggest_shortcut: '{site}' → {} · save via the shortcut manager to skip grounding next time",
-                        route.url.as_str()
-                    );
-                    let _ = self.record(&suggest).await;
-                }
-            }
+                (!site.is_empty()).then(|| GrounderHit {
+                    site,
+                    url: route.url.as_str().to_owned(),
+                })
+            } else {
+                None
+            };
             ProposedEntry {
                 log: Some(line),
                 source: Some(route.source),
                 direct_open_miss: false,
+                grounder_hit,
             }
         } else {
             let line = if direct_open {
@@ -2086,6 +2150,7 @@ impl AppService {
                 log: Some(line),
                 source: None,
                 direct_open_miss: direct_open,
+                ..ProposedEntry::default()
             }
         }
     }
@@ -2121,6 +2186,61 @@ impl AppService {
             return Ok(false);
         };
         Self::pre_navigate_to_entry(browser, intent).await
+    }
+
+    /// Cross-domain pre-navigation plus the post-landing shortcut offer in
+    /// one step: pre-navigation's `?` is the landing gate, so the returned
+    /// offer line (if any) is proof the grounded URL actually landed — a
+    /// failed navigation never reaches the journal call.
+    async fn pre_navigate_with_offer(
+        &self,
+        browser: &Arc<ManagedBrowser>,
+        steps: &[playbook_store::Step],
+        proposed: &ProposedEntry,
+    ) -> Result<Option<String>, AppError> {
+        Self::pre_navigate_to_step(browser, steps).await?;
+        Ok(self.offer_shortcut_after_landing(proposed).await)
+    }
+
+    /// Everything the batch lane needs after its preamble: the attached
+    /// browser, the run's journal handles, the proposed route's log line,
+    /// and the post-landing shortcut offer (when the ladder grounded one).
+    async fn begin_batch_dispatch(
+        &self,
+        portal: &url::Url,
+        prompt: &str,
+        intent: &mut macro_engine::SemanticIntent,
+    ) -> Result<BatchPreamble, AppError> {
+        // Ephemeral entry point (command-bar Run): propose the route at the
+        // top, before any macro task step exists. A direct-open miss fails
+        // before the batch run begins rather than snapshotting the connected
+        // portal for a destination the prompt never named.
+        let proposed = self.propose_entry_url(prompt, intent, Some(portal)).await;
+        if let Some(err) = Self::direct_open_miss_error(&proposed) {
+            return Err(err);
+        }
+        let route_log = proposed.log.clone();
+        let (browser, run_id, journal_id, journal) = self.begin_batch_run(portal).await?;
+        let name = orchestration_engine::ephemeral_name(prompt);
+        // The proposed route lives on both `intent.entry_url` and step 1, so
+        // pre-navigation provably runs from `step.entry_url`.
+        let steps = vec![playbook_store::Step::Semantic {
+            intent: intent.clone(),
+        }];
+        // Pre-navigation's `?` is the landing gate for the offer below.
+        let shortcut_offer = self
+            .pre_navigate_with_offer(&browser, &steps, &proposed)
+            .await?;
+        Ok(BatchPreamble {
+            browser,
+            run_id,
+            journal_id,
+            journal,
+            name,
+            steps,
+            route_log,
+            shortcut_offer,
+        })
     }
 
     /// Bind portal confinement to step 1's entry origin after intentional
@@ -2199,7 +2319,7 @@ impl AppService {
         if let Some(err) = Self::direct_open_miss_error(&proposed) {
             return Err(err);
         }
-        let route_log = proposed.log;
+        let route_log = proposed.log.clone();
         let name = orchestration_engine::ephemeral_name(&prompt);
         let playbook = playbook_store::Playbook::new(
             name.clone(),
@@ -2215,8 +2335,11 @@ impl AppService {
         // never snapshotted. Background: an ad-hoc run must never open a
         // window, only reuse whatever session is already attached.
         let browser = self.browser(BrowserIntent::Background).await?;
-        Self::pre_navigate_to_step(&browser, &playbook.steps).await?;
+        let shortcut_offer = self
+            .pre_navigate_with_offer(&browser, &playbook.steps, &proposed)
+            .await?;
         let telemetry_log = self.reanchor_to_entry(&browser, &playbook.steps).await;
+        let telemetry_log = Self::with_shortcut_offer(shortcut_offer, telemetry_log);
         self.verify_bridge_auth(&portal).await?;
         let (result, journal_id) = self
             .run_steps(
@@ -2265,31 +2388,18 @@ impl AppService {
         mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
-        // Ephemeral entry point (command-bar Run): propose the route at the
-        // top, before any macro task step exists. The log line travels on
-        // every batch outcome so failures still surface the proposal. A
-        // direct-open miss fails before the batch run begins rather than
-        // snapshotting the connected portal for a destination the prompt
-        // never named.
-        let proposed = self
-            .propose_entry_url(&prompt, &mut intent, Some(&portal))
-            .await;
-        if let Some(err) = Self::direct_open_miss_error(&proposed) {
-            return Err(err);
-        }
-        let route_log = proposed.log;
-        let (browser, run_id, journal_id, journal) = self.begin_batch_run(&portal).await?;
-        let name = orchestration_engine::ephemeral_name(&prompt);
-        // The proposed route lives on both `intent.entry_url` and step 1, so
-        // pre-navigation provably runs from `step.entry_url`.
-        let steps = vec![playbook_store::Step::Semantic {
-            intent: intent.clone(),
-        }];
-        // Cross-domain pre-navigation when step 1's entry differs from the
-        // live tab (origin/path): navigate first via the shared settle
-        // routine, re-anchor confinement to the intentional destination,
-        // then verify bridge auth before any ARIA snapshot.
-        Self::pre_navigate_to_step(&browser, &steps).await?;
+        let BatchPreamble {
+            browser,
+            run_id,
+            journal_id,
+            journal,
+            name,
+            steps,
+            route_log,
+            shortcut_offer,
+        } = self
+            .begin_batch_dispatch(&portal, &prompt, &mut intent)
+            .await?;
         self.verify_bridge_auth(&portal).await?;
         let events = std::sync::Mutex::new(&mut emit);
         // Read-only snapshot first: the approval names the real candidate
@@ -2297,9 +2407,10 @@ impl AppService {
         // A single entry-URL retry covers wrong-page starts: navigate once,
         // re-snapshot once, then stop. No approval gate ever opens on zero
         // candidates.
-        let (candidates, telemetry_log) = self
+        let (candidates, snapshot_telemetry) = self
             .snapshot_anchored_batch_candidates(&browser, &portal, &intent, &steps)
             .await;
+        let telemetry_log = Self::with_shortcut_offer(shortcut_offer, snapshot_telemetry);
         // Every terminal outcome below carries the same steps plus the
         // route-proposal and snapshot-telemetry lines, so failures still
         // surface both in the UI.
@@ -4862,6 +4973,131 @@ pub(crate) mod tests {
         );
         assert_eq!(metrics.runs_by_status.get("completed"), Some(&1));
         pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shortcut_offer_journaled_only_after_landing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The "Save as Shortcut" card is derived from the `shortcut_offer:`
+        // journal line, and that line has exactly one producer:
+        // `offer_shortcut_after_landing`. A grounder hit journals it; no hit
+        // journals nothing.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let hit = ProposedEntry {
+            grounder_hit: Some(GrounderHit {
+                site: "amazon".to_owned(),
+                url: "https://www.amazon.in".to_owned(),
+            }),
+            ..ProposedEntry::default()
+        };
+        let line = service
+            .offer_shortcut_after_landing(&hit)
+            .await
+            .ok_or("offer line")?;
+        assert!(line.starts_with("shortcut_offer:"), "got {line:?}");
+        assert!(
+            line.contains("amazon") && line.contains("https://www.amazon.in"),
+            "line names the site and URL, got {line:?}"
+        );
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            events.iter().any(|event| event.contains("shortcut_offer:")),
+            "offer journaled: {events:?}"
+        );
+        // No hit, no offer, no journal line.
+        let before = events.len();
+        let none = service
+            .offer_shortcut_after_landing(&ProposedEntry::default())
+            .await;
+        assert!(none.is_none(), "no hit means no offer");
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert_eq!(events.len(), before, "nothing journaled without a hit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proposal_alone_never_journals_shortcut_offer() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Regression guard for the old behavior (the suggestion was
+        // journaled at proposal time): running the ladder alone — search
+        // fallback and direct-open miss — must never produce the offer line.
+        // Only a post-landing call to `offer_shortcut_after_landing` may.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let mut intent = macro_engine::SemanticIntent {
+            role: "link".into(),
+            label_query: "amazon".into(),
+            container_query: None,
+            raw_prompt: "find amazon".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: false,
+            entry_url: None,
+            primary_target_noun: Some("amazon".into()),
+        };
+        let proposed = service
+            .propose_entry_url("find amazon", &mut intent, None)
+            .await;
+        assert!(proposed.needs_search_follow(), "search fallback proposed");
+        let origin = url::Url::parse("https://www.google.com/").ok();
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
+            orchestration_engine::resolve_command("open amazon for me", origin.as_ref(), &[])
+        else {
+            panic!("ad-hoc prompt resolves ephemeral");
+        };
+        let proposed = service
+            .propose_entry_url("open amazon for me", &mut intent, None)
+            .await;
+        assert!(proposed.direct_open_miss, "ladder miss flagged");
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert!(
+            !events.iter().any(|event| event.contains("shortcut_offer:")),
+            "proposal alone never offers: {events:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepting_shortcut_offer_hits_shortcut_rung_next_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // What the card's Save button invokes: `save_site_shortcut` persists
+        // `amazon → https://www.amazon.in` to SQLite; the next dispatch
+        // loads it into the ladder and the engine answers from the shortcut
+        // rung — zero tokens, no grounding.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let saved = service
+            .save_site_shortcut("amazon".to_owned(), "https://www.amazon.in/".to_owned())
+            .await
+            .map_err(|_| "save_site_shortcut")?;
+        assert_eq!(saved.name, "amazon");
+        assert_eq!(saved.url, "https://www.amazon.in/");
+        // The next dispatch's shortcut map, built exactly the way the
+        // production lane builds it.
+        let map = service.load_shortcut_map().await.ok_or("shortcut map")?;
+        let shortcuts = orchestration_engine::InMemoryShortcuts::new(map);
+        let ctx = orchestration_engine::ResolutionContext {
+            account_dir: None,
+            llm: None,
+            parser: None,
+            shortcuts: Some(&shortcuts),
+            site_search: None,
+            domain_grounder: None,
+            region_hint: "",
+        };
+        let resolved = orchestration_engine::resolve_entry_url("open amazon for me", None, &ctx)
+            .ok_or("route")?;
+        assert_eq!(
+            resolved.source,
+            orchestration_engine::RouteSource::Shortcut,
+            "saved shortcut answers the next run"
+        );
+        assert_eq!(resolved.url.as_str(), "https://www.amazon.in/");
         Ok(())
     }
 }

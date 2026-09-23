@@ -50,6 +50,10 @@ export type ThreadApi = {
   decide: (entryId: string, approved: boolean) => Promise<void>;
   save: (entryId: string) => Promise<void>;
   rename: (entryId: string, saveName: string) => void;
+  /** Accept the post-landing shortcut offer: persist `site → url`. */
+  saveShortcut: (entryId: string) => Promise<void>;
+  /** Decline the post-landing shortcut offer: keep nothing. */
+  dismissShortcut: (entryId: string) => void;
   openFile: (entryId: string, chip: OutputChip, reveal: boolean) => Promise<void>;
   /** Attribute the newest frame to whichever entry is currently live. */
   noteFrame: (frame: string) => void;
@@ -337,6 +341,34 @@ export function useThread(
     dispatch({ type: "rename", id: entryId, saveName });
   }, []);
 
+  /**
+   * Accept the post-landing shortcut offer: persist `site → url` through the
+   * same command the shortcut manager uses, so the next "open {site}"
+   * answers from the shortcut rung with zero tokens. Consent-gated — the
+   * backend never writes this on its own.
+   */
+  const saveShortcut = useCallback(
+    async (entryId: string) => {
+      const entry = latest.current.find(candidate => candidate.id === entryId);
+      const offer = entry?.shortcutOffer;
+      if (!entry || !offer || entry.shortcutSaved || entry.shortcutDismissed) return;
+      try {
+        await invoke("save_site_shortcut", { name: offer.site, url: offer.url });
+        dispatch({ type: "shortcutSaved", id: entryId });
+        report(
+          `Saved shortcut ${offer.site} → ${offer.url} — “open ${offer.site}” now jumps straight there.`,
+        );
+      } catch (error) {
+        report(message(error));
+      }
+    },
+    [report],
+  );
+
+  const dismissShortcut = useCallback((entryId: string) => {
+    dispatch({ type: "shortcutDismissed", id: entryId });
+  }, []);
+
   const openFile = useCallback(
     async (entryId: string, chip: OutputChip, reveal: boolean) => {
       const entry = latest.current.find(candidate => candidate.id === entryId);
@@ -368,6 +400,8 @@ export function useThread(
     decide,
     save,
     rename,
+    saveShortcut,
+    dismissShortcut,
     openFile,
     noteFrame,
   };

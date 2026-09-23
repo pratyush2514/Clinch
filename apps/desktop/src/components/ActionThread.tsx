@@ -22,6 +22,8 @@ export default function ActionThread({
   onTakeControl,
   onRelease,
   onConnect,
+  onSaveShortcut,
+  onDismissShortcut,
 }: {
   entries: ThreadEntry[];
   liveFrame: string | null;
@@ -34,6 +36,8 @@ export default function ActionThread({
   onTakeControl: () => void;
   onRelease: () => void;
   onConnect: () => void;
+  onSaveShortcut: (entryId: string) => void;
+  onDismissShortcut: (entryId: string) => void;
 }) {
   const end = useRef<HTMLDivElement>(null);
   const live = activeEntry(entries);
@@ -84,6 +88,8 @@ export default function ActionThread({
               onTakeControl={onTakeControl}
               onRelease={onRelease}
               onConnect={onConnect}
+              onSaveShortcut={() => onSaveShortcut(entry.id)}
+              onDismissShortcut={() => onDismissShortcut(entry.id)}
             />
           </li>
         ))}

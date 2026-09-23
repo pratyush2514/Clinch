@@ -136,6 +136,8 @@ export default function App() {
         onTakeControl={() => void screencast.takeControl()}
         onRelease={() => void screencast.release()}
         onConnect={() => setSessionOpen(true)}
+        onSaveShortcut={id => void thread.saveShortcut(id)}
+        onDismissShortcut={thread.dismissShortcut}
       />
       <footer>
         <p className="status" role="status" aria-live="polite">

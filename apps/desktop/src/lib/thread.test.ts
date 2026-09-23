@@ -10,6 +10,7 @@ import {
   anchorFromLines,
   describeAction,
   dispatchChips,
+  shortcutOfferFromLines,
   taskChips,
   telemetryLines,
   threadReducer,
@@ -246,5 +247,77 @@ describe("describeAction", () => {
     expect(describeAction({ type: "download_links", selector: "a.report" })).toBe(
       "Download files · a.report",
     );
+  });
+});
+
+const OFFER_LINE =
+  "shortcut_offer: 'amazon' → https://www.amazon.in · save to skip grounding next time";
+
+describe("shortcutOfferFromLines", () => {
+  it("parses the backend's post-landing offer line into site and url", () => {
+    expect(shortcutOfferFromLines([OFFER_LINE])).toEqual({
+      site: "amazon",
+      url: "https://www.amazon.in",
+    });
+  });
+
+  it("ignores every other journal line", () => {
+    expect(
+      shortcutOfferFromLines([
+        "route_proposed:www.amazon.in/ · source: DomainGrounded",
+        "portal_reanchored: google.com → www.amazon.in",
+      ]),
+    ).toBeNull();
+  });
+
+  it("returns null for a malformed offer line instead of a half offer", () => {
+    expect(shortcutOfferFromLines(["shortcut_offer: amazon"])).toBeNull();
+    expect(shortcutOfferFromLines(["shortcut_offer:"])).toBeNull();
+  });
+});
+
+describe("shortcut offer state", () => {
+  it("offers nothing when the journal has no offer line — the card only exists after a real landing", () => {
+    const [entry] = fold([
+      SUBMIT,
+      {
+        type: "notes",
+        id: "e1",
+        lines: ["route_proposed:www.amazon.in/ · source: DomainGrounded"],
+      },
+    ]);
+    expect(entry.shortcutOffer).toBeNull();
+    expect(entry.shortcutSaved).toBe(false);
+  });
+
+  it("derives the offer from the journal line once it arrives", () => {
+    const [entry] = fold([SUBMIT, { type: "notes", id: "e1", lines: [OFFER_LINE] }]);
+    expect(entry.shortcutOffer).toEqual({ site: "amazon", url: "https://www.amazon.in" });
+  });
+
+  it("marks the offer saved on acceptance", () => {
+    const [entry] = fold([
+      SUBMIT,
+      { type: "notes", id: "e1", lines: [OFFER_LINE] },
+      { type: "shortcutSaved", id: "e1" },
+    ]);
+    expect(entry.shortcutSaved).toBe(true);
+    expect(entry.shortcutOffer).toEqual({ site: "amazon", url: "https://www.amazon.in" });
+  });
+
+  it("a declined offer stays gone even if more notes arrive", () => {
+    const entries = fold([
+      SUBMIT,
+      { type: "notes", id: "e1", lines: [OFFER_LINE] },
+      { type: "shortcutDismissed", id: "e1" },
+    ]);
+    expect(entries[0].shortcutDismissed).toBe(true);
+    const [entry] = threadReducer(entries, {
+      type: "notes",
+      id: "e1",
+      lines: ["ax_snapshot: 42 nodes"],
+    });
+    expect(entry.shortcutDismissed).toBe(true);
+    expect(entry.shortcutOffer).toEqual({ site: "amazon", url: "https://www.amazon.in" });
   });
 });

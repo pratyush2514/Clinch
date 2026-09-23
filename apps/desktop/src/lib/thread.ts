@@ -36,6 +36,16 @@ export type ThreadGate = {
   candidates: CandidatePreview[];
 };
 
+/**
+ * A domain-grounder hit the backend offers to keep. The journal line only
+ * exists after navigation to the grounded URL completed, so an offer here
+ * is proof of a real landing — never a proposal that failed to land.
+ */
+export type ShortcutOffer = {
+  site: string;
+  url: string;
+};
+
 /** One artifact the run produced: a downloaded file or an extracted value. */
 export type OutputChip = {
   kind: "file" | "data";
@@ -90,6 +100,12 @@ export type ThreadEntry = {
   result: EntryResult | null;
   saveName: string;
   savedId: string | null;
+  /** The backend's post-landing shortcut offer, parsed from journal lines. */
+  shortcutOffer: ShortcutOffer | null;
+  /** True once the offer above was accepted and persisted. */
+  shortcutSaved: boolean;
+  /** True once the offer above was declined; declining keeps nothing. */
+  shortcutDismissed: boolean;
   error: { message: string; code: string | null } | null;
 };
 
@@ -104,7 +120,9 @@ export type ThreadAction =
   | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "rename"; id: string; saveName: string }
-  | { type: "saved"; id: string; savedId: string };
+  | { type: "saved"; id: string; savedId: string }
+  | { type: "shortcutSaved"; id: string }
+  | { type: "shortcutDismissed"; id: string };
 
 /** Terminal sequence statuses that are not a clean completion. */
 const BLOCKED_STATUSES = new Set(["denied", "needs_repair"]);
@@ -145,6 +163,9 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           result: null,
           saveName: "",
           savedId: null,
+          shortcutOffer: null,
+          shortcutSaved: false,
+          shortcutDismissed: false,
           error: null,
         },
       ];
@@ -171,10 +192,17 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         status: action.gate ? "awaiting" : entry.status === "awaiting" ? "running" : entry.status,
       }));
     case "notes":
-      return patch(entries, action.id, entry => ({
-        ...entry,
-        notes: [...entry.notes, ...action.lines],
-      }));
+      return patch(entries, action.id, entry => {
+        const notes = [...entry.notes, ...action.lines];
+        return {
+          ...entry,
+          notes,
+          // The card is derived from the journal, not stored separately:
+          // the offer line only exists after a real landing. Parsed once —
+          // a declined offer must not come back on a later notes action.
+          shortcutOffer: entry.shortcutOffer ?? shortcutOfferFromLines(notes),
+        };
+      });
     case "provenance":
       return patch(entries, action.id, entry => ({
         ...entry,
@@ -208,6 +236,12 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
       return patch(entries, action.id, entry => ({ ...entry, saveName: action.saveName }));
     case "saved":
       return patch(entries, action.id, entry => ({ ...entry, savedId: action.savedId }));
+    case "shortcutSaved":
+      return patch(entries, action.id, entry => ({ ...entry, shortcutSaved: true }));
+    case "shortcutDismissed":
+      // Declining leaves nothing behind: the card goes away and the journal
+      // line stays as plain telemetry.
+      return patch(entries, action.id, entry => ({ ...entry, shortcutDismissed: true }));
   }
 }
 
@@ -261,6 +295,25 @@ export function anchorFromLines(lines: string[]): string | null {
     if (!line.startsWith("route_proposed:")) continue;
     const host = hostOf(line.slice("route_proposed:".length).split("·")[0] ?? "");
     if (host) return host;
+  }
+  return null;
+}
+
+/**
+ * The post-landing shortcut offer, read from the run's own journal lines.
+ *
+ * The backend journals `shortcut_offer: '<site>' → <url> · …` only after
+ * navigation to a domain-grounded URL completed, so a parsed offer is
+ * proof the card may be shown — a proposal that never landed produces no
+ * such line.
+ */
+export function shortcutOfferFromLines(lines: string[]): ShortcutOffer | null {
+  for (const line of lines) {
+    if (!line.startsWith("shortcut_offer:")) continue;
+    const body = line.slice("shortcut_offer:".length).split("·")[0]?.trim() ?? "";
+    const [sitePart, url] = body.split("→").map(part => part.trim());
+    const site = sitePart?.replace(/^'|'$/g, "");
+    if (site && url) return { site, url };
   }
   return null;
 }

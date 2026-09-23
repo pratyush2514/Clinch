@@ -1,6 +1,7 @@
 import OutcomeCard from "./OutcomeCard";
 import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
+import ShortcutCard from "./ShortcutCard";
 import { TIER_LABELS, type OutputChip, type ThreadEntry } from "../lib/thread";
 import { needsSession } from "../lib/errors";
 
@@ -30,6 +31,8 @@ export default function ActionCard({
   onTakeControl,
   onRelease,
   onConnect,
+  onSaveShortcut,
+  onDismissShortcut,
 }: {
   entry: ThreadEntry;
   /** Whether this is the entry the managed browser is currently working for. */
@@ -44,6 +47,8 @@ export default function ActionCard({
   onTakeControl: () => void;
   onRelease: () => void;
   onConnect: () => void;
+  onSaveShortcut: () => void;
+  onDismissShortcut: () => void;
 }) {
   const frame = live ? liveFrame ?? entry.frame : entry.frame;
   const showCast = live || entry.frame !== null;
@@ -83,6 +88,21 @@ export default function ActionCard({
         </ol>
       )}
       {entry.gate && <SentinelGate gate={entry.gate} onDecide={onDecide} />}
+      {entry.shortcutOffer && !entry.shortcutDismissed && (
+        entry.shortcutSaved ? (
+          <p className="target">
+            🔖 Saved shortcut <strong>{entry.shortcutOffer.site}</strong> →{" "}
+            <code>{entry.shortcutOffer.url}</code>. “open {entry.shortcutOffer.site}” now
+            jumps straight there.
+          </p>
+        ) : (
+          <ShortcutCard
+            offer={entry.shortcutOffer}
+            onSave={onSaveShortcut}
+            onDismiss={onDismissShortcut}
+          />
+        )
+      )}
       {entry.notes.length > 0 && (
         <details className="telemetry">
           <summary>Route &amp; snapshot telemetry ({entry.notes.length})</summary>
