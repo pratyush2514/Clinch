@@ -297,8 +297,9 @@ impl ManagedBrowser {
         // the hide lands is accepted and documented; failure just leaves
         // the off-screen window in place.
         #[cfg(windows)]
-        if options.mode == WindowMode::Offscreen {
-            let pid = child.id();
+        if options.mode == WindowMode::Offscreen
+            && let Some(pid) = child.id()
+        {
             let _ = tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
         }
         let endpoint = tokio::time::timeout(IO_TIMEOUT, async {
