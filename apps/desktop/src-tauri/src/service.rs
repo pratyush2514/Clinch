@@ -137,9 +137,14 @@ impl BrowserIntent {
     /// construction: no code path can launch it any other way.
     fn launch_options(self) -> LaunchOptions {
         match self {
-            Self::Background => LaunchOptions::replay(),
             Self::Interactive => LaunchOptions::interactive(),
-            Self::ChallengeEscalation => LaunchOptions::offscreen_headed(),
+            // Off-screen headed, not `--headless=new`: a real headed
+            // Chromium (compositor, plugins, screen metrics) positioned
+            // off-monitor and OS-hidden, so bot-mitigation probes see a
+            // headed browser while the user sees no window. Headless is
+            // the most fingerprinted mode; nothing about a background run
+            // — or an escalation of one — needs it.
+            Self::Background | Self::ChallengeEscalation => LaunchOptions::offscreen_headed(),
         }
     }
 }
@@ -161,7 +166,7 @@ enum AcquireAction {
 /// (`None` when dormant).
 ///
 /// Background never restarts: it reuses whatever is attached, so a run can
-/// neither open a window nor close one the user opened. Interactive restarts
+/// neither open a visible window nor close one the user opened. Interactive restarts
 /// only when the live session shows no visible window. [`BrowserIntent::ChallengeEscalation`]
 /// restarts a headless session into off-screen headed (cookies carried in
 /// memory by the restart path) and reuses a session that is already headed
@@ -743,14 +748,17 @@ impl AppService {
     /// Acquire the managed browser for `intent`, launching lazily when no
     /// session is attached.
     ///
-    /// [`BrowserIntent::Background`] can never create an OS window: it
-    /// launches headless and, when a session already exists, reuses it
+    /// [`BrowserIntent::Background`] never shows the user a window: it
+    /// launches off-screen headed (a real headed Chromium positioned
+    /// off-monitor and OS-hidden — no `--headless=new`, which is the most
+    /// fingerprinted mode) and, when a session already exists, reuses it
     /// exactly as-is instead of restarting. Reuse-as-is matters in both
-    /// directions — a background run can neither promote a headless context
-    /// into a visible window nor demote a window the user opened with Take
-    /// Control. Only [`BrowserIntent::Interactive`] may restart a session
-    /// into a visible window, and only [`BrowserIntent::ChallengeEscalation`]
-    /// may restart one into off-screen headed.
+    /// directions — a background run can neither promote its hidden
+    /// context into a visible window nor demote a window the user opened
+    /// with Take Control. Only [`BrowserIntent::Interactive`] may restart
+    /// a session into a visible window, and only
+    /// [`BrowserIntent::ChallengeEscalation`] may restart one into
+    /// off-screen headed.
     async fn browser(&self, intent: BrowserIntent) -> Result<Arc<ManagedBrowser>, AppError> {
         let existing = self.browser.lock().map_err(|_| AppError::Internal)?.clone();
         match acquire_action(intent, existing.as_ref().map(|live| live.window_mode())) {
@@ -3788,14 +3796,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn background_acquisition_never_requests_a_window() {
+    fn background_acquisition_never_requests_a_visible_window() {
         // The window-visibility contract, provable without Chromium.
-        // 1. Background launches headless; interactive launches headed;
-        //    escalation launches off-screen headed (hidden, never handed
-        //    to the user).
+        // 1. Background launches off-screen headed (a real headed browser,
+        //    OS-hidden — never `--headless=new`, the most fingerprinted
+        //    mode); interactive launches headed; escalation launches
+        //    off-screen headed (hidden, never handed to the user).
         assert_eq!(
             BrowserIntent::Background.launch_options().mode,
-            WindowMode::Headless
+            WindowMode::Offscreen
         );
         assert_eq!(
             BrowserIntent::Interactive.launch_options().mode,

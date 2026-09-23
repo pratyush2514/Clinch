@@ -644,7 +644,7 @@ pub fn resolve_entry_url(
     }
     // Tier 3: direct-open grounding ladder. High-confidence single-target
     // opens never touch the search template: the destination comes from
-    // the user's own data, a fenced grounder, a structured directory, or
+    // the user's own data, a structured directory, a fenced grounder, or
     // nowhere.
     let grammar = parse_grammar(prompt, connected_origin);
     if is_direct_open(prompt, &grammar) {
@@ -658,21 +658,12 @@ pub fn resolve_entry_url(
         {
             return Some(route);
         }
-        // 3b. Fenced domain grounder: site slot + region hint → bare domain.
-        // The grounder sees only the normalized site name and the region
-        // code, never the raw prompt. Its output is validated in Rust
-        // (https, valid TLD, no credentials, no raw IP) before navigation.
-        // A malformed response degrades to the next rung, never to a
-        // guessed `www.{noun}.com`.
-        if let Some(grounder) = ctx.domain_grounder
-            && let Some(name) = target
-            && let Some(domain) = grounder.ground_domain(name, ctx.region_hint)
-            && let Some(url) = validate_grounded_domain(&domain)
-            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
-        {
-            return Some(route);
-        }
-        // 3c. Structured site directory, only when a key is configured.
+        // 3b. Structured site directory, only when a key is configured.
+        // This rung runs BEFORE the LLM grounder: a search API returns
+        // ranked results as data, and ranking is the ground truth of what
+        // a site name means — it cannot hallucinate the way a generative
+        // model can (`claude` → `open.com`). The call is backend HTTP in
+        // memory; the browser never sees a search page.
         // Trust note: the directory resolves a *name the user typed*, the
         // same way asking an assistant to "open amazon" does — it is name
         // resolution, not a machine-invented destination. Strict
@@ -690,6 +681,20 @@ pub fn resolve_entry_url(
             && let Some(name) = target
             && let Some(url) = client.search_site(name)
             && let Some(route) = accept_user_directed(&url, RouteSource::SiteSearch)
+        {
+            return Some(route);
+        }
+        // 3c. Fenced domain grounder: site slot + region hint → bare domain.
+        // Fallback when no directory key is configured. The grounder sees
+        // only the normalized site name and the region code, never the raw
+        // prompt. Its output is validated in Rust (https, valid TLD, no
+        // credentials, no raw IP) before navigation. A malformed response
+        // degrades to the next rung, never to a guessed `www.{noun}.com`.
+        if let Some(grounder) = ctx.domain_grounder
+            && let Some(name) = target
+            && let Some(domain) = grounder.ground_domain(name, ctx.region_hint)
+            && let Some(url) = validate_grounded_domain(&domain)
+            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
         {
             return Some(route);
         }
@@ -1166,8 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn ladder_domain_grounder_beats_site_search_but_loses_to_shortcut() {
-        // Precedence: shortcut (user data) > grounder > site directory.
+    fn ladder_site_search_beats_grounder_but_loses_to_shortcut() {
+        // Precedence: shortcut (user data) > site directory (ranked search
+        // data) > grounder (generative fallback). Ranking is the ground
+        // truth of what a site name means; it cannot hallucinate.
         let shortcuts = InMemoryShortcuts::new(
             [("amazon".to_owned(), "https://www.amazon.in/".to_owned())]
                 .into_iter()
@@ -1180,16 +1187,23 @@ mod tests {
         let directory = MockDirectory {
             url: Some("https://www.amazon.co.uk/".to_owned()),
         };
-        // Shortcut wins over grounder.
+        // Shortcut wins over directory.
         let ctx = ladder_ctx(Some(&shortcuts), Some(&directory), Some(&grounder), "IN");
         let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
             panic!("shortcut wins");
         };
         assert_eq!(resolved.source, RouteSource::Shortcut);
-        // Without shortcut, grounder wins over directory.
+        // Without shortcut, directory wins over grounder.
         let ctx = ladder_ctx(None, Some(&directory), Some(&grounder), "IN");
         let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
-            panic!("grounder beats directory");
+            panic!("directory beats grounder");
+        };
+        assert_eq!(resolved.source, RouteSource::SiteSearch);
+        assert_eq!(resolved.url.as_str(), "https://www.amazon.co.uk/");
+        // Without directory, the grounder is the fallback.
+        let ctx = ladder_ctx(None, None, Some(&grounder), "IN");
+        let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
+            panic!("grounder is the fallback");
         };
         assert_eq!(resolved.source, RouteSource::DomainGrounded);
         assert_eq!(resolved.url.as_str(), "https://amazon.com/");

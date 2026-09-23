@@ -45,6 +45,23 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Poll interval while waiting for the launched Chromium to publish its
 /// `DevTools` endpoint file.
 const ENDPOINT_POLL_MS: u64 = 100;
+/// `DevTools` endpoint wait: a cold start (Defender rescan, cold disk cache,
+/// profile init after a force-killed predecessor) routinely exceeds the
+/// interactive I/O budget on Windows. This only gates the poll loop — a
+/// fast launch costs nothing extra.
+const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Endpoint-wait attempts: the timed-out child is reaped on drop
+/// (`kill_on_drop`) and the retry runs warmer.
+const ENDPOINT_ATTEMPTS: u32 = 2;
+/// Bytes of captured Chromium stderr kept for a failed-launch diagnostic.
+const STDERR_TAIL_BYTES: u64 = 4096;
+
+/// Name the launch stage that failed. `BrowserError` stays coarse for the
+/// UI; the stage label on stderr is what makes a launch failure
+/// diagnosable instead of a generic "could not be started".
+fn log_launch_stage(stage: &str, detail: &dyn std::fmt::Debug) {
+    eprintln!("[clinch:browser] launch failed at stage={stage}: {detail:?}");
+}
 /// Grace period for orderly Chromium shutdown (Browser.close, then process
 /// wait) before falling back to killing the child.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -243,6 +260,107 @@ pub struct ManagedBrowser {
 }
 
 impl ManagedBrowser {
+    /// Spawn Chromium and wait for its `DevTools` endpoint file.
+    ///
+    /// Chromium's stderr is captured to a per-attempt temp file: a failed
+    /// launch must leave diagnostics behind instead of failing silent.
+    /// The file is removed best-effort on success; on timeout the tail is
+    /// logged (a slow crash looks identical to a slow start from the
+    /// outside) and the child is reaped by `kill_on_drop` on drop.
+    async fn spawn_and_wait_endpoint(
+        executable: &Path,
+        profile: &Path,
+        options: LaunchOptions,
+        endpoint_file: &Path,
+    ) -> Result<(Child, String), BrowserError> {
+        let stderr_path = std::env::temp_dir().join(format!(
+            "clinch-chromium-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        ));
+        let stderr_file = std::fs::File::create(&stderr_path).map_err(|error| {
+            log_launch_stage("stderr_capture_create", &error);
+            BrowserError::Launch
+        })?;
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--remote-debugging-port=0",
+                "--remote-debugging-address=127.0.0.1",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ])
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
+            .kill_on_drop(true);
+        for arg in window_mode_args(options.mode) {
+            command.arg(arg);
+        }
+        // Hide the helper console, but keep the requested interactive browser window.
+        #[cfg(target_os = "windows")]
+        command.creation_flags(0x0800_0000);
+        let child = command.spawn().map_err(|error| {
+            log_launch_stage("spawn", &error);
+            let _ = std::fs::remove_file(&stderr_path);
+            BrowserError::Launch
+        })?;
+        let endpoint = tokio::time::timeout(ENDPOINT_TIMEOUT, async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&endpoint_file).await {
+                    let mut lines = contents.lines();
+                    if let (Some(port), Some(path)) = (lines.next(), lines.next())
+                        && let Ok(port) = port.parse::<u16>()
+                        && port != 0
+                        && path.starts_with("/devtools/browser/")
+                    {
+                        return format!("ws://127.0.0.1:{port}{path}");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(ENDPOINT_POLL_MS)).await;
+            }
+        })
+        .await;
+        if let Ok(endpoint) = endpoint {
+            let _ = std::fs::remove_file(&stderr_path);
+            Ok((child, endpoint))
+        } else {
+            eprintln!(
+                "[clinch:browser] launch failed at stage=devtools_endpoint \
+                 (timeout after {}s)",
+                ENDPOINT_TIMEOUT.as_secs()
+            );
+            Self::log_stderr_tail(&stderr_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            // `child` drops here; `kill_on_drop` reaps it.
+            Err(BrowserError::Timeout)
+        }
+    }
+
+    /// Log the tail of a failed launch's captured stderr, best-effort.
+    fn log_stderr_tail(stderr_path: &Path) {
+        let tail = std::fs::File::open(stderr_path)
+            .and_then(|mut file| {
+                use std::io::{Read, Seek, SeekFrom};
+                let len = file.metadata()?.len();
+                let start = len.saturating_sub(STDERR_TAIL_BYTES);
+                file.seek(SeekFrom::Start(start))?;
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)?;
+                Ok::<_, std::io::Error>(buf)
+            })
+            .unwrap_or_default();
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            eprintln!("[clinch:browser] chromium stderr tail: {tail}");
+        }
+    }
+
     /// Launch a separate headed Chromium with a persistent app-owned profile.
     ///
     /// # Errors
@@ -259,39 +377,39 @@ impl ManagedBrowser {
         profile: &Path,
         options: LaunchOptions,
     ) -> Result<Self, BrowserError> {
-        tokio::fs::create_dir_all(profile)
-            .await
-            .map_err(|_| BrowserError::Launch)?;
+        tokio::fs::create_dir_all(profile).await.map_err(|error| {
+            log_launch_stage("profile_dir_create", &error);
+            BrowserError::Launch
+        })?;
         // Stale endpoint files must not connect us to an unrelated earlier process.
         let endpoint_file = profile.join("DevToolsActivePort");
         match tokio::fs::remove_file(&endpoint_file).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(BrowserError::Launch),
+            Err(error) => {
+                log_launch_stage("stale_endpoint_remove", &error);
+                return Err(BrowserError::Launch);
+            }
         }
-        let mut command = Command::new(executable);
-        command
-            .args([
-                "--remote-debugging-port=0",
-                "--remote-debugging-address=127.0.0.1",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ])
-            .arg(format!("--user-data-dir={}", profile.display()))
-            .arg("about:blank")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        for arg in window_mode_args(options.mode) {
-            command.arg(arg);
-        }
-        // Hide the helper console, but keep the requested interactive browser window.
-        #[cfg(target_os = "windows")]
-        command.creation_flags(0x0800_0000);
-        let child = command.spawn().map_err(|_| BrowserError::Launch)?;
+        // Cold-start retry: the first attempt may time out while Windows
+        // finishes a cold launch (Defender rescan, cold cache, profile
+        // init after a force-killed predecessor). The timed-out child is
+        // reaped by `kill_on_drop`; the retry runs warmer.
+        let mut attempt = 0;
+        let (child, endpoint) = loop {
+            attempt += 1;
+            match Self::spawn_and_wait_endpoint(executable, profile, options, &endpoint_file).await
+            {
+                Ok(launched) => break launched,
+                Err(BrowserError::Timeout) if attempt < ENDPOINT_ATTEMPTS => {
+                    eprintln!(
+                        "[clinch:browser] devtools endpoint timeout \
+                         (attempt {attempt}/{ENDPOINT_ATTEMPTS}); retrying launch"
+                    );
+                }
+                Err(other) => return Err(other),
+            }
+        };
         // Off-screen headed owns real windows: hide them best-effort so no
         // taskbar button or Alt+Tab entry appears. Detached: the top-level
         // window can appear seconds after spawn on a cold start, and
@@ -308,27 +426,16 @@ impl ManagedBrowser {
                     tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
             });
         }
-        let endpoint = tokio::time::timeout(IO_TIMEOUT, async {
-            loop {
-                if let Ok(contents) = tokio::fs::read_to_string(&endpoint_file).await {
-                    let mut lines = contents.lines();
-                    if let (Some(port), Some(path)) = (lines.next(), lines.next())
-                        && let Ok(port) = port.parse::<u16>()
-                        && port != 0
-                        && path.starts_with("/devtools/browser/")
-                    {
-                        return format!("ws://127.0.0.1:{port}{path}");
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(ENDPOINT_POLL_MS)).await;
-            }
-        })
-        .await
-        .map_err(|_| BrowserError::Timeout)?;
         let (browser, mut handler) = tokio::time::timeout(IO_TIMEOUT, Browser::connect(endpoint))
             .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
+            .map_err(|_| {
+                eprintln!("[clinch:browser] launch failed at stage=cdp_connect (timeout)");
+                BrowserError::Timeout
+            })?
+            .map_err(|error| {
+                eprintln!("[clinch:browser] launch failed at stage=cdp_connect: {error:?}");
+                BrowserError::Connection
+            })?;
         let task = tokio::spawn(async move {
             // Owned by ManagedBrowser; command futures expose connection failures.
             while let Some(result) = handler.next().await {
@@ -339,6 +446,7 @@ impl ManagedBrowser {
         });
         let Ok(Ok(page)) = tokio::time::timeout(IO_TIMEOUT, browser.new_page("about:blank")).await
         else {
+            eprintln!("[clinch:browser] launch failed at stage=new_page");
             task.abort();
             return Err(BrowserError::Connection);
         };
@@ -360,8 +468,14 @@ impl ManagedBrowser {
         script.run_immediately = Some(true);
         tokio::time::timeout(IO_TIMEOUT, managed.page.execute(script))
             .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
+            .map_err(|_| {
+                eprintln!("[clinch:browser] launch failed at stage=stealth_script (timeout)");
+                BrowserError::Timeout
+            })?
+            .map_err(|error| {
+                eprintln!("[clinch:browser] launch failed at stage=stealth_script: {error:?}");
+                BrowserError::Connection
+            })?;
         // Initial paint so the screencast preview never shows a black box:
         // best-effort by design — a failed ready paint leaves `about:blank`
         // rather than failing launch.

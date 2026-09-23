@@ -52,7 +52,7 @@ const OLLAMA_MODEL: &str = "qwen2.5:1.5b";
 
 /// The single instruction both providers receive. It names no sites — the
 /// only site knowledge in the whole call is the one slot in the user line.
-const SYSTEM_PROMPT: &str = "You are a domain grounder. Given a site name and an ISO region code, reply with ONLY a JSON object like {\"domain\": \"amazon.in\"} containing a bare domain name: no scheme, no path, no credentials, no explanation, no other text.";
+const SYSTEM_PROMPT: &str = "You are a domain grounder. Given a site name and an ISO region code, reply with ONLY a JSON object like {\"domain\": \"amazon.in\"} containing a bare domain name: no scheme, no path, no credentials, no explanation, no other text. If you are unsure, make your best guess — never return an empty object.";
 
 /// Which live provider backs the grounder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,17 +486,21 @@ impl DomainGrounder for LlmDomainGrounder {
             // HTTP 200 but nothing usable came back. This used to die
             // silent as a "clean decline"; surface the raw model output
             // (debug-formatted and truncated) so the terminal and the
-            // journal show what the model actually emitted.
+            // journal show what the model actually emitted. An empty
+            // object is the model's abstention, not a parse failure —
+            // name it so the journal distinguishes the two.
             let preview: String = content.chars().take(300).collect();
             let preview = if content.chars().count() > 300 {
                 format!("{preview}…")
             } else {
                 preview
             };
-            self.record_error(format!(
-                "{} returned unparseable content: {preview:?}",
-                self.provider.as_str()
-            ));
+            let kind = if content.trim() == "{}" {
+                "returned an empty object instead of grounding"
+            } else {
+                "returned unparseable content"
+            };
+            self.record_error(format!("{} {kind}: {preview:?}", self.provider.as_str()));
             None
         }
     }
@@ -707,6 +711,28 @@ mod tests {
             panic!("unparseable content records a diagnostic");
         };
         assert!(err.contains("unparseable"), "unexpected detail: {err}");
+        assert!(
+            !err.contains("test-key"),
+            "detail must never echo credentials"
+        );
+    }
+
+    #[test]
+    fn groq_empty_object_records_abstention() {
+        // The `{}` failure: valid JSON, but the model abstained instead of
+        // grounding. Must decline with a diagnostic naming the abstention —
+        // not the generic "unparseable" label.
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": "{}"}}],
+        })
+        .to_string();
+        let base = mock_base(envelope);
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
+        assert_eq!(grounder.ground_domain("x", "IN"), None);
+        let Some(err) = grounder.last_error() else {
+            panic!("empty object records a diagnostic");
+        };
+        assert!(err.contains("empty object"), "unexpected detail: {err}");
         assert!(
             !err.contains("test-key"),
             "detail must never echo credentials"
