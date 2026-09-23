@@ -2154,7 +2154,14 @@ impl AppService {
                 .await;
         };
         let shortcut_store = orchestration_engine::InMemoryShortcuts::new(shortcuts);
-        let site_search = orchestration_engine::BraveSiteSearch::from_env();
+        // Composite directory rung: Brave's sanctioned search API when
+        // `CLINCH_BRAVE_API_KEY` is set, DuckDuckGo's keyless HTML endpoint
+        // as the zero-config fallback. Backend HTTP in memory only — the
+        // browser never sees a search page. The rung is never unconfigured
+        // (DDG works out of the box), so the miss line names which backends
+        // were tried instead of a setup hint.
+        let site_search = orchestration_engine::ChainedSiteSearch::new();
+        let directory_label = site_search.backend_label();
         // Fenced domain grounder: an LLM-backed adapter when
         // `CLINCH_GROUNDER_PROVIDER` selects one — `groq` reads its key from
         // `GROQ_API_KEY`, `ollama` talks to the local daemon — and the
@@ -2165,9 +2172,10 @@ impl AppService {
         let region_hint = orchestration_engine::system_region_hint();
         // Captured before the blocking-thread move below: the miss line
         // names which ladder rungs were even live, so an unconfigured
-        // grounder reads as a setup hint rather than a dead end.
+        // grounder reads as a setup hint rather than a dead end. The
+        // directory rung is always live (DDG keyless fallback); the label
+        // names which backends the chain tried.
         let grounder_configured = live_grounder.is_some();
-        let site_search_configured = site_search.is_some();
         // The directory rung is synchronous network I/O (bounded at ten
         // seconds by the agent config). It runs on a blocking thread so it
         // can never stall the async runtime's workers; everything the
@@ -2187,9 +2195,7 @@ impl AppService {
                 llm: None,
                 parser: None,
                 shortcuts: Some(&shortcut_store),
-                site_search: site_search
-                    .as_ref()
-                    .map(|client| client as &dyn orchestration_engine::SiteSearchClient),
+                site_search: Some(&site_search as &dyn orchestration_engine::SiteSearchClient),
                 domain_grounder: Some(domain_grounder),
                 region_hint: region_hint.as_str(),
             };
@@ -2294,11 +2300,7 @@ impl AppService {
                 } else {
                     "grounder attempted, no domain returned".to_owned()
                 };
-                let directory_state = if site_search_configured {
-                    "directory attempted, no match"
-                } else {
-                    "directory unconfigured"
-                };
+                let directory_state = format!("directory attempted ({directory_label}), no match");
                 format!(
                     "route_resolution_miss: prompt='{prompt}' · {grounder_state} · {directory_state} — try the full domain (open amazon.in) or save a site shortcut"
                 )

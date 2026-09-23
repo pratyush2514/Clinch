@@ -24,11 +24,11 @@ pub use intent_resolver::{
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use route_proposer::{
-    BraveSiteSearch, DomainGrounder, InMemoryShortcuts, LlmUrlProposer, ResolutionContext,
-    ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore, SiteSearchClient, SlotSource,
-    StubDomainGrounder, explicit_url_in_prompt, region_hint_from_timezone, resolve_entry_url,
-    resolve_slots, sanitize_search_query, search_fallback_url, system_region_hint,
-    validate_grounded_domain,
+    BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,
+    LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,
+    SiteSearchClient, SlotSource, StubDomainGrounder, explicit_url_in_prompt,
+    region_hint_from_timezone, resolve_entry_url, resolve_slots, sanitize_search_query,
+    search_fallback_url, system_region_hint, validate_grounded_domain,
 };
 pub use runner::{
     IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,

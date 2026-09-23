@@ -305,6 +305,182 @@ impl SiteSearchClient for BraveSiteSearch {
     }
 }
 
+/// `DuckDuckGo`'s no-JS HTML endpoint as a [`SiteSearchClient`]: keyless,
+/// best-effort, zero-config.
+///
+/// No API key, no signup — a plain blocking GET to the HTML endpoint with
+/// a browser user-agent, parsed in memory. The browser never sees a search
+/// page; only the extracted target URL leaves this module.
+///
+/// Honesty notes, read before relying on this rung: DDG throttles
+/// programmatic clients per IP (HTTP 202 / anomaly pages under load), the
+/// markup can change without notice, and scraping is ToS-gray. Every one
+/// of those failure modes is `None`, which falls through to the next
+/// ladder rung — never a guess. The sanctioned upgrade is
+/// [`BraveSiteSearch`] when `CLINCH_BRAVE_API_KEY` is set.
+pub struct DuckDuckGoSiteSearch {
+    agent: ureq::Agent,
+}
+
+impl DuckDuckGoSiteSearch {
+    /// Keyless constructor: nothing to configure.
+    #[must_use]
+    pub fn new() -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .into();
+        Self { agent }
+    }
+}
+
+impl Default for DuckDuckGoSiteSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `DuckDuckGo` HTML endpoint and a browser user-agent: without the latter
+/// DDG serves the anomaly page to programmatic clients.
+const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/?q=";
+const DDG_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// Pull the first organic result URL out of a `DuckDuckGo` HTML response.
+/// Pure so tests prove the parsing without network.
+///
+/// Result anchors look like
+/// `<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=<pct-encoded>&amp;rut=…">`.
+/// The `uddg` query param is the real target, percent-encoded. Anchors
+/// whose target is DDG's own ad redirect (`/y.js`) are skipped — ads are
+/// not organic results, and taking one would route the user to an ad
+/// network instead of the site they named.
+fn ddg_top_url(html: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(a_at) = rest.find("<a") {
+        let after_a = &rest[a_at + 2..];
+        // `<a` must be followed by whitespace or `>`: skip `<abbr` etc.
+        if !after_a
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+        {
+            rest = after_a;
+            continue;
+        }
+        let tag = after_a.split('>').next()?;
+        rest = &after_a[tag.len()..];
+        if !tag.contains("result__a") {
+            continue;
+        }
+        let href = ddg_href(tag)?;
+        let target = ddg_unwrap_target(href)?;
+        // Ad redirect: DDG wraps paid results in its own `/y.js` click
+        // tracker. Never an organic destination.
+        if target.contains("duckduckgo.com/y.js") {
+            continue;
+        }
+        if target.starts_with("https://") || target.starts_with("http://") {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// The `href="…"` value of an anchor tag, or `None`.
+fn ddg_href(tag: &str) -> Option<&str> {
+    let after = tag.split("href=\"").nth(1)?;
+    after.split('"').next()
+}
+
+/// Resolve a DDG result href to its target URL: unwrap the `/l/?uddg=`
+/// redirect wrapper (percent-decoded), or pass a direct link through.
+fn ddg_unwrap_target(href: &str) -> Option<String> {
+    let href = href.replace("&amp;", "&");
+    if let Some((_, query)) = href.split_once('?') {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key == "uddg" {
+                return Some(value.into_owned());
+            }
+        }
+    }
+    if href.starts_with("https://") || href.starts_with("http://") {
+        return Some(href);
+    }
+    None
+}
+
+impl SiteSearchClient for DuckDuckGoSiteSearch {
+    fn search_site(&self, site_name: &str) -> Option<String> {
+        let query: String = url::form_urlencoded::byte_serialize(site_name.as_bytes()).collect();
+        let response = self
+            .agent
+            .get(&format!("{DDG_HTML_ENDPOINT}{query}"))
+            .header("User-Agent", DDG_USER_AGENT)
+            .call()
+            .ok()?;
+        // DDG throttles programmatic clients with HTTP 202 anomaly pages:
+        // only a 200 carries results. Anything else falls through to the
+        // next ladder rung.
+        if response.status() != 200 {
+            return None;
+        }
+        let html = response.into_body().read_to_string().ok()?;
+        ddg_top_url(&html)
+    }
+}
+
+/// The composite directory rung: Brave's sanctioned search API when
+/// `CLINCH_BRAVE_API_KEY` is configured, `DuckDuckGo`'s keyless HTML
+/// endpoint as the zero-config fallback.
+///
+/// One [`SiteSearchClient`] so the ladder keeps a single directory rung:
+/// shortcut → directory → grounder → honest miss. The LLM grounder stays
+/// below the directory either way — ranking is the ground truth of what a
+/// site name means; a generative guess cannot outrank it.
+pub struct ChainedSiteSearch {
+    primary: Option<BraveSiteSearch>,
+    fallback: DuckDuckGoSiteSearch,
+}
+
+impl ChainedSiteSearch {
+    /// Build from the environment: Brave when its key is present, `DuckDuckGo`
+    /// always. The directory rung is therefore never "unconfigured".
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            primary: BraveSiteSearch::from_env(),
+            fallback: DuckDuckGoSiteSearch::new(),
+        }
+    }
+
+    /// Which backends this chain will try, for the miss journal line.
+    #[must_use]
+    pub fn backend_label(&self) -> &'static str {
+        if self.primary.is_some() {
+            "brave→ddg"
+        } else {
+            "ddg"
+        }
+    }
+}
+
+impl Default for ChainedSiteSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SiteSearchClient for ChainedSiteSearch {
+    fn search_site(&self, site_name: &str) -> Option<String> {
+        if let Some(primary) = &self.primary
+            && let Some(url) = primary.search_site(site_name)
+        {
+            return Some(url);
+        }
+        self.fallback.search_site(site_name)
+    }
+}
+
 /// A fenced domain grounder: a site name in, a bare domain out.
 ///
 /// This is the Muse-like rung. The caller passes only the already-parsed
@@ -658,8 +834,11 @@ pub fn resolve_entry_url(
         {
             return Some(route);
         }
-        // 3b. Structured site directory, only when a key is configured.
-        // This rung runs BEFORE the LLM grounder: a search API returns
+        // 3b. Structured site directory, composite: Brave's sanctioned API
+        // when `CLINCH_BRAVE_API_KEY` is set, DuckDuckGo's keyless HTML
+        // endpoint as the zero-config fallback (`ChainedSiteSearch`). Either
+        // way the rung is never unconfigured — DDG works out of the box.
+        // This rung runs BEFORE the LLM grounder: a search backend returns
         // ranked results as data, and ranking is the ground truth of what
         // a site name means — it cannot hallucinate the way a generative
         // model can (`claude` → `open.com`). The call is backend HTTP in
@@ -685,7 +864,8 @@ pub fn resolve_entry_url(
             return Some(route);
         }
         // 3c. Fenced domain grounder: site slot + region hint → bare domain.
-        // Fallback when no directory key is configured. The grounder sees
+        // Fallback when the directory finds nothing (or is throttled —
+        // both backends degrade to `None`, never a guess). The grounder sees
         // only the normalized site name and the region code, never the raw
         // prompt. Its output is validated in Rust (https, valid TLD, no
         // credentials, no raw IP) before navigation. A malformed response
@@ -1363,5 +1543,72 @@ mod tests {
         if key.is_none_or(|key| key.trim().is_empty()) {
             assert!(BraveSiteSearch::from_env().is_none());
         }
+    }
+
+    /// Fixture shaped like the live HTML endpoint: a paid ad anchor first,
+    /// then organic results. The parser must skip the ad and unwrap the
+    /// `uddg` param of the first organic hit.
+    const DDG_FIXTURE: &str = r#"
+<div class="result results_links results_links_deep result--ad ">
+  <div class="links_main links_deep result__body">
+    <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dask%252Dchat.ai&amp;rut=aaa">Ad</a></h2>
+  </div>
+</div>
+<div class="result results_links results_links_deep web-result ">
+  <div class="links_main links_deep result__body">
+    <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fclaude.com%2F&amp;rut=bbb">Claude</a></h2>
+  </div>
+</div>
+<div class="result results_links results_links_deep web-result ">
+  <div class="links_main links_deep result__body">
+    <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FClaude&amp;rut=ccc">Wikipedia</a></h2>
+  </div>
+</div>
+"#;
+
+    #[test]
+    fn ddg_top_url_skips_ads_and_unwraps_uddg() {
+        assert_eq!(
+            ddg_top_url(DDG_FIXTURE).as_deref(),
+            Some("https://claude.com/")
+        );
+    }
+
+    #[test]
+    fn ddg_top_url_returns_none_without_organic_results() {
+        // Ad-only page: paid results are never destinations.
+        let ads_only = r#"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dx&amp;rut=a">Ad</a>"#;
+        assert_eq!(ddg_top_url(ads_only), None);
+        // Anomaly / throttle page and empty bodies carry no results.
+        assert_eq!(ddg_top_url(""), None);
+        assert_eq!(ddg_top_url("<html><body>anomaly</body></html>"), None);
+    }
+
+    #[test]
+    fn ddg_unwrap_target_decodes_and_passes_through() {
+        assert_eq!(
+            ddg_unwrap_target("//duckduckgo.com/l/?uddg=https%3A%2F%2Fclaude.com%2F&amp;rut=x")
+                .as_deref(),
+            Some("https://claude.com/")
+        );
+        // Direct links pass through; junk is rejected.
+        assert_eq!(
+            ddg_unwrap_target("https://example.com/").as_deref(),
+            Some("https://example.com/")
+        );
+        assert_eq!(ddg_unwrap_target("/relative/path"), None);
+        assert_eq!(ddg_unwrap_target("javascript:void(0)"), None);
+    }
+
+    #[test]
+    fn chained_site_search_always_offers_ddg() {
+        // The composite rung is never "unconfigured": even without a Brave
+        // key the keyless fallback is present. (No network in tests — only
+        // the wiring is asserted here.)
+        let chain = ChainedSiteSearch {
+            primary: None,
+            fallback: DuckDuckGoSiteSearch::new(),
+        };
+        assert_eq!(chain.backend_label(), "ddg");
     }
 }
