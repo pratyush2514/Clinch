@@ -293,14 +293,20 @@ impl ManagedBrowser {
         command.creation_flags(0x0800_0000);
         let child = command.spawn().map_err(|_| BrowserError::Launch)?;
         // Off-screen headed owns real windows: hide them best-effort so no
-        // taskbar button or Alt+Tab entry appears. A brief flicker before
-        // the hide lands is accepted and documented; failure just leaves
-        // the off-screen window in place.
+        // taskbar button or Alt+Tab entry appears. Detached: the top-level
+        // window can appear seconds after spawn on a cold start, and
+        // blocking launch on the sweep would stall the escalation that is
+        // already time-boxed. A second sweep runs after escalation settles
+        // (`ManagedBrowser::hide_windows`); a brief flicker before a sweep
+        // lands is accepted and documented.
         #[cfg(windows)]
         if options.mode == WindowMode::Offscreen
             && let Some(pid) = child.id()
         {
-            let _ = tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
+            tokio::task::spawn(async move {
+                let _ =
+                    tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
+            });
         }
         let endpoint = tokio::time::timeout(IO_TIMEOUT, async {
             loop {
@@ -561,6 +567,29 @@ impl ManagedBrowser {
             let _ = child.start_kill();
         }
     }
+
+    /// Re-run the best-effort Win32 window hide for this session's process.
+    /// Catches top-level windows that appeared after the launch-time sweep
+    /// (slow cold starts). Used after challenge escalation settles, so a
+    /// persistent challenge never leaves a taskbar button while it waits
+    /// for L2 Take Control. No-op off Windows.
+    #[cfg(windows)]
+    pub async fn hide_windows(&self) {
+        let pid = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|child| child.id()));
+        if let Some(pid) = pid {
+            let _ = tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
+        }
+    }
+
+    /// No-op off Windows: there is no top-level window to hide. `async` is
+    /// kept so call sites don't need platform gates.
+    #[cfg(not(windows))]
+    #[allow(clippy::unused_async)]
+    pub async fn hide_windows(&self) {}
 }
 
 impl Drop for ManagedBrowser {

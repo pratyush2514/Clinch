@@ -122,7 +122,9 @@ impl ManagedBrowser {
                 .page
                 .evaluate("[window.innerWidth,window.innerHeight]")
                 .await
-                .map_err(|_| BrowserError::Connection)?
+                // A navigation committing mid-capture destroys the execution
+                // context; report the retryable race, not a dead connection.
+                .map_err(crate::actions::evaluation_error)?
                 .into_value::<[f64; 2]>()
                 .map_err(|_| BrowserError::Connection)?;
             let params = CaptureScreenshotParams::builder()

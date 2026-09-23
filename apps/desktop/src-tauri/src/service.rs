@@ -1864,6 +1864,11 @@ impl AppService {
                     // The pre-escalation frame shows the interstitial; show
                     // the cleared page instead.
                     outcome.final_frame = self.capture_final_frame().await;
+                    // The headed session's job is done: shut it down
+                    // gracefully so no phantom window lingers. Clearance
+                    // persists in the app profile on disk, so the next
+                    // acquisition lazily launches headless again.
+                    self.stand_down_escalated_browser().await;
                 }
                 Ok(false) => {
                     self.journal_line(format!("challenge_auto_escalated: {host} · persistent"))
@@ -3223,13 +3228,39 @@ impl AppService {
     /// settling run's final frame. Peeks at the live session without
     /// launching: `None` when no browser is attached or capture fails. The
     /// run outcome is never affected by a capture failure.
+    ///
+    /// A capture raced by a committing navigation fails with
+    /// [`browser_driver::BrowserError::PageChanging`]; one retry after a
+    /// short settle covers that. Any remaining failure is journaled with a
+    /// static label — never the error's Debug, which could carry a payload —
+    /// so a missing preview stays diagnosable instead of silently empty.
     async fn capture_final_frame(&self) -> Option<String> {
         let browser = self
             .browser
             .lock()
             .ok()
             .and_then(|guard| (*guard).clone())?;
-        browser.viewport().await.ok().map(|viewport| viewport.data)
+        let mut attempt = browser.viewport().await;
+        if matches!(attempt, Err(browser_driver::BrowserError::PageChanging)) {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            attempt = browser.viewport().await;
+        }
+        match attempt {
+            Ok(viewport) => Some(viewport.data),
+            Err(error) => {
+                let label = match error {
+                    browser_driver::BrowserError::Timeout => "timeout",
+                    browser_driver::BrowserError::Connection => "connection",
+                    browser_driver::BrowserError::PageChanging => "page changing",
+                    browser_driver::BrowserError::Launch => "launch",
+                    browser_driver::BrowserError::InvalidAction => "invalid action",
+                    _ => "unexpected",
+                };
+                self.journal_line(format!("final_frame_capture_failed: {label}"))
+                    .await;
+                None
+            }
+        }
     }
 
     /// Best-effort bot-challenge verdict on the attached browser's live
@@ -3244,6 +3275,24 @@ impl AppService {
             .ok()
             .and_then(|guard| (*guard).clone())?;
         browser.challenge_detected().await
+    }
+
+    /// Gracefully shut down the attached (headed, post-escalation) browser
+    /// and detach it, so the next acquisition lazily launches headless. The
+    /// app profile on disk keeps any clearance cookies; a fresh challenge
+    /// simply escalates again. Only used after a *cleared* escalation — a
+    /// persistent challenge keeps the headed session alive for L2 Take
+    /// Control.
+    async fn stand_down_escalated_browser(&self) {
+        let previous = self.browser.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(browser) = previous {
+            // Best-effort: the run already completed. A failed shutdown is
+            // journaled so a lingering headed process stays visible.
+            if browser.shutdown().await.is_err() {
+                self.journal_line("challenge_browser_shutdown_failed".to_string())
+                    .await;
+            }
+        }
     }
 
     /// L1 challenge escalation: restart the attached session as off-screen
@@ -3291,9 +3340,16 @@ impl AppService {
                 .flatten()
                 .and_then(|url| url.host_str().map(str::to_owned));
             if live_host == expected_host && browser.challenge_detected().await.is_none() {
+                // Slow cold starts can create the top-level window after the
+                // launch-time sweep; hide again now that the outcome is known.
+                browser.hide_windows().await;
                 return Ok(true);
             }
             if std::time::Instant::now() >= deadline {
+                // Same re-hide as on clearance: the headed session stays
+                // attached for L2 Take Control, and must not leave a
+                // taskbar button while it waits for the user.
+                browser.hide_windows().await;
                 return Ok(false);
             }
         }

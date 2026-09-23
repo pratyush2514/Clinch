@@ -52,13 +52,15 @@ unsafe extern "system" fn hide_callback(h_wnd: HWND, l_param: LPARAM) -> BOOL {
     TRUE
 }
 
-/// Hide visible top-level windows owned by `pid`, retrying briefly: the
-/// browser window typically appears within a few hundred ms of spawn.
+/// Hide visible top-level windows owned by `pid`, retrying: the browser
+/// window usually appears within a few hundred ms of spawn, but a cold
+/// start can take seconds — the sweep breaks early on the first success,
+/// so the long budget only costs time when the window never appears.
 /// Returns the number hidden. Best-effort by design — a zero just leaves
 /// the off-screen (but taskbar-listed) window where it is.
 pub fn hide_process_windows(pid: u32) -> u32 {
     let mut ctx = HideContext { pid, hidden: 0 };
-    for _ in 0..20 {
+    for _ in 0..60 {
         // SAFETY: `hide_callback` only dereferences the context pointer for
         // the duration of this call; nothing escapes.
         unsafe {
@@ -67,7 +69,7 @@ pub fn hide_process_windows(pid: u32) -> u32 {
         if ctx.hidden > 0 {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
     ctx.hidden
 }

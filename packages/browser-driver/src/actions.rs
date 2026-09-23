@@ -84,7 +84,11 @@ struct Resolution {
     target: Option<Highlight>,
 }
 
-fn evaluation_error(error: chromiumoxide::error::CdpError) -> BrowserError {
+/// Map a CDP evaluation failure to the right [`BrowserError`]: a navigation
+/// destroying the JS execution context mid-read is a retryable race, not a
+/// dead connection. Shared with the viewport preview so a capture raced by
+/// a committing navigation reports the same retryable error.
+pub(crate) fn evaluation_error(error: chromiumoxide::error::CdpError) -> BrowserError {
     use chromiumoxide::error::CdpError;
     match error {
         CdpError::Chrome(error)
