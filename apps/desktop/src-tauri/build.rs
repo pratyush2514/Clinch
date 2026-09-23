@@ -29,10 +29,27 @@ fn main() {
 /// source archives without git metadata fall back to a build nonce, and the
 /// build itself never fails over identity.
 fn stamp_build_hash() {
-    for candidate in ["../../.git/HEAD", "../../.git/refs/heads"] {
-        if std::path::Path::new(candidate).exists() {
-            println!("cargo:rerun-if-changed={candidate}");
+    // Build scripts run with the package root (`apps/desktop/src-tauri`) as
+    // CWD, so the worktree's git dir is three levels up. Re-stamp whenever
+    // the checkout moves: `git pull --ff-only` rewrites the branch ref
+    // without touching HEAD's symref, so watch HEAD, the ref it points at,
+    // and packed-refs (which covers packed branch refs).
+    let git_dir = std::path::Path::new("../../../.git");
+    let head = git_dir.join("HEAD");
+    if head.exists() {
+        println!("cargo:rerun-if-changed={}", head.display());
+        if let Ok(target) = std::fs::read_to_string(&head)
+            && let Some(ref_path) = target.strip_prefix("ref:")
+        {
+            let ref_file = git_dir.join(ref_path.trim());
+            if ref_file.exists() {
+                println!("cargo:rerun-if-changed={}", ref_file.display());
+            }
         }
+    }
+    let packed = git_dir.join("packed-refs");
+    if packed.exists() {
+        println!("cargo:rerun-if-changed={}", packed.display());
     }
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
