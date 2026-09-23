@@ -74,6 +74,14 @@ impl GrounderProvider {
             _ => None,
         }
     }
+
+    /// Short name used in diagnostics.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Groq => "groq",
+            Self::Ollama => "ollama",
+        }
+    }
 }
 
 /// Raw environment values for grounder construction. [`LlmDomainGrounder::from_env`]
@@ -385,15 +393,40 @@ fn groq_error_code(excerpt: &str) -> Option<String> {
 /// non-string `domain` — is `None`, and the ladder degrades to its next
 /// rung. This parses only; [`crate::route_proposer::validate_grounded_domain`]
 /// decides whether the domain may be navigated.
+/// Pull the `domain` slot out of one JSON object string.
+fn parse_domain(object: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(object).ok()?;
+    value.get("domain")?.as_str().map(str::to_owned)
+}
+
 fn extract_domain(content: &str) -> Option<String> {
     let trimmed = content.trim();
+    // Models decorate the JSON they were asked to emit bare: strip a
+    // surrounding markdown fence, then surrounding quotes, then whitespace.
     let unfenced = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .and_then(|rest| rest.strip_suffix("```"))
         .map_or(trimmed, str::trim);
-    let value: serde_json::Value = serde_json::from_str(unfenced).ok()?;
-    value.get("domain")?.as_str().map(str::to_owned)
+    let unquoted = unfenced
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            unfenced
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .map_or(unfenced, str::trim);
+    // Whole-string parse first (the contract), then a salvage pass over the
+    // first `{`…last `}` span, for models that wrap the JSON in prose.
+    parse_domain(unquoted).or_else(|| {
+        let start = unquoted.find('{')?;
+        let end = unquoted.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        parse_domain(unquoted[start..=end].trim())
+    })
 }
 
 impl DomainGrounder for LlmDomainGrounder {
@@ -413,7 +446,25 @@ impl DomainGrounder for LlmDomainGrounder {
             GrounderProvider::Groq => self.groq_completion(site, region_hint.trim()),
             GrounderProvider::Ollama => self.ollama_generate(site, region_hint.trim()),
         }?;
-        extract_domain(&content)
+        if let Some(domain) = extract_domain(&content) {
+            Some(domain)
+        } else {
+            // HTTP 200 but nothing usable came back. This used to die
+            // silent as a "clean decline"; surface the raw model output
+            // (debug-formatted and truncated) so the terminal and the
+            // journal show what the model actually emitted.
+            let preview: String = content.chars().take(300).collect();
+            let preview = if content.chars().count() > 300 {
+                format!("{preview}…")
+            } else {
+                preview
+            };
+            self.record_error(format!(
+                "{} returned unparseable content: {preview:?}",
+                self.provider.as_str()
+            ));
+            None
+        }
     }
 }
 
@@ -521,6 +572,26 @@ mod tests {
     }
 
     #[test]
+    fn extract_domain_salvages_decorated_json() {
+        // Quoted JSON.
+        assert_eq!(
+            extract_domain(r#""{"domain": "amazon.in"}""#).as_deref(),
+            Some("amazon.in")
+        );
+        // Prose wrapped around the JSON.
+        assert_eq!(
+            extract_domain("Here is the domain:\n{\"domain\": \"amazon.in\"}\nHope this helps!")
+                .as_deref(),
+            Some("amazon.in")
+        );
+        // Fence plus prose.
+        assert_eq!(
+            extract_domain("```json\n{\"domain\":\"amazon.in\"}\n```").as_deref(),
+            Some("amazon.in")
+        );
+    }
+
+    #[test]
     fn extract_domain_rejects_everything_else() {
         assert_eq!(extract_domain("amazon.in"), None);
         assert_eq!(extract_domain(""), None);
@@ -554,8 +625,9 @@ mod tests {
     }
 
     #[test]
-    fn groq_wrong_shape_declines() {
-        // Valid JSON, but no usable `domain`: still a decline.
+    fn groq_wrong_shape_declines_but_records_content() {
+        // Valid JSON, but no usable `domain`: still a decline — and now the
+        // raw model output is surfaced instead of dying silent.
         let envelope = serde_json::json!({
             "choices": [{"message": {"content": "{\"url\": \"https://amazon.in\"}"}}],
         })
@@ -563,8 +635,14 @@ mod tests {
         let base = mock_base(envelope);
         let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
         assert_eq!(grounder.ground_domain("amazon", "IN"), None);
-        // A clean decline is not a provider failure: nothing to diagnose.
-        assert_eq!(grounder.last_error(), None);
+        let Some(err) = grounder.last_error() else {
+            panic!("unparseable content records a diagnostic");
+        };
+        assert!(err.contains("unparseable"), "unexpected detail: {err}");
+        assert!(
+            !err.contains("test-key"),
+            "detail must never echo credentials"
+        );
     }
 
     #[test]
