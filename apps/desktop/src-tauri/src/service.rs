@@ -1836,7 +1836,7 @@ impl AppService {
         // pre-navigation session and does not survive cross-origin
         // navigation, so without this the settled card freezes on the
         // launch placeholder instead of showing the destination.
-        outcome.final_frame = self.capture_final_frame().await;
+        self.attach_final_frame(&mut outcome).await;
         // A completed run that landed on a human-verification gate is not
         // a silent success. L1: try the automatic off-screen headed
         // escalation first (zero clicks); only a persistent challenge keeps
@@ -1863,7 +1863,7 @@ impl AppService {
                     });
                     // The pre-escalation frame shows the interstitial; show
                     // the cleared page instead.
-                    outcome.final_frame = self.capture_final_frame().await;
+                    self.attach_final_frame(&mut outcome).await;
                     // The headed session's job is done: shut it down
                     // gracefully so no phantom window lingers. Clearance
                     // persists in the app profile on disk, so the next
@@ -3226,40 +3226,79 @@ impl AppService {
 
     /// Best-effort one-shot viewport capture of the attached browser, for a
     /// settling run's final frame. Peeks at the live session without
-    /// launching: `None` when no browser is attached or capture fails. The
-    /// run outcome is never affected by a capture failure.
+    /// launching. Returns the frame plus, when capture fails, a static
+    /// failure label so the caller can surface the cause on the outcome —
+    /// the run outcome itself is never affected by a capture failure.
     ///
     /// A capture raced by a committing navigation fails with
-    /// [`browser_driver::BrowserError::PageChanging`]; one retry after a
-    /// short settle covers that. Any remaining failure is journaled with a
-    /// static label — never the error's Debug, which could carry a payload —
-    /// so a missing preview stays diagnosable instead of silently empty.
-    async fn capture_final_frame(&self) -> Option<String> {
-        let browser = self
-            .browser
-            .lock()
-            .ok()
-            .and_then(|guard| (*guard).clone())?;
+    /// [`browser_driver::BrowserError::PageChanging`]; a bounded settle
+    /// poll plus retries cover a still-loading page. Any remaining failure
+    /// is journaled with a static label — never the error's Debug, which
+    /// could carry a payload — so a missing preview stays diagnosable
+    /// instead of silently empty.
+    async fn capture_final_frame(&self) -> (Option<String>, Option<String>) {
+        let browser = self.browser.lock().ok().and_then(|guard| (*guard).clone());
+        let Some(browser) = browser else {
+            return (None, None);
+        };
+        // Settle: don't photograph a half-loaded page. Bounded and
+        // fail-open — a dead page reads as complete, and the attempt below
+        // surfaces the real error with its label.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !browser.document_complete().await {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        // A capture raced by a committing navigation surfaces as
+        // PageChanging; give the new document a bounded moment to settle,
+        // then retry. Other failures get no retry: the page is gone or the
+        // connection is broken, and waiting cannot fix that.
         let mut attempt = browser.viewport().await;
-        if matches!(attempt, Err(browser_driver::BrowserError::PageChanging)) {
+        let mut retries = 0;
+        while matches!(attempt, Err(browser_driver::BrowserError::PageChanging)) && retries < 2 {
+            retries += 1;
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             attempt = browser.viewport().await;
         }
         match attempt {
-            Ok(viewport) => Some(viewport.data),
+            Ok(viewport) => (Some(viewport.data), None),
             Err(error) => {
-                let label = match error {
-                    browser_driver::BrowserError::Timeout => "timeout",
-                    browser_driver::BrowserError::Connection => "connection",
-                    browser_driver::BrowserError::PageChanging => "page changing",
-                    browser_driver::BrowserError::Launch => "launch",
-                    browser_driver::BrowserError::InvalidAction => "invalid action",
-                    _ => "unexpected",
-                };
+                let label = Self::final_frame_failure_label(&error);
                 self.journal_line(format!("final_frame_capture_failed: {label}"))
                     .await;
-                None
+                (None, Some(label.to_string()))
             }
+        }
+    }
+
+    /// Static failure label for a final-frame capture error — never the
+    /// error's Debug, which could carry a payload.
+    fn final_frame_failure_label(error: &browser_driver::BrowserError) -> &'static str {
+        match error {
+            browser_driver::BrowserError::Timeout => "timeout",
+            browser_driver::BrowserError::Connection => "connection",
+            browser_driver::BrowserError::PageChanging => "page changing",
+            browser_driver::BrowserError::Launch => "launch",
+            browser_driver::BrowserError::InvalidAction => "invalid action",
+            _ => "unexpected",
+        }
+    }
+
+    /// Attach a final-frame capture to the outcome. A capture failure is
+    /// appended to the card's telemetry as `final_frame_capture_failed:
+    /// <label>` — the journal line alone is invisible in the thread, and a
+    /// settled card with no frame and no explanation reads as broken.
+    async fn attach_final_frame(&self, outcome: &mut DispatchOutcome) {
+        let (frame, failure) = self.capture_final_frame().await;
+        outcome.final_frame = frame;
+        if let Some(label) = failure {
+            let line = format!("final_frame_capture_failed: {label}");
+            outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
+                Some(existing) => format!("{existing}\n{line}"),
+                None => line,
+            });
         }
     }
 
@@ -3505,6 +3544,35 @@ fn default_chromium() -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn final_frame_failure_labels_are_static_and_sanitized() {
+        use browser_driver::BrowserError;
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::Timeout),
+            "timeout"
+        );
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::Connection),
+            "connection"
+        );
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::PageChanging),
+            "page changing"
+        );
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::Launch),
+            "launch"
+        );
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::InvalidAction),
+            "invalid action"
+        );
+        // Payload-carrying variants never leak into the label.
+        assert_eq!(
+            AppService::final_frame_failure_label(&BrowserError::Navigation),
+            "unexpected"
+        );
+    }
     #[tokio::test]
     async fn task_run_requires_a_connected_session_and_exclusive_browser_access()
     -> Result<(), Box<dyn std::error::Error>> {

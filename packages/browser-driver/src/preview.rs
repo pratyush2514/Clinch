@@ -110,6 +110,23 @@ impl ManagedBrowser {
         }
     }
 
+    /// Whether the live document reports `readyState === "complete"`.
+    ///
+    /// Fail-open: any CDP failure reads as complete, so the caller proceeds
+    /// to attempt its read instead of stalling on a dead page — the read
+    /// itself surfaces the real error with its label.
+    pub async fn document_complete(&self) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.page.evaluate("document.readyState === 'complete'"),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .and_then(|value| value.into_value::<bool>().ok())
+        .unwrap_or(true)
+    }
+
     /// Local-only viewport preview in CSS pixels.
     /// # Errors
     /// Returns CDP or capture errors.
