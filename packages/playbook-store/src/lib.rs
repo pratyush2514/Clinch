@@ -40,7 +40,30 @@ pub struct PlaybookSummary {
     /// consumers parsing summaries that predate the field.
     #[serde(default)]
     pub description: Option<String>,
+    /// Normalized prompt this workflow was learned from, if any. Command
+    /// routing reads it to turn a repeated phrasing into an exact match
+    /// instead of a token-overlap race. `#[serde(default)]` keeps older
+    /// consumers parsing summaries that predate the field.
+    #[serde(default)]
+    pub prompt_key: Option<String>,
 }
+
+/// One `playbooks` row fetched by id: `(name, portal_url, steps_json,
+/// description, prompt_key)`. Named so the column order stays reviewable in
+/// one place as the table gains additive columns.
+type PlaybookRow = (String, String, String, Option<String>, Option<String>);
+
+/// One `playbooks` row as listed: [`PlaybookRow`] prefixed by `id` and
+/// suffixed by `updated_at`, matching the summary projection.
+type PlaybookListRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 /// SQLite-backed Playbook repository. Shares the application's single WAL
 /// pool; every write validates first, so stored rows always re-validate.
@@ -68,13 +91,14 @@ impl PlaybookStore {
         playbook.validate()?;
         let steps = serde_json::to_string(&playbook.steps)?;
         sqlx::query(
-            "INSERT INTO playbooks(name, portal_url, steps_json, description, updated_at) VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP) \
-             ON CONFLICT(name) DO UPDATE SET portal_url=excluded.portal_url, steps_json=excluded.steps_json, description=excluded.description, updated_at=CURRENT_TIMESTAMP",
+            "INSERT INTO playbooks(name, portal_url, steps_json, description, prompt_key, updated_at) VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(name) DO UPDATE SET portal_url=excluded.portal_url, steps_json=excluded.steps_json, description=excluded.description, prompt_key=excluded.prompt_key, updated_at=CURRENT_TIMESTAMP",
         )
         .bind(&playbook.name)
         .bind(playbook.origin.as_str())
         .bind(&steps)
         .bind(playbook.description.as_deref())
+        .bind(playbook.prompt_key.as_deref())
         .execute(&self.pool)
         .await?;
         let id: i64 = sqlx::query_scalar("SELECT id FROM playbooks WHERE name = ?")
@@ -91,13 +115,14 @@ impl PlaybookStore {
     /// Returns not-found, definition, serialization, or database errors.
     pub async fn load_playbook(&self, id: &str) -> Result<crate::schema::Playbook, StoreError> {
         let row_id: i64 = id.parse().map_err(|_| StoreError::NotFound)?;
-        let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT name, portal_url, steps_json, description FROM playbooks WHERE id = ?",
+        let row: Option<PlaybookRow> = sqlx::query_as(
+            "SELECT name, portal_url, steps_json, description, prompt_key FROM playbooks WHERE id = ?",
         )
         .bind(row_id)
         .fetch_optional(&self.pool)
         .await?;
-        let (name, portal_url, steps_json, description) = row.ok_or(StoreError::NotFound)?;
+        let (name, portal_url, steps_json, description, prompt_key) =
+            row.ok_or(StoreError::NotFound)?;
         let origin = url::Url::parse(&portal_url)
             .map_err(|_| StoreError::Invalid(crate::schema::SchemaError::Invalid))?;
         let steps: Vec<crate::schema::Step> = serde_json::from_str(&steps_json)?;
@@ -107,6 +132,7 @@ impl PlaybookStore {
             origin,
             steps,
             description,
+            prompt_key,
         };
         playbook.validate()?;
         Ok(playbook)
@@ -204,14 +230,14 @@ impl PlaybookStore {
     /// # Errors
     /// Returns serialization or database errors.
     pub async fn list_playbooks(&self) -> Result<Vec<PlaybookSummary>, StoreError> {
-        let rows: Vec<(i64, String, String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT id, name, portal_url, steps_json, description, updated_at FROM playbooks ORDER BY updated_at DESC, id DESC",
+        let rows: Vec<PlaybookListRow> = sqlx::query_as(
+            "SELECT id, name, portal_url, steps_json, description, prompt_key, updated_at FROM playbooks ORDER BY updated_at DESC, id DESC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(
-                |(id, name, portal_url, steps_json, description, updated_at)| {
+                |(id, name, portal_url, steps_json, description, prompt_key, updated_at)| {
                     let steps: Vec<crate::schema::Step> = serde_json::from_str(&steps_json)?;
                     Ok(PlaybookSummary {
                         id: id.to_string(),
@@ -220,6 +246,7 @@ impl PlaybookStore {
                         step_count: steps.len(),
                         updated_at,
                         description,
+                        prompt_key,
                     })
                 },
             )
@@ -329,6 +356,21 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
             .execute(&pool)
             .await?;
     }
+    // Second additive migration: the learning loop's index. Nullable, so
+    // every existing row stays valid and unkeyed — workflows saved before
+    // prompts were remembered keep matching by name tokens exactly as
+    // before. PRAGMA-guarded like the column above, so reopening is
+    // idempotent.
+    let has_prompt_key: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('playbooks') WHERE name = 'prompt_key'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if !has_prompt_key {
+        sqlx::query("ALTER TABLE playbooks ADD COLUMN prompt_key TEXT")
+            .execute(&pool)
+            .await?;
+    }
     // Run journal for POC metrics (reuse rates, sync outcomes). Additive and
     // idempotent like every table here: existing databases gain it on next
     // open, no ALTER or data migration involved. `completed_at` stays NULL
@@ -354,7 +396,37 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     )
     .execute(&pool)
     .await?;
+    seed_default_playbooks(&pool).await?;
     Ok(pool)
+}
+
+/// Insert the proven default workflows on a fresh database, so resolution
+/// tier 1 answers them instantly with no static route table in the picture.
+///
+/// Runs last, after every `CREATE`/`ALTER` above, so the `description`
+/// column exists even on databases created before it did. `DO NOTHING` on
+/// the name conflict makes reopening idempotent *and* non-destructive:
+/// once a seed row exists, later opens never overwrite edits, adopted
+/// signatures, or memos the user has since made to it.
+///
+/// # Errors
+/// Returns definition, serialization, or database errors.
+async fn seed_default_playbooks(pool: &SqlitePool) -> Result<(), StoreError> {
+    for playbook in crate::schema::seeded_playbooks()? {
+        let steps = serde_json::to_string(&playbook.steps)?;
+        sqlx::query(
+            "INSERT INTO playbooks(name, portal_url, steps_json, description, prompt_key) VALUES(?, ?, ?, ?, ?) \
+             ON CONFLICT(name) DO NOTHING",
+        )
+        .bind(&playbook.name)
+        .bind(playbook.origin.as_str())
+        .bind(&steps)
+        .bind(playbook.description.as_deref())
+        .bind(playbook.prompt_key.as_deref())
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Whether a journaled run came from a stored playbook or an ad-hoc intent.
@@ -414,16 +486,77 @@ mod tests {
         let revived = store.load_playbook(&id).await?;
         assert_eq!(revived, playbook);
         let listed = store.list_playbooks().await?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, id);
-        assert_eq!(listed[0].name, "reports");
-        assert_eq!(listed[0].portal_url, "https://portal.example.com/");
-        assert_eq!(listed[0].step_count, 1);
+        // Seeded defaults share the list, so match by id rather than position.
+        let row = listed
+            .iter()
+            .find(|summary| summary.id == id)
+            .ok_or("saved row listed")?;
+        assert_eq!(row.name, "reports");
+        assert_eq!(row.portal_url, "https://portal.example.com/");
+        assert_eq!(row.step_count, 1);
+        assert_eq!(row.description.as_deref(), Some("Monthly site report"));
+        assert!(!row.updated_at.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialization_seeds_runnable_default_playbooks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, store) = store().await?;
+        // Every seed definition validates, so a database open can never fail
+        // on its own default data.
+        let seeds = crate::schema::seeded_playbooks()?;
+        assert!(!seeds.is_empty());
+        let listed = store.list_playbooks().await?;
+        for seed in &seeds {
+            let row = listed
+                .iter()
+                .find(|summary| summary.name == seed.name)
+                .ok_or("seed row listed")?;
+            // Round-trips through storage as a runnable envelope, exactly like
+            // a user's own recording — no special-casing on read.
+            assert_eq!(store.load_playbook(&row.id).await?, *seed);
+        }
+        // The GitHub harvester carries the billing-history entry route the
+        // deleted static table used to supply, plus the invoice batch anchor.
+        let github = seeds
+            .iter()
+            .find(|seed| seed.name == "github-invoices")
+            .ok_or("github seed")?;
+        let crate::schema::Step::Semantic { intent } = github.steps.first().ok_or("seeded step")?
+        else {
+            return Err("seeded step is semantic".into());
+        };
         assert_eq!(
-            listed[0].description.as_deref(),
-            Some("Monthly site report")
+            intent.entry_url.as_deref(),
+            Some("https://github.com/account/billing/history")
         );
-        assert!(!listed[0].updated_at.is_empty());
+        assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
+        // Single-target by choice, not by limitation: the saved-replay lane
+        // now honors `is_plural` through the batch gate, so this seed stays
+        // singular because it promises one invoice, not because a plural seed
+        // would be inert.
+        assert!(!intent.is_plural);
+        // Reopening is idempotent and never clobbers later edits to the row.
+        let mut edited = github.clone().with_description(Some("edited".into()));
+        edited.steps.push(edited.steps[0].clone());
+        let id = store.save_playbook(&edited).await?;
+        let pool = store.pool.clone();
+        super::seed_default_playbooks(&pool).await?;
+        assert_eq!(store.load_playbook(&id).await?, edited);
+        let names: Vec<String> = store
+            .list_playbooks()
+            .await?
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == "github-invoices")
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -620,8 +753,13 @@ mod tests {
         let same_id = store.save_playbook(&updated).await?;
         assert_eq!(same_id, id);
         let listed = store.list_playbooks().await?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].step_count, 2);
+        let row = listed
+            .iter()
+            .find(|summary| summary.id == id)
+            .ok_or("saved row listed")?;
+        assert_eq!(row.step_count, 2);
+        // Re-saving replaced the row rather than adding one.
+        assert_eq!(listed.iter().filter(|row| row.name == "reports").count(), 1);
         Ok(())
     }
 
@@ -670,13 +808,20 @@ mod tests {
         let mut bad = reports_playbook()?;
         bad.name.clear();
         assert!(store.save_playbook(&bad).await.is_err());
-        assert!(store.list_playbooks().await?.is_empty());
+        // The rejected definition wrote nothing: only seeded defaults remain.
+        assert_eq!(
+            store.list_playbooks().await?.len(),
+            crate::schema::seeded_playbooks()?.len()
+        );
         // A tampered row fails the listing closed instead of hiding a workflow.
         sqlx::query("INSERT INTO playbooks(name, portal_url, steps_json) VALUES('tampered', 'https://portal.example.com/', 'not-json')")
             .execute(&store.pool)
             .await?;
         assert!(store.list_playbooks().await.is_err());
-        assert!(store.load_playbook("1").await.is_err());
+        let tampered: i64 = sqlx::query_scalar("SELECT id FROM playbooks WHERE name = 'tampered'")
+            .fetch_one(&store.pool)
+            .await?;
+        assert!(store.load_playbook(&tampered.to_string()).await.is_err());
         Ok(())
     }
 

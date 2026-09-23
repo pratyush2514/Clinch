@@ -340,6 +340,117 @@ pub fn billing_history_tree() -> serde_json::Value {
     serde_json::json!({ "nodes": nodes })
 }
 
+/// Canonical search-results tree shared by hermetic Stage-2 tests.
+///
+/// Shaped like a real results page and deliberately hostile to naive
+/// selection: the engine's own chrome comes **first** in document order and
+/// its links mention the target noun too, so a "click the first link that
+/// matches" implementation picks chrome and fails the test. Only the
+/// landmark check separates them. The organic results then interleave a
+/// non-matching competitor between two matching entries, so "first organic
+/// link" is also insufficient — the noun gate has to hold.
+#[must_use]
+pub fn search_results_tree() -> serde_json::Value {
+    fn text(value: &str) -> serde_json::Value {
+        serde_json::json!({"type": "string", "value": value})
+    }
+    fn node(
+        id: &str,
+        role: Option<&str>,
+        name: Option<&str>,
+        backend: Option<i64>,
+        parent: Option<&str>,
+        children: &[&str],
+    ) -> serde_json::Value {
+        let mut node = serde_json::json!({ "nodeId": id, "ignored": false });
+        if let Some(role) = role {
+            node["role"] = text(role);
+        }
+        if let Some(name) = name {
+            node["name"] = text(name);
+        }
+        if let Some(backend) = backend {
+            node["backendDOMNodeId"] = serde_json::json!(backend);
+        }
+        if let Some(parent) = parent {
+            node["parentId"] = serde_json::json!(parent);
+        }
+        if !children.is_empty() {
+            node["childIds"] = serde_json::json!(children);
+        }
+        node
+    }
+    let mut nodes = vec![
+        // Engine chrome: a `navigation` landmark whose links also say
+        // "Amazon". Document order puts it ahead of every organic result.
+        node(
+            "nav",
+            Some("navigation"),
+            Some("Search modes"),
+            None,
+            None,
+            &["nav1", "nav2"],
+        ),
+        node(
+            "nav1",
+            Some("link"),
+            Some("Images"),
+            Some(101),
+            Some("nav"),
+            &[],
+        ),
+        node(
+            "nav2",
+            Some("link"),
+            Some("Shopping results for Amazon"),
+            Some(102),
+            Some("nav"),
+            &[],
+        ),
+    ];
+    // Organic results, in document order. Only 2 and 4 mention the noun.
+    let organic = [
+        ("r1", 1_i64, "Flipkart Online Shopping", "Compare prices"),
+        (
+            "r2",
+            2,
+            "Amazon.in - Online Shopping",
+            "Low prices across India",
+        ),
+        ("r3", 3, "Best shopping sites 2026", "A roundup"),
+        ("r4", 4, "Amazon.com official site", "Shop now"),
+    ];
+    for (id, backend, label, blurb) in organic {
+        let group = format!("{id}g");
+        let caption = format!("{id}t");
+        nodes.push(node(
+            &group,
+            Some("group"),
+            None,
+            None,
+            None,
+            &[id, &caption],
+        ));
+        nodes.push(node(
+            id,
+            Some("link"),
+            Some(label),
+            Some(backend),
+            Some(&group),
+            &[],
+        ));
+        nodes.push(node(
+            &caption,
+            Some("StaticText"),
+            Some(blurb),
+            None,
+            Some(&group),
+            &[],
+        ));
+    }
+    serde_json::json!({ "nodes": nodes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

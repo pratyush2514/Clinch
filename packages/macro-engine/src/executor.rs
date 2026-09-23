@@ -779,6 +779,162 @@ pub fn resolve_batch(elements: &[AxElement], intent: &SemanticIntent) -> Resolve
     }
 }
 
+/// Upper bound on how far down a results page Stage 2 scans for a
+/// followable link. Organic results sit near the top in document order;
+/// scanning past this means the noun never really appeared.
+const MAX_SEARCH_RESULT_SCAN: usize = 40;
+
+/// Stage-2 navigation budget: how long a followed result may take to leave
+/// the search page before the follow is reported as failed.
+pub const FOLLOW_POLL_MS: u64 = 250;
+pub const FOLLOW_TIMEOUT_MS: u64 = 10_000;
+
+/// What Stage 2 did: the followed link's visible label plus the URL the
+/// browser actually landed on. The landed URL is observed, never predicted,
+/// so confinement re-anchors to where the click really went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowedResult {
+    pub label: String,
+    pub landed: url::Url,
+}
+
+/// Pick the link Stage 2 should follow on a search-results page.
+///
+/// Evidence-only — there is no engine-specific markup, selector, or result
+/// container name anywhere in here. Among `link` candidates in snapshot
+/// document order: skip page chrome (the engine's own `navigation` /
+/// `banner` / `contentinfo` / `complementary` landmarks), skip unlabeled
+/// links, and require the target noun in the link's visible text,
+/// description, or surroundings. The first survivor is the top organic
+/// result, because document order is the snapshot's ordering contract.
+///
+/// An empty noun yields `None` rather than "first link on the page": with
+/// nothing to match against, clicking anything would be a guess.
+#[must_use]
+pub fn select_search_result<'a>(elements: &'a [AxElement], noun: &str) -> Option<&'a AxElement> {
+    if noun.trim().is_empty() {
+        return None;
+    }
+    elements
+        .iter()
+        .take(MAX_SEARCH_RESULT_SCAN)
+        .find(|element| {
+            element.role == "link"
+                && !is_page_chrome(element)
+                && !element.name.trim().is_empty()
+                && mentions_noun(element, noun)
+        })
+}
+
+/// Diagnostic for a Stage-2 follow that found no candidate: the noun plus
+/// every link the page did offer, bounded like [`grounding_diagnostic`], so
+/// a failed follow reads as evidence instead of a bare failure.
+#[must_use]
+pub fn follow_diagnostic(elements: &[AxElement], noun: &str) -> String {
+    let mut rendered: Vec<String> = Vec::new();
+    let mut links = 0_usize;
+    for element in elements.iter().filter(|element| element.role == "link") {
+        links += 1;
+        if rendered.len() >= MAX_DIAGNOSTIC_CANDIDATES {
+            continue;
+        }
+        let chrome = if is_page_chrome(element) {
+            " [chrome]"
+        } else {
+            ""
+        };
+        let text: String = element.name.chars().take(MAX_DIAGNOSTIC_TEXT_LEN).collect();
+        rendered.push(format!("'{text}'{chrome}"));
+    }
+    let hidden = links.saturating_sub(rendered.len());
+    if hidden > 0 {
+        rendered.push(format!("… and {hidden} more"));
+    }
+    format!(
+        "Search follow found no result mentioning '{noun}'. Evaluated {links} links: [{}]",
+        rendered.join(", ")
+    )
+}
+
+/// Whether the live page has navigated away from `from`: origin or path
+/// differs. Reuses [`url_drifted`], which also treats `blob:` / `data:`
+/// targets as "not yet landed" — exactly right here, since a download
+/// handoff is not a site landing and the poll should keep waiting.
+fn navigated_away(from: &url::Url, now: &url::Url) -> bool {
+    url_drifted(from, now)
+}
+
+/// Poll until the live URL leaves `from`, or the timeout elapses.
+/// `None` means the click never navigated (an in-page result, or a dead
+/// link), so the caller fails the follow honestly instead of re-anchoring
+/// confinement to the search page it never left. Pure polling policy over
+/// an injected URL reader, so the loop is provable without a browser.
+async fn wait_for_navigation_with<F, Fut>(
+    mut current: F,
+    from: &url::Url,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Option<url::Url>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<url::Url>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(now) = current().await
+            && navigated_away(from, &now)
+        {
+            return Some(now);
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Stage 2 of search-and-follow: click the top result matching `noun` and
+/// report where it landed.
+///
+/// Snapshots the settled search page, selects a candidate by visible
+/// evidence, clicks it through the same badge-and-coordinate path every
+/// other semantic click uses, then waits for the navigation to land. The
+/// returned URL is observed from the live target, so the caller can
+/// re-anchor portal confinement to the real destination instead of a
+/// predicted one.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when no link mentions the noun or the
+/// click never navigated, and [`IntentError::Browser`] on CDP failure.
+pub async fn follow_search_result(
+    browser: &ManagedBrowser,
+    search_origin: &url::Url,
+    noun: &str,
+) -> Result<FollowedResult, IntentError> {
+    let (elements, _, _) = browser.ax_snapshot(search_origin).await;
+    let candidate = select_search_result(&elements, noun)
+        .ok_or_else(|| IntentError::NoMatch(follow_diagnostic(&elements, noun)))?;
+    let label = candidate.name.clone();
+    let from = browser
+        .current_url()
+        .await?
+        .ok_or(browser_driver::BrowserError::WrongOrigin)?;
+    click_element(browser, candidate).await?;
+    let landed = wait_for_navigation_with(
+        || async { browser.current_url().await.ok().flatten() },
+        &from,
+        std::time::Duration::from_millis(FOLLOW_POLL_MS),
+        std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),
+    )
+    .await
+    .ok_or_else(|| {
+        IntentError::NoMatch(format!(
+            "Search follow clicked '{label}' but the page never left the results."
+        ))
+    })?;
+    Ok(FollowedResult { label, landed })
+}
+
 /// Pure route-mismatch decision for entry pre-conditions: literal URL
 /// inequality, so any drift — path, query, or trailing-slash normalization
 /// aside — navigates rather than grounding on the wrong page.
@@ -853,6 +1009,35 @@ pub fn settle_probe_text(intent: &SemanticIntent) -> &str {
         .as_deref()
         .filter(|noun| !noun.trim().is_empty())
         .unwrap_or(&intent.label_query)
+}
+
+/// Noun [`select_search_result`] should match on for one intent.
+///
+/// Stage 2 picks a *site*, while the batch gate picks *artifacts inside a
+/// site* — two different words whenever the prompt named both. The prompt's
+/// grammar decides which is available:
+///
+/// * `download all my invoices from github` parses a site complement, so
+///   `site_context` is `github` and Stage 2 follows the GitHub result. The
+///   artifact (`invoice`) stays on the intent, where [`resolve_batch`] gates
+///   with it once the destination has loaded.
+/// * `open amazon for me` carries no complement, so the direct object is
+///   itself the destination and this falls back to
+///   [`settle_probe_text`] — the intent's target noun.
+///
+/// Blank or missing site contexts fall back rather than failing: an empty
+/// noun makes [`select_search_result`] return `None`, and losing a
+/// followable result to whitespace would be a worse answer than the noun
+/// the settle loop already trusts.
+#[must_use]
+pub fn search_follow_noun<'a>(
+    intent: &'a SemanticIntent,
+    site_context: Option<&'a str>,
+) -> &'a str {
+    site_context
+        .map(str::trim)
+        .filter(|site| !site.is_empty())
+        .unwrap_or_else(|| settle_probe_text(intent))
 }
 
 /// Poll `snapshot` until its tree holds at least one valid target
@@ -982,16 +1167,60 @@ fn halted_early(
     }
 }
 
-/// Execute a plural intent: snapshot once, then badge and click every
-/// collected candidate in document order with a settling pause between
-/// actions. Refusing non-plural intents fail-closed: batch-clicking a
-/// single-target intent would act on controls the user never asked for.
+/// Refusal carried by both halves of the batch path when an intent is not
+/// plural: batch-clicking a single-target intent would act on controls the
+/// user never asked for. Shared so previewing and executing fail closed
+/// with the same words.
+const NOT_PLURAL_REFUSAL: &str = "plural execution requires is_plural; refusing batch click";
+
+/// Resolve every control a plural intent would act on, without touching
+/// any of them: entry navigation, origin check, settle poll, snapshot,
+/// collect. This is the read-only half of [`execute_batch`], split out so a
+/// consent gate can name the exact candidates — count and labels — before
+/// the first CDP click happens.
+///
+/// Navigation is the one side effect: an intent carrying an `entry_url`
+/// still moves the target there, exactly as execution would, because
+/// candidates that were never rendered cannot be previewed.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the intent is not plural, nothing
+/// resolves, or the intent is malformed, and [`IntentError::Browser`] on
+/// CDP failure.
+pub async fn preview_batch(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    intent: &SemanticIntent,
+) -> Result<Vec<AxElement>, IntentError> {
+    if !intent.is_plural {
+        return Err(IntentError::NoMatch(NOT_PLURAL_REFUSAL.to_owned()));
+    }
+    ensure_entry(browser, intent).await?;
+    browser.check_anchored_origin(origin).await?;
+    wait_for_settled_candidates(browser, origin, intent).await;
+    let (elements, _, _) = browser.ax_snapshot(origin).await;
+    match resolve_batch(&elements, intent) {
+        ResolveOutcome::BatchMatch(batch) => Ok(batch),
+        _ => Err(IntentError::NoMatch(grounding_diagnostic(
+            &elements, intent,
+        ))),
+    }
+}
+
+/// Execute a plural intent: resolve once via [`preview_batch`], then badge
+/// and click every collected candidate in document order with a settling
+/// pause between actions. Refusing non-plural intents fail-closed.
 ///
 /// Before every click after the first, the live URL is compared against
 /// the route held at batch start: origin or path drift aborts the rest
 /// immediately with [`ExecuteOutcome::HaltedEarly`] instead of acting on a
 /// foreign page. Unreadable URLs fail closed the same way a CDP failure
 /// does.
+///
+/// Callers that previewed first resolve twice by design: the second
+/// resolution is the one that clicks, so a page that changed during the
+/// approval wait is re-grounded rather than acted on through stale node
+/// handles.
 ///
 /// # Errors
 /// Returns [`IntentError::NoMatch`] when the intent is not plural, nothing
@@ -1002,20 +1231,21 @@ pub async fn execute_batch(
     origin: &url::Url,
     intent: &SemanticIntent,
 ) -> Result<ExecuteOutcome, IntentError> {
-    if !intent.is_plural {
-        return Err(IntentError::NoMatch(
-            "plural execution requires is_plural; refusing batch click".to_owned(),
-        ));
-    }
-    ensure_entry(browser, intent).await?;
-    browser.check_anchored_origin(origin).await?;
-    wait_for_settled_candidates(browser, origin, intent).await;
-    let (elements, _, _) = browser.ax_snapshot(origin).await;
-    let ResolveOutcome::BatchMatch(batch) = resolve_batch(&elements, intent) else {
-        return Err(IntentError::NoMatch(grounding_diagnostic(
-            &elements, intent,
-        )));
-    };
+    let batch = preview_batch(browser, origin, intent).await?;
+    click_batch(browser, &batch).await
+}
+
+/// Badge and click a resolved batch in document order, halting on route
+/// drift. Separated from resolution so the ordering contract — every click
+/// preceded by a route check, a settle pause between clicks, none after the
+/// last — lives in one place.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn click_batch(
+    browser: &ManagedBrowser,
+    batch: &[AxElement],
+) -> Result<ExecuteOutcome, IntentError> {
     let initial = browser
         .current_url()
         .await?

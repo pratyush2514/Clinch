@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* One vertical thread between a fixed header and a fixed composer. The palette
+   of the original two-pane shell is unchanged — same paper background, same
+   ink, same accent green, same 36px rhythm — because only the layout moved. */
+
 :root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #252722; background: #f7f7f2; font-synthesis: none; }
 * { box-sizing: border-box; }
 body { margin: 0; }
@@ -10,69 +14,123 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: #293126; color: white; border-color: #293126; }
 button.primary:hover:enabled { background: #40503a; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #6d8639; outline-offset: 3px; }
+h1 { font-size: clamp(30px, 3.8vw, 48px); letter-spacing: -2px; font-weight: 500; line-height: 1.1; margin: 24px 0 18px; }
+h3 { font-size: 22px; margin: 14px 0; font-weight: 500; }
+p { font-size: 13px; color: #6a6d61; line-height: 1.7; max-width: 560px; margin: 0 0 20px; }
+label { display: block; font-size: 11px; color: #505549; }
+input:not([type=checkbox]), select { display: block; width: 100%; background: #fffefa; color: #292c24; border: 1px solid #d9dacf; border-radius: 5px; margin-top: 8px; padding: 11px; font-size: 13px; }
+.eyebrow { font-size: 10px; letter-spacing: 1.5px; color: #767b6a; font-weight: 600; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 16px 0; }
+.consent { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; margin: 20px 0; }
+.consent input { margin-top: 4px; accent-color: #40503a; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.notice { font-size: 11px; }
+.status { padding: 15px; border-left: 2px solid #93a16f; background: #eeeFE7; margin: 0; max-width: none; }
+.badge { font-size: 10px; letter-spacing: 1px; font-weight: 600; color: #7a4a1e; border: 1px solid #d9c9a8; background: #faf3e3; border-radius: 4px; padding: 2px 8px; white-space: nowrap; }
+.download-file, .target { border-left: 2px solid #93a16f; padding-left: 12px; }
+
+/* ── Shell ─────────────────────────────────────────────────────────────── */
+.shell { display: grid; grid-template-rows: auto auto 1fr auto; height: 100vh; }
 header { height: 85px; padding: 0 36px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #deded5; }
 header strong { font-size: 28px; letter-spacing: -1.5px; }
 .dot { color: #7f9a44; }
 .subtitle { font-size: 12px; margin-left: 20px; color: #76796c; }
 kbd { color: #777; margin-left: 22px; }
 .stage { display: flex; justify-content: space-between; padding: 18px 36px; color: #727568; font-size: 10px; letter-spacing: 1.5px; border-bottom: 1px solid #deded5; }
-.command-bar { padding: 18px 36px; border-bottom: 1px solid #deded5; }
-.command-bar fieldset { border: 0; margin: 0; padding: 0; min-width: 0; display: flex; gap: 10px; }
-.command-bar fieldset input { flex: 1; margin-top: 0; }
-.command-bar ol { margin: 16px 0 0; }
-.command-bar .gate-card { margin-top: 16px; }
-.command-bar .status { margin: 16px 0 0; }
-.workspace { min-height: calc(100vh - 178px); }
-.pane { padding: 36px; }
-.eyebrow { font-size: 10px; letter-spacing: 1.5px; color: #767b6a; font-weight: 600; }
-h1 { font-size: clamp(30px, 3.8vw, 48px); letter-spacing: -2px; font-weight: 500; line-height: 1.1; margin: 24px 0 18px; }
-h2 { font-size: 24px; letter-spacing: -.7px; margin: 20px 0; font-weight: 500; }
-h3 { font-size: 22px; margin: 14px 0; font-weight: 500; }
-p { font-size: 13px; color: #6a6d61; line-height: 1.7; max-width: 520px; margin: 0 0 20px; }
-form { margin-top: 28px; }
-label { display: block; font-size: 11px; color: #505549; }
-input:not([type=checkbox]), select { display: block; width: 100%; background: #fffefa; color: #292c24; border: 1px solid #d9dacf; border-radius: 5px; margin-top: 8px; padding: 11px; font-size: 13px; }
-.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 16px 0; }
-.consent { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; margin: 20px 0; }
-.consent input { margin-top: 4px; accent-color: #40503a; }
-.actions { display: flex; flex-wrap: wrap; gap: 10px; }
-.notice { font-size: 11px; }
-.browser-note { border-top: 1px solid #deded5; padding-top: 22px; margin-top: 30px; }
-.browser-note p { font-size: 11px; margin: 10px 0; }
-.resize-handle { width: 5px; border-left: 1px solid #deded5; }
-.resize-handle:hover, .resize-handle:focus-visible { background: #b4c891; }
-.status { padding: 15px; border-left: 2px solid #93a16f; background: #eeeFE7; }
-ol { list-style: none; padding: 0; margin: 24px 0; }
-li { display: flex; gap: 16px; font-size: 12px; line-height: 1.6; padding: 14px 0; border-bottom: 1px solid #e0e1d7; }
+footer { border-top: 1px solid #deded5; background: #f7f7f2; }
+footer .status { border-left: 0; background: transparent; padding: 14px 36px 0; font-size: 12px; color: #6a6d61; }
+
+/* ── Thread ────────────────────────────────────────────────────────────── */
+.thread { overflow-y: auto; padding: 8px 36px 36px; }
+.thread-empty { padding-top: 44px; }
+.turns { list-style: none; margin: 0; padding: 0; max-width: 760px; }
+/* The global list reset elsewhere styles rows; thread turns are blocks. */
+.turns > li { display: block; padding: 0; border: 0; }
+.action-card { padding: 28px 0; border-bottom: 1px solid #deded5; }
+.turns > li:last-child .action-card { border-bottom: 0; }
+.prompt { font-size: 17px; color: #252722; line-height: 1.5; margin: 0 0 14px; max-width: none; }
+.prompt-who { display: inline-block; font-size: 10px; letter-spacing: 1.5px; font-weight: 600; color: #767b6a; margin-right: 12px; vertical-align: 2px; }
+.pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.pill { font-size: 10px; letter-spacing: 1px; font-weight: 600; text-transform: uppercase; border: 1px solid #d9dacf; background: #fffefa; border-radius: 999px; padding: 4px 11px; color: #6a6d61; white-space: nowrap; }
+.pill-tier { border-color: #cbd3b6; background: #f4f7ec; color: #55603f; }
+.pill-anchor { text-transform: none; letter-spacing: .3px; border-color: #cbd3b6; background: #f4f7ec; color: #55603f; }
+.pill-running, .pill-awaiting { border-color: #d9c9a8; background: #faf3e3; color: #7a4a1e; }
+.pill-completed { border-color: #b9c4a3; background: #f2f5e9; color: #4a5a2e; }
+.pill-blocked, .pill-failed { border-color: #d6bcb0; background: #f8efe9; color: #85402a; }
+.action-card .status { margin-bottom: 18px; }
+.action-card .status p { margin: 0 0 12px; }
+.action-card .status p:last-child { margin-bottom: 0; }
+
+/* ── Inline screencast ─────────────────────────────────────────────────── */
+.cast { border: 1px solid #d9dacf; border-radius: 8px; background: #fffefa; padding: 16px; margin-bottom: 20px; }
+.cast-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+.cast-state { font-size: 10px; letter-spacing: 1px; color: #898f78; text-transform: uppercase; }
+.cast-empty { font-size: 11px; margin: 0; }
+/* Capped height: a frame is evidence, not the whole thread. Without this a
+   tall or oddly-proportioned capture would push every later turn off screen. */
+.cast .browser-frame { position: relative; width: 100%; max-height: 360px; overflow: hidden; border: 1px solid #e0e1d7; border-radius: 6px; background: #eeeee5; }
+.cast .browser-frame img { display: block; width: 100%; height: auto; max-height: 360px; object-fit: contain; object-position: top; }
+.cast .actions { margin-top: 14px; }
+.cast-preview { width: min(1100px, 92vw); padding: 18px; }
+.cast-preview img { display: block; width: 100%; height: auto; border: 1px solid #e0e1d7; border-radius: 6px; }
+.cast-preview .actions { margin-top: 14px; justify-content: flex-end; }
+
+/* ── Step progress, gate, telemetry ────────────────────────────────────── */
+ol { list-style: none; padding: 0; margin: 20px 0; }
+li { display: flex; gap: 16px; font-size: 12px; line-height: 1.6; padding: 12px 0; border-bottom: 1px solid #e0e1d7; }
 li span { color: #898f78; }
-.gate-card { border: 1px solid #d9dacf; padding: 24px; margin-top: 34px; border-radius: 6px; }
-.badge { font-size: 10px; letter-spacing: 1px; font-weight: 600; color: #7a4a1e; border: 1px solid #d9c9a8; background: #faf3e3; border-radius: 4px; padding: 2px 8px; white-space: nowrap; }
-.task-workspace { border-top: 1px solid #deded5; padding-top: 24px; }
-.workflow-form { border-top: 1px solid #deded5; padding-top: 24px; margin-top: 24px; }
-.workflow-form pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; background: #eeeFE7; padding: 15px; border-radius: 6px; }
-.task-workspace fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
-.task-workspace label { margin-bottom: 16px; }
-.run-result { margin-top: 24px; }
-.run-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 11px; }
-.run-result small { display: block; color: #737a66; margin-top: 3px; }
-.run-result code { overflow-wrap: anywhere; font-size: 11px; }
-.download-file, .target { border-left: 2px solid #93a16f; padding-left: 12px; }
-footer { border-top: 1px solid #deded5; padding: 16px 36px; font-size: 9px; letter-spacing: 1px; color: #777d69; display: flex; justify-content: space-between; }
-dialog { margin: auto; background: #fafaf5; color: #252722; max-width: 510px; padding: 32px; border: 1px solid #bbbfb0; border-radius: 10px; }
+li small { display: block; color: #737a66; margin-top: 3px; }
+.steps { margin: 0 0 20px; }
+.gate-card { border: 1px solid #d9c9a8; background: #fdfaf3; padding: 24px; margin: 0 0 20px; border-radius: 6px; }
+.gate-card p { max-width: none; }
+.gate-card code { overflow-wrap: anywhere; font-size: 11px; }
+.candidates { margin: 18px 0; max-height: 300px; overflow-y: auto; }
+.candidates li { align-items: flex-start; }
+.candidates strong { font-weight: 500; }
+.candidates small { overflow-wrap: anywhere; }
+.telemetry { margin-bottom: 20px; }
+.telemetry summary { font-size: 11px; color: #767b6a; cursor: pointer; }
+.telemetry ol { margin: 12px 0 0; }
+.telemetry code { font-size: 10px; overflow-wrap: anywhere; color: #6a6d61; }
+
+/* ── Outcome ───────────────────────────────────────────────────────────── */
+.outcome { border: 1px solid #d9dacf; border-radius: 6px; padding: 22px; }
+.outcome-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 12px; color: #6a6d61; }
+.outcome-head strong { color: #252722; font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 0; }
+.chip { font-size: 11px; border: 1px solid #d9dacf; background: #f7f7f2; border-radius: 4px; padding: 4px 10px; color: #55603f; }
+.outcome .download-file { margin-top: 18px; }
+.outcome .download-file p { font-size: 12px; margin: 0 0 10px; }
+.outcome .download-file code { font-size: 10px; overflow-wrap: anywhere; }
+.outcome .target { margin: 18px 0 0; font-size: 12px; }
+.save-row { margin-top: 18px; border-top: 1px solid #e0e1d7; padding-top: 18px; }
+.save-row p { margin-bottom: 12px; }
+.save-row input { margin-top: 0; width: auto; flex: 1 1 200px; }
+
+/* ── Composer ──────────────────────────────────────────────────────────── */
+.composer { margin: 0; padding: 14px 36px 22px; }
+.composer fieldset { border: 0; margin: 0; padding: 0; min-width: 0; display: flex; gap: 10px; }
+.composer input { flex: 1; margin-top: 0; padding: 14px; font-size: 14px; }
+
+/* ── Dialogs ───────────────────────────────────────────────────────────── */
+dialog { margin: auto; background: #fafaf5; color: #252722; max-width: 560px; padding: 32px; border: 1px solid #bbbfb0; border-radius: 10px; max-height: calc(100vh - 48px); overflow: auto; }
 dialog::backdrop, [cmdk-overlay] { background: #1a201766; position: fixed; inset: 0; }
-[cmdk-dialog] { position: fixed; top: 25%; left: 50%; transform: translateX(-50%); background: #fafaf5; width: min(500px, 90vw); border: 1px solid #bbbfb0; border-radius: 8px; padding: 18px; z-index: 10; }
-[cmdk-item] { padding: 15px; cursor: pointer; font-size: 13px; }
+dialog form { margin-top: 24px; }
+.auth-modal { border-color: #b9c4a3; background: #f5f8ee; }
+.auth-modal code { overflow-wrap: anywhere; font-size: 11px; }
+[cmdk-dialog] { position: fixed; top: 18%; left: 50%; transform: translateX(-50%); background: #fafaf5; width: min(560px, 92vw); border: 1px solid #bbbfb0; border-radius: 8px; padding: 18px; z-index: 10; }
+[cmdk-list] { max-height: 380px; overflow-y: auto; margin-top: 12px; }
+[cmdk-group-heading] { font-size: 10px; letter-spacing: 1.5px; font-weight: 600; color: #767b6a; padding: 14px 15px 6px; text-transform: uppercase; }
+[cmdk-item] { display: block; padding: 12px 15px; cursor: pointer; font-size: 13px; border-radius: 5px; }
+[cmdk-item] small { display: block; color: #898f78; font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
 [cmdk-item][data-selected=true] { background: #e7ecdc; }
-[cmdk-item][data-disabled=true] { opacity: .4; }
-@media (max-width: 850px) { .pane { padding: 24px; } .subtitle { display: none; } }
-.browser-viewport { position: relative; width: 100%; overflow: hidden; margin-top: 24px; min-height: 120px; border: 1px solid var(--border, #d7d7cf); border-radius: 8px; }
-.browser-frame { position: relative; width: 100%; overflow: hidden; }
-.browser-viewport img { display: block; width: 100%; height: 100%; }
-.browser-viewport p { padding: 16px; }
-.browser-highlight { position: absolute; pointer-events: none; border: 2px solid #748b17; background: #b8d84426; box-sizing: border-box; }
-.task-workspace dialog { margin: auto 24px auto auto; width: min(480px, calc(45vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
-.task-workspace dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-.element-picker { margin: -8px 0 16px; }
-.element-picker .actions { margin-bottom: 8px; }
-.auth-panel { border: 1px solid #b9c4a3; background: #f2f5e9; border-radius: 6px; padding: 20px; margin-top: 20px; }
-.auth-panel code { overflow-wrap: anywhere; font-size: 11px; }
+[cmdk-item][data-disabled=true] { opacity: .4; cursor: not-allowed; }
+[cmdk-empty] { padding: 18px 15px; font-size: 13px; color: #6a6d61; }
+
+@media (max-width: 850px) {
+  .thread { padding: 8px 24px 24px; }
+  header, .stage { padding-left: 24px; padding-right: 24px; }
+  .composer, footer .status { padding-left: 24px; padding-right: 24px; }
+  .subtitle { display: none; }
+  .fields { grid-template-columns: 1fr; }
+}

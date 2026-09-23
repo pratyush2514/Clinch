@@ -1,15 +1,18 @@
 #![deny(unsafe_code)]
 //! Allowlist validation for machine-proposed navigation targets. Every
-//! resolver tier — route table, account entities, even a future LLM adapter
-//! — funnels through [`validate_proposed_url`], so a bad table edit, a
-//! compromised directory response, or an untrusted model can never yield a
+//! resolver tier — account entities, the grounded search template, even a
+//! future LLM adapter — funnels through [`validate_proposed_url`], so a
+//! compromised directory response or an untrusted model can never yield a
 //! navigable URL outside the contract below.
+//!
+//! Scope note: this guards *proposed* URLs only. A Stage-2 destination is
+//! observed from a real click on a live search result, not proposed, so it
+//! re-anchors confinement instead of passing through here.
 
-/// Hosts navigation may target. Exact matches only, kept alongside the
-/// portal route table: adding a portal means extending both lists together.
-/// `www.google.com` / `google.com` back the grounded search-fallback tier
-/// only (`/search?q=…` template, never guessed TLDs); table and entity
-/// tiers still resolve solely to portal hosts.
+/// Hosts navigation may target. Exact matches only.
+/// `www.google.com` / `google.com` back the grounded search tier
+/// (`/search?q=…` template, never guessed TLDs); the entity tier resolves
+/// solely to portal hosts.
 const ALLOWED_HOSTS: &[&str] = &["github.com", "www.google.com", "google.com"];
 
 /// Why a proposed URL was rejected. Variants stay coarse on purpose: the

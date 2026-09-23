@@ -306,3 +306,164 @@ async fn sequence_runs_in_order_and_stops_at_repair() -> Result<(), Box<dyn std:
     stop(harness).await;
     Ok(())
 }
+
+/// Three download links on one page, each in a row carrying invoice
+/// evidence, plus a nav landmark whose link also mentions invoices. Page
+/// chrome must never join a batch, so a run that clicks four controls — or
+/// navigates away via the sidebar — fails this fixture.
+const INVOICES_HTML: &str = "<!doctype html><html><body>\
+<nav><a id=\"nav\" href=\"/archive\">All invoices</a></nav>\
+<table>\
+<tr><td>Invoice INV-001 <a class=\"dl\" href=\"#a\">Download</a></td></tr>\
+<tr><td>Invoice INV-002 <a class=\"dl\" href=\"#b\">Download</a></td></tr>\
+<tr><td>Invoice INV-003 <a class=\"dl\" href=\"#c\">Download</a></td></tr>\
+</table>\
+<script>window.clicked=0;document.querySelectorAll('a.dl').forEach(function(link){\
+link.addEventListener('click',function(event){event.preventDefault();window.clicked++;\
+document.body.setAttribute('data-clicked',String(window.clicked));});});</script>\
+</body></html>";
+
+async fn invoices_portal() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut head = [0; 4096];
+                let _ = socket.read(&mut head).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{INVOICES_HTML}",
+                    INVOICES_HTML.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Ok((url, task))
+}
+
+fn plural_invoice_step() -> Step {
+    Step::Semantic {
+        intent: SemanticIntent {
+            role: "link".into(),
+            label_query: "download".into(),
+            container_query: None,
+            raw_prompt: "download all my invoices".into(),
+            ordinal_index: None,
+            is_last: false,
+            is_plural: true,
+            entry_url: None,
+            primary_target_noun: Some("invoice".into()),
+        },
+    }
+}
+
+#[tokio::test]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+async fn saved_plural_step_batches_every_candidate_behind_one_gate()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The live half of `test_saved_playbook_plural_batch_execution`: a saved
+    // step with `is_plural` must click every eligible control through
+    // `execute_batch`, and the gate must have seen those controls before the
+    // first click. Ordering matters as much as the count — an approval that
+    // cannot name what it is approving is not a gate.
+    let (portal, server) = invoices_portal().await?;
+    let profile_dir = tempfile::tempdir()?;
+    let output = profile_dir.path().join("downloads");
+    let browser = headless_browser(&profile_dir).await?;
+    browser.navigate(&portal).await?;
+
+    let previewed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let clicks: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let seen = Arc::clone(&previewed);
+    let counted = Arc::clone(&clicks);
+    let outcome = execute_step(
+        &browser,
+        &portal,
+        &output,
+        0,
+        &plural_invoice_step(),
+        |_| {
+            counted.lock().map(|mut guard| *guard += 1).ok();
+        },
+        |_, _| async { panic!("the semantic path never asks action consent") },
+        |_, request: orchestration_engine::IntentApproval| {
+            // Recorded inside the gate, so the assertions below prove the
+            // candidates were known at consent time, not reconstructed after.
+            seen.lock()
+                .map(|mut guard| {
+                    guard.push(
+                        request
+                            .candidates
+                            .iter()
+                            .map(|candidate| candidate.name.clone())
+                            .collect(),
+                    );
+                })
+                .ok();
+            async move { request.is_batch() }
+        },
+    )
+    .await
+    .map_err(|error| format!("plural dispatch failed: {error:?}"))?;
+
+    let previewed = previewed
+        .lock()
+        .map_err(|_| "preview log poisoned")?
+        .clone();
+    assert_eq!(previewed.len(), 1, "exactly one gate for the whole batch");
+    assert_eq!(
+        previewed[0],
+        vec!["Download".to_owned(); 3],
+        "the gate itemized all three row controls and excluded the nav link"
+    );
+    // Every click streamed its own highlight, so a batch of three is visible
+    // as three targets rather than one opaque step.
+    assert_eq!(*clicks.lock().map_err(|_| "click log poisoned")?, 3);
+    assert!(outcome.highlight.is_some(), "the last target is reported");
+    // The page itself is the witness: three handlers fired, not one.
+    browser.resolve("body[data-clicked='3']", false).await?;
+    browser.clear_marks().await?;
+    let _ = browser.shutdown().await;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+async fn rejected_plural_step_denies_the_sequence_without_clicking()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Fail-closed, and closed means untouched: a denied batch leaves the
+    // page exactly as it was.
+    let (portal, server) = invoices_portal().await?;
+    let profile_dir = tempfile::tempdir()?;
+    let output = profile_dir.path().join("downloads");
+    let browser = headless_browser(&profile_dir).await?;
+    browser.navigate(&portal).await?;
+    let steps = vec![plural_invoice_step()];
+    let outcome = run_playbook_sequence(
+        &browser,
+        &portal,
+        &output,
+        &steps,
+        |_| {},
+        |_, _| async { panic!("the semantic path never asks action consent") },
+        |_, _| async { false },
+    )
+    .await;
+    assert_eq!(outcome.status, SequenceStatus::Denied);
+    assert_eq!(outcome.completed_steps, 0);
+    assert_eq!(outcome.stopped_at, Some(0));
+    assert!(
+        browser
+            .resolve("body[data-clicked='1']", false)
+            .await
+            .is_err(),
+        "no control was clicked"
+    );
+    let _ = browser.shutdown().await;
+    server.abort();
+    Ok(())
+}

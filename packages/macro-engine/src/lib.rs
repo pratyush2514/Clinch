@@ -5,11 +5,13 @@ use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
 pub use executor::{
-    DriftDetail, ExecuteOutcome, FastReplayMetrics, IntentError, IntentOutcome, MAX_BATCH_CLICKS,
-    RESOLVE_COST_USD, ResolveOutcome, ResolvedIntent, SETTLE_POLL_MS, SETTLE_TIMEOUT_MS,
-    SemanticIntent, ensure_at_entry_url, entry_url_mismatched, execute_batch, execute_intent,
-    grounding_diagnostic, resolve_batch, resolve_fast, resolve_intent, resolve_with_drift,
-    settle_probe_text, wait_for_settled_candidates,
+    DriftDetail, ExecuteOutcome, FOLLOW_POLL_MS, FOLLOW_TIMEOUT_MS, FastReplayMetrics,
+    FollowedResult, IntentError, IntentOutcome, MAX_BATCH_CLICKS, RESOLVE_COST_USD, ResolveOutcome,
+    ResolvedIntent, SETTLE_POLL_MS, SETTLE_TIMEOUT_MS, SemanticIntent, ensure_at_entry_url,
+    entry_url_mismatched, execute_batch, execute_intent, follow_diagnostic, follow_search_result,
+    grounding_diagnostic, preview_batch, resolve_batch, resolve_fast, resolve_intent,
+    resolve_with_drift, search_follow_noun, select_search_result, settle_probe_text,
+    wait_for_settled_candidates,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};

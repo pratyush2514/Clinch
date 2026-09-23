@@ -342,42 +342,12 @@ mod tests {
         id: u64,
     }
 
-    /// Restores `CLINCH_CHROMIUM_PATH` on drop so the hermetic browser
-    /// failure below never leaks into other tests sharing the process.
-    /// Sound here: no other test in this workspace launches a browser
-    /// (all browser fixtures are `#[ignore]`d), so nothing else reads the
-    /// variable during the guard's lifetime.
-    struct ChromiumEnvGuard {
-        prior: Option<std::ffi::OsString>,
-    }
-
-    #[allow(unsafe_code)]
-    impl ChromiumEnvGuard {
-        fn hold_bogus() -> Self {
-            let prior = std::env::var_os("CLINCH_CHROMIUM_PATH");
-            // Edition 2024 marks env mutation unsafe (process-wide); see the
-            // soundness note on the struct.
-            unsafe {
-                std::env::set_var("CLINCH_CHROMIUM_PATH", "nonexistent-chromium-hermetic-test");
-            }
-            Self { prior }
-        }
-    }
-
-    #[allow(unsafe_code)]
-    impl Drop for ChromiumEnvGuard {
-        fn drop(&mut self) {
-            if let Some(prior) = self.prior.take() {
-                unsafe {
-                    std::env::set_var("CLINCH_CHROMIUM_PATH", prior);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var("CLINCH_CHROMIUM_PATH");
-                }
-            }
-        }
-    }
+    /// Shared with the service suite rather than redefined: both suites run
+    /// in this one test binary and mutate the same process-wide
+    /// `CLINCH_CHROMIUM_PATH`, so they must serialize against a single lock.
+    /// A second guard with its own lock would let the two interleave and
+    /// restore the variable out from under each other.
+    use crate::service::tests::ChromiumEnvGuard;
 
     #[tokio::test]
     async fn run_button_dispatch_proposes_route_and_logs() -> Result<(), Box<dyn std::error::Error>>
@@ -387,8 +357,8 @@ mod tests {
         // With a github session connected, the IPC handler must reach the
         // ephemeral dispatch path: route proposal runs before any browser
         // attach, so even though no Chromium exists here
-        // (`browser_unavailable`), `session_events` still carries
-        // `route_proposed` and step 1 would carry the billing-history entry.
+        // (`browser_unavailable`), `session_events` still carries the
+        // grounded search proposal step 1 would have navigated to.
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "init")?;
@@ -425,11 +395,17 @@ mod tests {
             .await
             .map_err(|_| "events")?;
         assert!(
-            events
+            events.iter().any(|outcome| outcome
+                == "route_fallback: search q='download all invoices from github' · url=https://www.google.com/search?q=download+all+invoices+from+github"),
+            "grounded search proposal logged, got {events:?}"
+        );
+        // No fabricated deep link reaches the journal: the destination is
+        // grounded by Stage 2 from a real click, never guessed here.
+        assert!(
+            !events
                 .iter()
-                .any(|outcome| outcome
-                    .starts_with("route_proposed:github.com/account/billing/history")),
-            "route_proposed logged, got {events:?}"
+                .any(|outcome| outcome.contains("github.com/account")),
+            "no invented portal route, got {events:?}"
         );
         Ok(())
     }

@@ -108,6 +108,63 @@ pub struct ContextStatus {
 /// Tauri event carrying one base64 JPEG viewport frame to the preview card.
 pub const SCREENCAST_EVENT: &str = "browser-screencast-frame";
 
+/// Why a managed-browser handle is being acquired.
+///
+/// The window-visibility contract lives in this type rather than in a bare
+/// `headless: bool` at each call site, so "background work never opens an OS
+/// window" is checkable by reading the argument instead of tracing a boolean.
+///
+/// * [`Self::Background`] — dispatch lanes, playbook runs, task replay, and
+///   screencast acquisition. Always `--headless=new`.
+/// * [`Self::Interactive`] — only actions the user asked for by name:
+///   manual login, in-app re-authentication, source-profile and bridge sync
+///   (each may need a visible login/2FA page), and Take Control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserIntent {
+    Background,
+    Interactive,
+}
+
+impl BrowserIntent {
+    /// Launch options for a fresh process. Background is headless by
+    /// construction: no code path can launch it any other way.
+    fn launch_options(self) -> LaunchOptions {
+        match self {
+            Self::Background => LaunchOptions::replay(),
+            Self::Interactive => LaunchOptions::interactive(),
+        }
+    }
+}
+
+/// What acquiring a browser should do with the session that is already
+/// attached. Separated from the CDP work so the window-visibility invariant
+/// is provable without launching Chromium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcquireAction {
+    /// Take the live session exactly as it is.
+    Reuse,
+    /// Restart the live session under the requested window mode.
+    Restart,
+    /// Nothing attached: launch a fresh process.
+    Launch,
+}
+
+/// Decide how to satisfy `intent` given the attached session's window mode
+/// (`attached_headless`; `None` when dormant).
+///
+/// Background never restarts: it reuses whatever is attached, so a run can
+/// neither open a window nor close one the user opened. Interactive restarts
+/// only when the live session is headless.
+fn acquire_action(intent: BrowserIntent, attached_headless: Option<bool>) -> AcquireAction {
+    match (intent, attached_headless) {
+        (_, None) => AcquireAction::Launch,
+        (BrowserIntent::Background, Some(_)) | (BrowserIntent::Interactive, Some(false)) => {
+            AcquireAction::Reuse
+        }
+        (BrowserIntent::Interactive, Some(true)) => AcquireAction::Restart,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntentPreview {
@@ -222,6 +279,34 @@ struct RunScope {
     playbook_id: Option<String>,
 }
 
+/// Outcome of one entry-route proposal: the exact journaled line (so the UI
+/// can render it without polling) plus which tier answered.
+///
+/// The tier matters because the search tier only reaches a results page.
+/// A `SearchFallback` entry still owes a Stage-2 follow before the intent
+/// can run against its real destination.
+#[derive(Clone, Debug, Default)]
+struct ProposedEntry {
+    log: Option<String>,
+    source: Option<orchestration_engine::RouteSource>,
+}
+
+impl ProposedEntry {
+    /// Whether this proposal landed on a search page rather than the
+    /// destination, and therefore needs a follow-through click.
+    fn needs_search_follow(&self) -> bool {
+        self.source == Some(orchestration_engine::RouteSource::SearchFallback)
+    }
+}
+
+/// Where a Stage-2 follow landed: the origin-normalized run portal plus the
+/// journaled line naming the destination.
+#[derive(Clone, Debug)]
+struct FollowedDestination {
+    portal: url::Url,
+    log: String,
+}
+
 /// Which execution lane a resolved command takes. Plural ephemeral intents
 /// batch across every matching control; everything else keeps its existing
 /// single-step path. Pure routing so the browserless suite can prove the
@@ -322,17 +407,33 @@ pub struct AppService {
     /// only — `save_run_as_workflow` drains entries into durable playbooks.
     completed_runs: Mutex<VecDeque<CompletedRun>>,
     next_playbook_run: AtomicU64,
+    /// Fenced structured-intent parser consulted only when the deterministic
+    /// grammar parse is not confident, and only for slots — never for URLs,
+    /// selectors, or code.
+    ///
+    /// Ships as [`orchestration_engine::StubIntentParser`], which declines
+    /// every prompt so low-confidence commands degrade to raw search. That
+    /// keeps the app offline-first with no model dependency, no API key, and
+    /// no prompt leaving the machine; choosing a local or hosted provider is
+    /// a product decision that swaps this one field.
+    intent_parser: Arc<dyn orchestration_engine::IntentParser>,
 }
 
 /// One finished ephemeral run held for persistence: the exact executed
 /// graph plus the portal it ran under. Recorded only on terminal
 /// completion; anything else never becomes saveable. The save command
 /// supplies a fresh name, so none is stored here.
+///
+/// `prompt` is the phrasing that produced the run. It becomes the saved
+/// workflow's prompt key if — and only if — the user chooses to save, which
+/// is what closes the learning loop: an irregular prompt that needed the
+/// parser seam once resolves from storage every time after.
 #[derive(Clone, Debug)]
 struct CompletedRun {
     id: String,
     origin: url::Url,
     steps: Vec<playbook_store::Step>,
+    prompt: String,
 }
 
 /// Session cap on persistable completed runs: old entries evict
@@ -358,7 +459,37 @@ impl AppService {
             screencast: Mutex::new(None),
             completed_runs: Mutex::new(VecDeque::new()),
             next_playbook_run: AtomicU64::new(1),
+            intent_parser: Arc::new(orchestration_engine::StubIntentParser),
         }
+    }
+
+    /// Swap the intent-parser seam. Builder-style so the field stays
+    /// immutable at runtime — a parser is chosen at construction, never
+    /// mid-session.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_intent_parser(
+        mut self,
+        parser: Arc<dyn orchestration_engine::IntentParser>,
+    ) -> Self {
+        self.intent_parser = parser;
+        self
+    }
+
+    /// Resolve the slots search-and-follow grounds on for `prompt`.
+    ///
+    /// Routes through the confidence gate: a crisp command is answered by
+    /// grammar alone (zero tokens), an irregular one gets one bounded parser
+    /// shot, and anything unanswered degrades to ungrounded slots plus raw
+    /// search. Shared by Stage 2 and its tests so both exercise the same
+    /// cascade.
+    fn follow_slots(&self, prompt: &str) -> orchestration_engine::ResolvedSlots {
+        let ctx = orchestration_engine::ResolutionContext {
+            account_dir: None,
+            llm: None,
+            parser: Some(&self.intent_parser),
+        };
+        orchestration_engine::resolve_slots(prompt, None, &ctx)
     }
 
     async fn database(&self) -> Result<&sqlx::SqlitePool, AppError> {
@@ -450,12 +581,10 @@ impl AppService {
         if connected.is_none_or(|url| url.origin() != request.portal_url.origin()) {
             return Err(AppError::SessionRequired);
         }
-        let mode = Engine::run_mode(request, &self.data)
-            .await
-            .map_err(|error| engine_error(&error))?;
-        let browser = self
-            .browser(mode == orchestration_engine::RunMode::Replay)
-            .await?;
+        // Task runs are background work in both modes: replay additionally
+        // *requires* headless (`EngineError::HeadlessRequired`), and a
+        // first-run recording has no reason to put a window on screen either.
+        let browser = self.browser(BrowserIntent::Background).await?;
         self.engine()
             .await?
             .run_task(request, &browser, &self.data, emit)
@@ -548,13 +677,13 @@ impl AppService {
     /// session into a visible one.
     async fn browser(&self, intent: BrowserIntent) -> Result<Arc<ManagedBrowser>, AppError> {
         let existing = self.browser.lock().map_err(|_| AppError::Internal)?.clone();
-        if let Some(browser) = existing {
-            // Background takes the live session untouched; interactive only
-            // needs a restart when that session has no window.
-            if intent == BrowserIntent::Background || !browser.is_headless() {
-                return Ok(browser);
+        match acquire_action(intent, existing.as_ref().map(|live| live.is_headless())) {
+            AcquireAction::Reuse => return existing.ok_or(AppError::BrowserUnavailable),
+            AcquireAction::Restart => {
+                let live = existing.ok_or(AppError::BrowserUnavailable)?;
+                return self.restart_browser(&live, intent).await;
             }
-            return self.restart_browser(&browser, intent).await;
+            AcquireAction::Launch => {}
         }
         let browser = Arc::new(
             ManagedBrowser::launch_with_options(
@@ -613,7 +742,9 @@ impl AppService {
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         self.database().await?;
         let prepared = session_sync::prepare(&request, &self.home).await;
-        let browser = self.browser(false).await?;
+        // Interactive: an imported session may still land on a login/2FA
+        // page the user has to complete in a visible window.
+        let browser = self.browser(BrowserIntent::Interactive).await?;
         // Identity mirroring: replay the source browser's User-Agent so the
         // synced session does not arrive under a mismatched UA (a standard
         // anti-bot signal). Best-effort — an unknown UA keeps the native one.
@@ -795,7 +926,9 @@ impl AppService {
                 ),
                 _ => AppError::WorkflowFailed,
             })?;
-        let browser = self.browser(false).await?;
+        // Interactive: same reason as local-profile sync — the landing may
+        // be a challenge page the user must finish.
+        let browser = self.browser(BrowserIntent::Interactive).await?;
         // Identity first: the session must not arrive under a mismatched UA.
         // The UA was allowlist-validated by the bridge, so a CDP failure here
         // means the target is gone.
@@ -824,7 +957,8 @@ impl AppService {
         let portal = session_sync::validate_portal(portal_url)
             .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
-        let browser = self.browser(false).await?;
+        // Interactive by definition: the user signs in in this window.
+        let browser = self.browser(BrowserIntent::Interactive).await?;
         browser
             .navigate(&portal)
             .await
@@ -852,7 +986,8 @@ impl AppService {
             .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         self.database().await?;
-        let browser = self.browser(false).await?;
+        // Interactive: the panel exists so the user can re-authenticate here.
+        let browser = self.browser(BrowserIntent::Interactive).await?;
         browser
             .navigate(&portal)
             .await
@@ -1069,12 +1204,24 @@ impl AppService {
     /// Record one terminally completed ephemeral run for later persistence,
     /// evicting the oldest entries past [`MAX_COMPLETED_RUNS`]. Only
     /// completed runs are remembered: anything else was never proven.
-    fn remember_completed_run(&self, id: &str, origin: &url::Url, steps: &[playbook_store::Step]) {
+    ///
+    /// Remembering is not saving. The entry lives in session memory until the
+    /// user explicitly accepts the "Save as Playbook" card; declining (or
+    /// simply moving on) persists nothing, which keeps the store free of runs
+    /// nobody wanted to keep.
+    fn remember_completed_run(
+        &self,
+        id: &str,
+        origin: &url::Url,
+        steps: &[playbook_store::Step],
+        prompt: &str,
+    ) {
         if let Ok(mut runs) = self.completed_runs.lock() {
             runs.push_back(CompletedRun {
                 id: id.to_owned(),
                 origin: origin.clone(),
                 steps: steps.to_vec(),
+                prompt: prompt.to_owned(),
             });
             while runs.len() > MAX_COMPLETED_RUNS {
                 runs.pop_front();
@@ -1109,9 +1256,14 @@ impl AppService {
         let memo = description
             .map(|memo| memo.trim().to_owned())
             .filter(|memo| !memo.is_empty());
+        // This click is the learning loop closing. The prompt that produced
+        // the run becomes the workflow's key, so the next time the user says
+        // the same thing it resolves from storage instead of re-parsing —
+        // the whole point of remembering an irregular phrasing once.
         let playbook = playbook_store::Playbook::new(name, run.origin, run.steps)
             .map_err(|_| AppError::InvalidInput("Check the workflow name, portal, and steps."))?
-            .with_description(memo);
+            .with_description(memo)
+            .with_prompt_key(orchestration_engine::prompt_key(&run.prompt));
         self.persist_playbook(playbook).await
     }
 
@@ -1409,6 +1561,17 @@ impl AppService {
     /// `ensure_at_entry_url`, then `reanchor_portal` before running.
     /// The derived entry origin becomes the run portal, so the Portal URL
     /// input stays an optional override.
+    ///
+    /// Two-stage when the search tier answered: Stage 1 lands the results
+    /// page, Stage 2 follows the top matching result through to the real
+    /// destination, and only then does the intent execute. The run reports
+    /// success only if Stage 2 landed somewhere.
+    ///
+    /// Trust boundary: the Stage-1 entry is a *machine-proposed* URL and is
+    /// allowlist-validated below. The Stage-2 destination is not — it is
+    /// observed from a real click on a real link rendered by the search
+    /// engine, so there is no proposed host to validate. Confinement moves to
+    /// that observed origin rather than trusting a predicted one.
     async fn dispatch_adhoc_auto_acquire(
         &self,
         prompt: String,
@@ -1419,8 +1582,10 @@ impl AppService {
         // the browser cannot start (mirrors the connected lane ordering).
         // `propose_entry_url` validates every tier (https, no credentials,
         // allowlisted host) and journals `route_fallback: search` for the
-        // grounded template.
-        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
+        // grounded template. Its reported tier decides whether Stage 2 below
+        // still owes a follow-through click.
+        let proposed = self.propose_entry_url(&prompt, &mut intent).await;
+        let route_log = proposed.log.clone();
         let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
             "The derived intent is not runnable.",
         ))?;
@@ -1437,13 +1602,30 @@ impl AppService {
         portal.set_query(None);
         portal.set_fragment(None);
         *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
-        // Delegate to the connected lanes: they auto-acquire the browser
-        // (`browser(false)` lazy-launches when dormant), journal the target,
-        // `ensure_at_entry_url` via pre-navigation, and `reanchor_portal`
-        // before snapshotting. Batch intents keep the batch lane so plural
-        // prompts never truncate to one click. The first proposal line is
-        // preserved because the delegate sees `entry_url` already set and
-        // returns `route_log: None`.
+        // Stage 2. A search-tier entry only reaches a results page, which is
+        // not the destination the prompt asked for. Land Stage 1, follow the
+        // top matching result through, and rebind the run to wherever the
+        // click actually went — before any intent executes. Navigation is
+        // only "complete" once this returns.
+        let mut follow_log = None;
+        if proposed.needs_search_follow() {
+            let browser = self.browser(BrowserIntent::Background).await?;
+            // Stage 1: land the search page (headless, no window).
+            Self::pre_navigate_to_entry(&browser, &intent).await?;
+            let followed = self
+                .follow_search_to_destination(&browser, &portal, &mut intent)
+                .await?;
+            portal = followed.portal;
+            follow_log = Some(followed.log);
+        }
+        // Delegate to the connected lanes: they reuse the attached browser,
+        // journal the target, `ensure_at_entry_url` via pre-navigation, and
+        // `reanchor_portal` before snapshotting. Batch intents keep the batch
+        // lane so plural prompts never truncate to one click. After a Stage-2
+        // follow, `entry_url` already names the landed page, so
+        // pre-navigation is a no-op instead of a trip back to the results.
+        // The first proposal line is preserved because the delegate sees
+        // `entry_url` already set and returns `route_log: None`.
         let mut outcome = if intent.is_plural {
             self.dispatch_plural_batch(portal, prompt, intent, emit)
                 .await?
@@ -1454,7 +1636,101 @@ impl AppService {
         if outcome.route_log.is_none() {
             outcome.route_log = route_log;
         }
+        // The follow line rides the same channel as snapshot telemetry so
+        // Session Activity shows the destination it landed on.
+        if let Some(line) = follow_log {
+            outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
+                Some(existing) => format!("{line}\n{existing}"),
+                None => line,
+            });
+        }
         Ok(outcome)
+    }
+
+    /// Stage 2 of search-and-follow: from a settled search landing, click the
+    /// top result matching the prompt's destination, then rebind the run to
+    /// where the click actually landed.
+    ///
+    /// Rebinding covers all three pieces of run state that name a location:
+    /// the driver's portal anchor (so confinement evaluates the destination),
+    /// the session origin (so the shared run machinery's origin check passes),
+    /// and step 1's `entry_url` (set to the landed page, which makes the
+    /// delegate lane's pre-navigation a no-op rather than a trip back to the
+    /// results page). The destination is read from the live target, never
+    /// predicted from the prompt, so no TLD is ever guessed.
+    async fn follow_search_to_destination(
+        &self,
+        browser: &Arc<ManagedBrowser>,
+        search_origin: &url::Url,
+        intent: &mut macro_engine::SemanticIntent,
+    ) -> Result<FollowedDestination, AppError> {
+        // Which word Stage 2 follows comes from the prompt's own grammar,
+        // not a portal list. A prepositional complement names the destination
+        // (`… invoices from github` → `github`), so the results page is
+        // matched on the site while the artifact noun stays on the intent for
+        // the batch gate once the destination loads. Without a complement the
+        // direct object *is* the destination (`open amazon for me`), and the
+        // noun falls back to the settle probe text.
+        //
+        // Irregular phrasing that grammar cannot read confidently gets one
+        // bounded shot at the fenced parser seam first; an absent or stalled
+        // parser simply leaves the slots ungrounded and the follow falls back
+        // to probe text, which is the offline path.
+        let slots = self.follow_slots(&intent.raw_prompt);
+        let noun = macro_engine::search_follow_noun(intent, slots.grammar.site_context.as_deref())
+            .to_owned();
+        // Journaled so a wrong follow is attributable to the tier that chose
+        // the noun. Prompt-derived words only — no URLs, no page text.
+        let slot_log = self
+            .journal_line(format!(
+                "follow_slots: tier={} noun='{noun}'",
+                slots.source.as_str()
+            ))
+            .await;
+        let followed = match macro_engine::follow_search_result(browser, search_origin, &noun).await
+        {
+            Ok(followed) => followed,
+            Err(error) => {
+                // Journal the evidence (which links the page did offer)
+                // before failing, so a miss is diagnosable.
+                let _ = self.record(&format!("search_follow_failed: {error}")).await;
+                return Err(AppError::WorkflowFailed);
+            }
+        };
+        let mut portal = followed.landed.clone();
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        // Confinement first: every later snapshot is evaluated against the
+        // destination origin, not the search host it came from.
+        let previous = browser.reanchor_portal(&followed.landed);
+        if let Some(current) = browser.portal_anchor()
+            && previous.as_ref() != Some(&current)
+        {
+            self.journal_line(browser_driver::portal_reanchored_line(
+                previous.as_ref(),
+                &current,
+            ))
+            .await;
+        }
+        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
+        intent.entry_url = Some(followed.landed.as_str().to_owned());
+        // Host plus path only: a destination URL can carry tokens in its
+        // query string, and this line is persisted.
+        let line = self
+            .journal_line(format!(
+                "search_followed: '{}' → {}{}",
+                followed.label,
+                followed.landed.host_str().unwrap_or("?"),
+                followed.landed.path()
+            ))
+            .await;
+        // Slot tier first, then what it landed on: Session Activity reads the
+        // follow as a decision plus its result.
+        Ok(FollowedDestination {
+            portal,
+            log: format!("{slot_log}\n{line}"),
+        })
     }
 
     /// Run a stored playbook by row id with the shared run machinery.
@@ -1499,64 +1775,61 @@ impl AppService {
     }
 
     /// Cold-path entry resolution: tab-independent by design. Never inspects
-    /// the active tab's URL, never vetoes or filters against it — `(portal,
-    /// intent_class)` comes purely from prompt tokens plus the primary target
-    /// noun, queried against the normalized `portal_route` table. Shared by
-    /// the single and batch dispatch lanes. Records host plus path — never
-    /// query strings — to `session_events` and returns the exact log line so
-    /// dispatch outcomes can surface it in the Session Activity UI
-    /// immediately. Returns `None` when an entry is already present (nothing
-    /// proposed, nothing to surface).
+    /// the active tab's URL and never vetoes or filters against it — the raw
+    /// prompt is the only input, so starting on `google.com` or `about:blank`
+    /// cannot block cross-domain pre-navigation. Shared by the single and
+    /// batch dispatch lanes. Records host plus path — never query strings —
+    /// to `session_events` and returns the exact log line so dispatch
+    /// outcomes can surface it in the Session Activity UI immediately, plus
+    /// which tier answered. An entry that is already present proposes
+    /// nothing and surfaces nothing.
+    ///
+    /// Proven destinations are not resolved here at all: they live in saved
+    /// playbooks, which `resolve_command` matches upstream (tier 1) before
+    /// dispatch ever produces an ephemeral intent. This function only runs
+    /// for prompts no stored workflow claimed.
     async fn propose_entry_url(
         &self,
         prompt: &str,
         intent: &mut macro_engine::SemanticIntent,
-    ) -> Option<String> {
+    ) -> ProposedEntry {
         if intent.entry_url.is_some() {
-            return None;
+            return ProposedEntry::default();
         }
         // Production wires no account directory (no stored credential backs
-        // one) and no LLM adapter: the curated table tier fires first, with
-        // grounded search fallback when it misses.
+        // one) and no URL adapter, so the grounded search-and-follow tier
+        // answers and Stage 2 grounds the destination from a live click.
+        // The intent parser is deliberately absent here: it resolves *slots*,
+        // never URLs, so it belongs to `follow_slots` rather than this tier.
         let ctx = orchestration_engine::ResolutionContext {
             account_dir: None,
             llm: None,
+            parser: None,
         };
-        // Try the label first, then the primary target noun when it differs:
-        // both are prompt-derived topic words, so neither inspects tab state.
-        // Table/entity hits win over search: a search fallback from the
-        // label never shadows a table hit from the noun.
-        let label_resolved =
-            orchestration_engine::resolve_entry_url(prompt, &intent.label_query, &ctx);
-        let mut resolved = label_resolved;
-        if let Some(noun) = intent.primary_target_noun.as_deref()
-            && !noun.eq_ignore_ascii_case(&intent.label_query)
-        {
-            let noun_resolved = orchestration_engine::resolve_entry_url(prompt, noun, &ctx);
-            let label_is_search = resolved.as_ref().is_some_and(|route| {
-                route.source == orchestration_engine::RouteSource::SearchFallback
-            });
-            let noun_is_strong = noun_resolved.as_ref().is_some_and(|route| {
-                route.source != orchestration_engine::RouteSource::SearchFallback
-            });
-            if resolved.is_none() || (label_is_search && noun_is_strong) {
-                resolved = noun_resolved;
-            }
-        }
-        if let Some(route) = resolved {
+        if let Some(route) = orchestration_engine::resolve_entry_url(prompt, &ctx) {
             // Grounded search fallback journals its own line (query string
             // included) so Session Activity shows the template, never a
             // guessed TLD. Dispatcher navigates to the search page and
             // grounds the top result link from the live AX tree.
             if route.source == orchestration_engine::RouteSource::SearchFallback {
-                let query = route.url.query().unwrap_or("").to_owned();
+                // The decoded `q` value, not the raw query string: the line
+                // reads `q='open amazon'`, never `q='q=open+amazon'`.
+                let query = route
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "q")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
                 let line = format!(
                     "route_fallback: search q='{query}' · url={}",
                     route.url.as_str()
                 );
                 let _ = self.record(&line).await;
                 intent.entry_url = Some(route.url.as_str().to_owned());
-                return Some(line);
+                return ProposedEntry {
+                    log: Some(line),
+                    source: Some(route.source),
+                };
             }
             let line = format!(
                 "route_proposed:{}{} · source: {:?}",
@@ -1566,11 +1839,17 @@ impl AppService {
             );
             let _ = self.record(&line).await;
             intent.entry_url = Some(route.url.as_str().to_owned());
-            Some(line)
+            ProposedEntry {
+                log: Some(line),
+                source: Some(route.source),
+            }
         } else {
             let line = format!("route_resolution_miss: prompt='{prompt}'");
             let _ = self.record(&line).await;
-            Some(line)
+            ProposedEntry {
+                log: Some(line),
+                source: None,
+            }
         }
     }
 
@@ -1674,7 +1953,7 @@ impl AppService {
         // top, before any macro task step exists, so `intent.entry_url` and
         // step 1 carry the same proposed route into pre-navigation. The
         // returned log line travels on the outcome for immediate UI render.
-        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
+        let route_log = self.propose_entry_url(&prompt, &mut intent).await.log;
         let name = orchestration_engine::ephemeral_name(&prompt);
         let playbook = playbook_store::Playbook::new(
             name.clone(),
@@ -1687,8 +1966,9 @@ impl AppService {
         // before any snapshot. Re-anchor confinement to the proposed entry
         // origin so snapshots evaluate the intentional destination, not the
         // starting tab. Unauthenticated bridge sessions halt here —
-        // never snapshotted.
-        let browser = self.browser(false).await?;
+        // never snapshotted. Background: an ad-hoc run must never open a
+        // window, only reuse whatever session is already attached.
+        let browser = self.browser(BrowserIntent::Background).await?;
         Self::pre_navigate_to_step(&browser, &playbook.steps).await?;
         let telemetry_log = self.reanchor_to_entry(&browser, &playbook.steps).await;
         self.verify_bridge_auth(&portal).await?;
@@ -1704,7 +1984,7 @@ impl AppService {
             )
             .await?;
         if result.status == orchestration_engine::SequenceStatus::Completed {
-            self.remember_completed_run(&journal_id, &portal, &playbook.steps);
+            self.remember_completed_run(&journal_id, &portal, &playbook.steps, &prompt);
         }
         // The registry key travels only when the run was remembered, so the
         // Save button can offer one-click persistence without re-asking the
@@ -1742,7 +2022,7 @@ impl AppService {
         // Ephemeral entry point (command-bar Run): propose the route at the
         // top, before any macro task step exists. The log line travels on
         // every batch outcome so failures still surface the proposal.
-        let route_log = self.propose_entry_url(&prompt, &mut intent).await;
+        let route_log = self.propose_entry_url(&prompt, &mut intent).await.log;
         let (browser, run_id, journal_id, journal) = self.begin_batch_run(&portal).await?;
         let name = orchestration_engine::ephemeral_name(&prompt);
         // The proposed route lives on both `intent.entry_url` and step 1, so
@@ -1814,7 +2094,7 @@ impl AppService {
                     run_id,
                     orchestration_engine::SequencePhase::Completed,
                 );
-                self.remember_completed_run(&journal_id, &portal, &steps);
+                self.remember_completed_run(&journal_id, &portal, &steps, &prompt);
                 Ok(outcome(
                     orchestration_engine::SequenceStatus::Completed,
                     1,
@@ -1877,7 +2157,7 @@ impl AppService {
         if connected.is_none_or(|url| url.origin() != portal.origin()) {
             return Err(AppError::SessionRequired);
         }
-        let browser = self.browser(false).await?;
+        let browser = self.browser(BrowserIntent::Background).await?;
         let run_id = self.next_playbook_run.fetch_add(1, Ordering::Relaxed);
         let journal_id = format!(
             "run-{run_id}-{}",
@@ -2081,24 +2361,17 @@ impl AppService {
         (candidates, journaled)
     }
 
-    /// One batch approval naming the live candidate count and carrying the
-    /// itemized previews for the gate card. Denials flow back as `false`
-    /// for the caller to report Blocked.
-    async fn approve_batch(
-        &self,
-        run_id: u64,
-        candidates: &[browser_driver::AxElement],
-        intent: &macro_engine::SemanticIntent,
-        prompt: &str,
-        events: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
-    ) -> bool {
-        // When an entry was resolved (stored or proposed), the gate card
-        // names its destination so a wrong route is visible pre-consent.
-        // Host plus path only — query strings never reach the summary.
+    /// Gate copy for one batch approval: how many controls, of what role,
+    /// for which request, and — when an entry was resolved — where. Shared
+    /// by the ad-hoc batch lane and saved plural replays so an approval reads
+    /// identically no matter which lane raised it.
+    ///
+    /// Host plus path only: query strings can carry tokens and never reach
+    /// the summary.
+    fn batch_summary(count: usize, intent: &macro_engine::SemanticIntent, subject: &str) -> String {
         let mut summary = format!(
-            "Batch click: {} {} controls for {prompt}",
-            candidates.len(),
-            intent.role,
+            "Batch click: {count} {} controls for {subject}",
+            intent.role
         );
         if let Some(entry) = intent.entry_url.as_deref()
             && let Ok(url) = url::Url::parse(entry)
@@ -2111,13 +2384,55 @@ impl AppService {
                 url.path()
             );
         }
+        summary
+    }
+
+    /// Gate content for one intent-consent request, batch or single.
+    ///
+    /// A plural request itemizes every resolved control so the card can list
+    /// what is about to be clicked; a single-target request carries none,
+    /// because the intent already names its one target. Saved replays have no
+    /// live prompt, so the subject falls back to the phrasing the intent was
+    /// learned from, then to its label query.
+    fn intent_approval_content(approval: &orchestration_engine::IntentApproval) -> ApprovalContent {
+        let intent = &approval.intent;
+        if !approval.is_batch() {
+            return ApprovalContent {
+                kind: "intent",
+                summary: format!("{} · {}", intent.role, intent.label_query),
+                candidates: Vec::new(),
+            };
+        }
+        let subject = if intent.raw_prompt.trim().is_empty() {
+            intent.label_query.as_str()
+        } else {
+            intent.raw_prompt.as_str()
+        };
+        ApprovalContent {
+            kind: "intent",
+            summary: Self::batch_summary(approval.candidates.len(), intent, subject),
+            candidates: candidate_previews(&approval.candidates),
+        }
+    }
+
+    /// One batch approval naming the live candidate count and carrying the
+    /// itemized previews for the gate card. Denials flow back as `false`
+    /// for the caller to report Blocked.
+    async fn approve_batch(
+        &self,
+        run_id: u64,
+        candidates: &[browser_driver::AxElement],
+        intent: &macro_engine::SemanticIntent,
+        prompt: &str,
+        events: &std::sync::Mutex<&mut (impl FnMut(PlaybookEvent) + Send)>,
+    ) -> bool {
         self.approve_playbook_step(
             run_id,
             0,
             1,
             ApprovalContent {
                 kind: "intent",
-                summary,
+                summary: Self::batch_summary(candidates.len(), intent, prompt),
                 candidates: candidate_previews(candidates),
             },
             events,
@@ -2222,7 +2537,7 @@ impl AppService {
             return Err(AppError::SessionRequired);
         }
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
-        let browser = self.browser(false).await?;
+        let browser = self.browser(BrowserIntent::Background).await?;
         // Saved cross-domain playbooks replay from their entry route, not
         // the connected portal: navigate first (no-op when already there),
         // then bind confinement to the intentional destination so snapshots
@@ -2286,16 +2601,15 @@ impl AppService {
                     &events,
                 )
             },
-            |index, intent| {
+            |index, approval| {
+                // Plural saved steps arrive with their resolved controls
+                // attached, so the gate itemizes exactly what the batch will
+                // click. Single-target steps carry none and read as before.
                 self.approve_playbook_step(
                     run_id,
                     index,
                     total_steps,
-                    ApprovalContent {
-                        kind: "intent",
-                        summary: format!("{} · {}", intent.role, intent.label_query),
-                        candidates: Vec::new(),
-                    },
+                    Self::intent_approval_content(&approval),
                     &events,
                 )
             },
@@ -2368,7 +2682,7 @@ impl AppService {
         &self,
         emit: impl Fn(browser_driver::ScreencastFrame) + Send + 'static,
     ) -> Result<ContextStatus, AppError> {
-        let browser = self.browser(true).await?;
+        let browser = self.browser(BrowserIntent::Background).await?;
         browser
             .start_screencast()
             .await
@@ -2426,7 +2740,8 @@ impl AppService {
     /// directly interactive. Streaming, if active, keeps running for the
     /// preview card.
     pub async fn take_control(&self) -> Result<ContextStatus, AppError> {
-        let browser = self.browser(false).await?;
+        // The one and only path that may put a window on screen.
+        let browser = self.browser(BrowserIntent::Interactive).await?;
         Ok(ContextStatus {
             attached: true,
             headless: browser.is_headless(),
@@ -2483,7 +2798,7 @@ fn default_chromium() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[tokio::test]
     async fn task_run_requires_a_connected_session_and_exclusive_browser_access()
@@ -2629,23 +2944,46 @@ mod tests {
         Ok(())
     }
 
-    /// Restores `CLINCH_CHROMIUM_PATH` on drop so the hermetic launch
-    /// failure below never leaks into other tests sharing the process.
-    struct ChromiumEnvGuard {
+    /// Serializes every holder of [`ChromiumEnvGuard`].
+    ///
+    /// `CLINCH_CHROMIUM_PATH` is process-wide, and several tests in this
+    /// binary point it at a nonexistent executable to prove a launch fails
+    /// closed. Without a lock they interleave: the first guard to drop
+    /// restores the variable (usually by removing it) while another test is
+    /// still mid-launch, which then finds the real Chromium on the machine
+    /// and stops failing. That reads as a flaky assertion far from its cause,
+    /// so the mutation is serialized rather than merely documented as safe.
+    static CHROMIUM_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Points `CLINCH_CHROMIUM_PATH` at a nonexistent binary for the guard's
+    /// lifetime, restoring the prior value on drop.
+    ///
+    /// Holds [`CHROMIUM_ENV_LOCK`] for its whole lifetime, so exactly one
+    /// test at a time observes the bogus path. Shared with the IPC suite in
+    /// `crate::tests` so both serialize against the same lock — two guards
+    /// with two locks would not be a guard at all.
+    pub(crate) struct ChromiumEnvGuard {
         prior: Option<std::ffi::OsString>,
+        /// Poisoning is irrelevant here: the lock protects an env var, not an
+        /// invariant a panicking test could corrupt.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     #[allow(unsafe_code)]
     impl ChromiumEnvGuard {
-        fn hold_bogus() -> Self {
+        pub(crate) fn hold_bogus() -> Self {
+            let lock = CHROMIUM_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prior = std::env::var_os("CLINCH_CHROMIUM_PATH");
-            // Edition 2024 marks env mutation unsafe (process-wide); no
-            // other test here launches a browser, so nothing else reads the
-            // variable during the guard's lifetime.
+            // Edition 2024 marks env mutation unsafe (process-wide). Sound
+            // because the lock above makes this the only live mutator, and
+            // every browser-launching fixture either holds this guard or is
+            // `#[ignore]`d.
             unsafe {
                 std::env::set_var("CLINCH_CHROMIUM_PATH", "nonexistent-chromium-hermetic-test");
             }
-            Self { prior }
+            Self { prior, _lock: lock }
         }
     }
 
@@ -2662,6 +3000,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn background_acquisition_never_requests_a_window() {
+        // The window-visibility contract, provable without Chromium.
+        // 1. Background launches headless; only interactive launches headed.
+        assert!(BrowserIntent::Background.launch_options().headless);
+        assert!(!BrowserIntent::Interactive.launch_options().headless);
+        // 2. Dormant: both intents launch, each under its own mode.
+        assert_eq!(
+            acquire_action(BrowserIntent::Background, None),
+            AcquireAction::Launch
+        );
+        assert_eq!(
+            acquire_action(BrowserIntent::Interactive, None),
+            AcquireAction::Launch
+        );
+        // 3. Background NEVER restarts, in either direction: it cannot
+        //    promote a headless context into a window, and it cannot demote
+        //    a window the user opened with Take Control.
+        for attached in [true, false] {
+            assert_eq!(
+                acquire_action(BrowserIntent::Background, Some(attached)),
+                AcquireAction::Reuse,
+                "background must reuse an attached session (headless={attached})"
+            );
+        }
+        // 4. Interactive restarts only when the live session has no window,
+        //    and reuses an already-visible one.
+        assert_eq!(
+            acquire_action(BrowserIntent::Interactive, Some(true)),
+            AcquireAction::Restart
+        );
+        assert_eq!(
+            acquire_action(BrowserIntent::Interactive, Some(false)),
+            AcquireAction::Reuse
+        );
+    }
+
+    #[tokio::test]
+    async fn background_dispatch_fails_closed_without_opening_a_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Ad-hoc dispatch with no session and no usable Chromium: the run
+        // must fail closed on launch rather than falling back to a headed
+        // window. The guard below also proves the launch was attempted
+        // (`BrowserUnavailable`, not `SessionRequired`) and that nothing
+        // stayed attached afterwards.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let _chromium = ChromiumEnvGuard::hold_bogus();
+        assert!(matches!(
+            service.browser(BrowserIntent::Background).await,
+            Err(AppError::BrowserUnavailable)
+        ));
+        assert!(!service.context_status().map_err(|_| "status")?.attached);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2757,12 +3152,15 @@ mod tests {
                 .is_ok()
         );
         let listed = service.list_playbooks().await.map_err(|_| "list")?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "run");
-        assert_eq!(listed[0].step_count, 1);
+        // Seeded defaults share the list with user saves, so match by name.
+        let saved_row = listed
+            .iter()
+            .find(|summary| summary.name == "run")
+            .ok_or("saved row listed")?;
+        assert_eq!(saved_row.step_count, 1);
         // No portal connected: execution is rejected before any browser I/O.
         assert!(matches!(
-            service.execute_playbook(listed[0].id.clone(), |_| {}).await,
+            service.execute_playbook(saved_row.id.clone(), |_| {}).await,
             Err(AppError::SessionRequired)
         ));
         // No pending gate: decisions fail closed without side effects.
@@ -2972,10 +3370,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn propose_entry_attaches_validated_table_route() -> Result<(), Box<dyn std::error::Error>>
+    async fn test_saved_playbook_plural_batch_execution() -> Result<(), Box<dyn std::error::Error>>
     {
+        // The learning loop for a plural command, end to end and browserless:
+        // an ad-hoc plural prompt resolves to an is_plural intent, that intent
+        // is saved as a playbook, it reloads plural out of SQLite, and
+        // replaying it raises the *batch* gate — itemizing every resolved
+        // control before any CDP click — rather than silently clicking one.
+        //
+        // Candidates come from the shared hermetic billing-history fixture
+        // through `resolve_batch`, the same collector `execute_batch` uses, and
+        // the gate is the real one `decide_playbook` answers. What a live
+        // Chromium adds on top is the clicking itself, covered by the
+        // opt-in runner test in orchestration-engine.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://github.com/")?;
+        let prompt = "download all my invoices from github";
+        let matched = orchestration_engine::resolve_command(prompt, Some(&portal), &[]);
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) = matched else {
+            panic!("plural prompt resolves to an ephemeral intent");
+        };
+        assert!(intent.is_plural, "the prompt is plural");
+        // The entry a completed ad-hoc run would have proven and carried into
+        // storage; the gate names it so a wrong route is visible pre-consent.
+        intent.entry_url = Some("https://github.com/account/billing/history".into());
+
+        let id = service
+            .save_playbook(
+                "github_invoices_all".into(),
+                portal.to_string(),
+                vec![playbook_store::Step::Semantic {
+                    intent: intent.clone(),
+                }],
+            )
+            .await
+            .map_err(|_| "save")?;
+        let reloaded = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .load_playbook(&id)
+            .await?;
+        let [playbook_store::Step::Semantic { intent: saved }] = reloaded.steps.as_slice() else {
+            panic!("the saved playbook holds exactly one semantic step");
+        };
+        assert!(
+            saved.is_plural,
+            "the plural flag survives the steps_json round-trip"
+        );
+
+        // Exactly what the runner hands the gate: the fixture's three invoice
+        // rows, header excluded and page chrome never admitted.
+        let candidates = billing_history_candidates(saved)?;
+        assert_eq!(candidates.len(), 3, "every invoice row joins the batch");
+
+        // Both decisions, through the real single-flight gate: approval is
+        // granted only when given, and a rejection fails closed.
+        let request = orchestration_engine::IntentApproval::batch(saved.clone(), candidates);
+        assert!(request.is_batch());
+        let expected_summary = format!(
+            "Batch click: 3 {} controls for {prompt} @ github.com/account/billing/history",
+            saved.role
+        );
+        for (run_id, decision) in [(70_u64, true), (71, false)] {
+            let (granted, gate) = drive_one_gate(&service, run_id, &request, decision).await?;
+            assert_eq!(granted, decision, "the gate returns the decision given");
+            assert_eq!(gate.kind, "intent");
+            // The count and the destination are both visible pre-consent, and
+            // only the host and path of the entry route reach the summary.
+            assert_eq!(gate.summary, expected_summary);
+            assert_batch_previews(&gate.candidates);
+        }
+
+        // The contrast that keeps the two lanes legible: a single-target step
+        // raises a candidate-free gate reading as it always has.
+        let mut single = saved.clone();
+        single.is_plural = false;
+        let single = AppService::intent_approval_content(
+            &orchestration_engine::IntentApproval::single(single),
+        );
+        assert_eq!(
+            single.summary,
+            format!("{} · {}", saved.role, saved.label_query)
+        );
+        assert!(single.candidates.is_empty());
+        Ok(())
+    }
+
+    /// Batch candidates the engine itself would collect from the shared
+    /// hermetic billing-history tree — no browser, no hand-built elements, so
+    /// the fixture and production agree on what a row candidate is.
+    fn billing_history_candidates(
+        intent: &macro_engine::SemanticIntent,
+    ) -> Result<Vec<browser_driver::AxElement>, Box<dyn std::error::Error>> {
+        let nodes: Vec<browser_driver::AxNode> = serde_json::from_value(
+            browser_driver::test_utils::fake_cdp::billing_history_tree()
+                .get("nodes")
+                .cloned()
+                .unwrap_or_default(),
+        )?;
+        let elements = browser_driver::interactive_elements(&nodes);
+        match macro_engine::resolve_batch(&elements, intent) {
+            macro_engine::ResolveOutcome::BatchMatch(batch) => Ok(batch),
+            other => Err(format!("the billing rows resolve as a batch, got {other:?}").into()),
+        }
+    }
+
+    /// Raise one real gate and answer it, returning the decision the run saw
+    /// plus the card the UI was shown.
+    async fn drive_one_gate(
+        service: &AppService,
+        run_id: u64,
+        request: &orchestration_engine::IntentApproval,
+        decision: bool,
+    ) -> Result<(bool, PlaybookApproval), Box<dyn std::error::Error>> {
+        let mut captured: Vec<PlaybookEvent> = Vec::new();
+        let mut push = |event: PlaybookEvent| captured.push(event);
+        let events = std::sync::Mutex::new(&mut push);
+        let (granted, ()) = tokio::join!(
+            service.approve_playbook_step(
+                run_id,
+                0,
+                1,
+                AppService::intent_approval_content(request),
+                &events,
+            ),
+            async {
+                tokio::task::yield_now().await;
+                let _ = service.decide_playbook(run_id, 0, decision);
+            }
+        );
+        let gate = captured
+            .first()
+            .and_then(|event| event.approval.clone())
+            .ok_or("one gate card is emitted")?;
+        Ok((granted, gate))
+    }
+
+    /// Every preview carries what makes three identical "Download" labels
+    /// distinguishable: document position, role, chrome status, and the row
+    /// evidence naming its invoice.
+    fn assert_batch_previews(candidates: &[CandidatePreview]) {
+        assert_eq!(candidates.len(), 3);
+        assert!(
+            candidates
+                .iter()
+                .enumerate()
+                .all(|(index, candidate)| candidate.index == index
+                    && candidate.label == "Download"
+                    && candidate.role == "link"
+                    && !candidate.is_landmark),
+            "previews carry position, label, role, and chrome status: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().all(|candidate| candidate
+                .container
+                .as_deref()
+                .is_some_and(|text| text.contains("INV-"))),
+            "each preview names the invoice its row belongs to: {candidates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_entry_grounds_search_with_no_static_route_table()
+    -> Result<(), Box<dyn std::error::Error>> {
         // No browser, no database: the tiered proposer is pure until the
         // record call, which fails open without an initialized pool.
+        //
+        // With the curated `(portal, class)` table deleted, a portal-shaped
+        // prompt no longer resolves to an invented deep link. It advances to
+        // the fixed search template and owes a Stage-2 follow, which grounds
+        // the real destination from a live click. Proven destinations come
+        // from saved playbooks (tier 1) instead, resolved before dispatch.
         let service = AppService::new(PathBuf::new(), PathBuf::new());
         let mut intent = macro_engine::SemanticIntent {
             role: "link".into(),
@@ -2988,36 +3556,57 @@ mod tests {
             entry_url: None,
             primary_target_noun: Some("invoice".into()),
         };
-        service
+        let proposed = service
             .propose_entry_url("download all my invoices from github", &mut intent)
             .await;
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://github.com/account/billing/history")
+            Some("https://www.google.com/search?q=download+all+invoices+from+github")
         );
-        // Table misses advance to grounded search fallback (never a bare
-        // miss): unknown prompts carry the fixed template, no guessed TLDs.
+        assert!(proposed.needs_search_follow());
+        // No deep link is ever fabricated for the portal named in the prompt.
+        assert!(
+            !intent
+                .entry_url
+                .as_deref()
+                .unwrap_or("")
+                .contains("github.com/account")
+        );
+        // Unknown prompts behave identically — there is no privileged portal
+        // vocabulary left to branch on.
         let mut other = intent.clone();
         other.label_query = "dashboard".into();
         other.primary_target_noun = None;
         other.entry_url = None;
-        let line = service
+        let proposed = service
             .propose_entry_url("open the dashboard", &mut other)
             .await;
+        // Filler (`the`) is stripped from the query by sanitization.
         assert_eq!(
             other.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=open+the+dashboard")
+            Some("https://www.google.com/search?q=open+dashboard")
         );
-        assert!(line.is_some_and(|line| line.starts_with("route_fallback: search")));
+        // A search entry still owes a Stage-2 follow before it can run.
+        assert!(proposed.needs_search_follow());
+        assert!(
+            proposed
+                .log
+                .as_deref()
+                .is_some_and(|line| line.starts_with("route_fallback: search"))
+        );
+        // An entry already present (a saved playbook's own route) proposes
+        // nothing and is never overwritten by a search template.
         let mut preset = intent.clone();
         preset.entry_url = Some("https://github.com/account/billing/history".into());
-        service
+        let proposed = service
             .propose_entry_url("download all my invoices from github", &mut preset)
             .await;
         assert_eq!(
             preset.entry_url.as_deref(),
             Some("https://github.com/account/billing/history")
         );
+        assert!(proposed.log.is_none());
+        assert!(!proposed.needs_search_follow());
         Ok(())
     }
 
@@ -3049,8 +3638,10 @@ mod tests {
         assert_eq!(intent.entry_url, None);
         service.propose_entry_url(prompt, &mut intent).await;
         // Explicit propagation: the proposed route lands on both the intent
-        // and step 1 of the ephemeral task.
-        let expected = "https://github.com/account/billing/history";
+        // and step 1 of the ephemeral task. With no static route table the
+        // proposal is the grounded search template; Stage 2 rewrites
+        // `entry_url` to the landed destination before the batch runs.
+        let expected = "https://www.google.com/search?q=download+all+invoices+from+github";
         assert_eq!(intent.entry_url.as_deref(), Some(expected));
         let steps = [playbook_store::Step::Semantic {
             intent: intent.clone(),
@@ -3068,16 +3659,16 @@ mod tests {
         let current = url::Url::parse("https://google.com")?;
         let entry = url::Url::parse(step_intent.entry_url.as_deref().ok_or("entry")?)?;
         assert!(macro_engine::entry_url_mismatched(&current, &entry));
-        // Session Activity carries the proposal (host + path, never query).
+        // Session Activity carries the proposal.
         let pool = service.database().await.map_err(|_| "database")?;
         let rows: Vec<(String,)> = sqlx::query_as("SELECT outcome FROM session_events")
             .fetch_all(pool)
             .await
             .map_err(|_| "events")?;
         assert!(
-            rows.iter().any(|(outcome,)| outcome
-                .starts_with("route_proposed:github.com/account/billing/history")),
-            "route_proposed logged, got {rows:?}"
+            rows.iter()
+                .any(|(outcome,)| outcome.starts_with("route_fallback: search")),
+            "route_fallback logged, got {rows:?}"
         );
         Ok(())
     }
@@ -3110,9 +3701,14 @@ mod tests {
             panic!("ad-hoc prompt resolves ephemeral");
         };
         service.propose_entry_url(prompt, &mut intent).await;
+        // Ad-hoc prompts resolve through grounded search now that no static
+        // route table exists; Stage 2 replaces this with the landed
+        // destination at run time. Grammar slots survive persistence: the
+        // artifact noun anchors the batch, the `github` complement was the
+        // destination cue and is not the batch anchor.
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://github.com/account/billing/history")
+            Some("https://www.google.com/search?q=download+all+invoices+from+github")
         );
         assert!(intent.is_plural);
         assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
@@ -3121,7 +3717,7 @@ mod tests {
         let steps = vec![playbook_store::Step::Semantic {
             intent: intent.clone(),
         }];
-        service.remember_completed_run("run-1-test", &portal, &steps);
+        service.remember_completed_run("run-1-test", &portal, &steps, prompt);
         // Persist through the IPC command under test, with a memo. Unknown
         // ids fail closed without touching storage.
         let playbook_id = service
@@ -3152,6 +3748,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_fallback_auto_clicks_first_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use browser_driver::test_utils::fake_cdp::{
+            FakeCdpClient, FakeCdpServer, ScriptStep, search_results_tree,
+        };
+        use std::time::Duration;
+        // End-to-end Stage 1 → Stage 2 over scripted CDP traffic, with no
+        // Chromium binary: search landing → candidate link selection →
+        // re-anchored destination navigation.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+
+        // Stage 1: the prompt resolves to the search template, not a guessed
+        // TLD, and reports that a follow is still owed.
+        let prompt = "open amazon for me";
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
+            orchestration_engine::resolve_command(
+                prompt,
+                url::Url::parse("https://www.google.com/").ok().as_ref(),
+                &[],
+            )
+        else {
+            panic!("ad-hoc prompt resolves ephemeral");
+        };
+        let proposed = service.propose_entry_url(prompt, &mut intent).await;
+        assert!(proposed.needs_search_follow(), "search tier answered");
+        let search_entry = intent.entry_url.clone().ok_or("search entry")?;
+        assert_eq!(
+            search_entry, "https://www.google.com/search?q=open+amazon",
+            "sanitized query, fixed host"
+        );
+        for guess in ["amazon.com", "amazon.in"] {
+            assert!(!search_entry.contains(guess), "no TLD guessing: {guess}");
+        }
+
+        // Stage 2 selection, over the real AX tree the results page returns.
+        let fake = FakeCdpServer::start(vec![ScriptStep::reply(
+            "Accessibility.getFullAXTree",
+            search_results_tree(),
+        )])
+        .await
+        .map_err(|error| format!("fake server failed to start: {error}"))?;
+        // Stage 2's noun comes from the same cascade the live lane uses. This
+        // prompt is a crisp direct action, so grammar answers it on the fast
+        // path and the parser seam is never consulted.
+        let slots = service.follow_slots(&intent.raw_prompt);
+        assert_eq!(
+            slots.source,
+            orchestration_engine::SlotSource::GrammarFastPath
+        );
+        let noun = macro_engine::search_follow_noun(&intent, slots.grammar.site_context.as_deref())
+            .to_owned();
+        assert_eq!(noun, "amazon", "target noun drives the follow");
+        let run = async {
+            let mut client = FakeCdpClient::connect(fake.url()).await?;
+            let tree = client
+                .call("Accessibility.getFullAXTree", serde_json::json!({}))
+                .await?;
+            let nodes: Vec<browser_driver::AxNode> =
+                serde_json::from_value(tree.get("nodes").cloned().unwrap_or_default())
+                    .map_err(|error| format!("bad tree: {error}"))?;
+            let elements = browser_driver::interactive_elements(&nodes);
+            let picked = macro_engine::select_search_result(&elements, &noun)
+                .ok_or("a result must be selected")?;
+            // The engine's own nav links come first in document order and
+            // also say "Amazon": the landmark gate must skip them.
+            assert_eq!(picked.name, "Amazon.in - Online Shopping");
+            assert_eq!(picked.backend_node_id, 2);
+            assert!(picked.landmark.is_none(), "never page chrome");
+            // The non-matching competitor ahead of it is skipped by the noun
+            // gate, so this is not merely "first organic link".
+            assert!(
+                elements
+                    .iter()
+                    .any(|element| element.name == "Flipkart Online Shopping"),
+                "competitor present but not chosen"
+            );
+            // An absent noun fails closed instead of clicking something.
+            assert!(macro_engine::select_search_result(&elements, "nonexistentbrand").is_none());
+            assert!(macro_engine::select_search_result(&elements, "").is_none());
+            assert_eq!(fake.received_methods(), vec!["Accessibility.getFullAXTree"]);
+            assert!(fake.violations().is_empty());
+            client.close().await;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run).await;
+        fake.shutdown();
+        outcome.map_err(|_| "fake CDP roundtrip timed out")??;
+
+        // Stage 2 landing: confinement re-anchors to the observed
+        // destination, so the destination page is no longer "drift" even
+        // though the run was requested against the search origin.
+        let search_origin = url::Url::parse("https://www.google.com/")?;
+        let landed = url::Url::parse("https://www.amazon.in/ref=nav_logo")?;
+        assert!(
+            browser_driver::portal_reanchored_line(Some(&search_origin), &landed)
+                .starts_with("portal_reanchored: https://www.google.com/ → "),
+            "transition journaled"
+        );
+        // The run portal becomes the landed origin, query/fragment stripped.
+        let mut portal = landed.clone();
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        assert_eq!(portal.as_str(), "https://www.amazon.in/");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_persist_ephemeral_run_to_playbook_and_replay()
     -> Result<(), Box<dyn std::error::Error>> {
         use browser_driver::test_utils::fake_cdp::{FakeCdpClient, FakeCdpServer, ScriptStep};
@@ -3169,7 +3875,7 @@ mod tests {
         assert_eq!(playbook.origin, portal);
         assert_eq!(
             saved.entry_url.as_deref(),
-            Some("https://github.com/account/billing/history")
+            Some("https://www.google.com/search?q=download+all+invoices+from+github")
         );
         assert!(saved.is_plural);
         assert_eq!(saved.primary_target_noun.as_deref(), Some("invoice"));
@@ -3223,6 +3929,141 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_secs(10), run).await;
         fake.shutdown();
         outcome.map_err(|_| "fake CDP roundtrip timed out")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_consent_gated_playbook_saving() -> Result<(), Box<dyn std::error::Error>> {
+        // The learning loop only closes on an explicit click. A completed run
+        // is *offered* for saving; declining it — which in the UI means simply
+        // not pressing the button — must leave the store untouched, or every
+        // throwaway prompt would accumulate as a workflow.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://aws.amazon.com/")?;
+        let prompt = "pull up what I owe on aws";
+        let steps = vec![playbook_store::Step::Semantic {
+            intent: macro_engine::SemanticIntent {
+                role: "link".into(),
+                label_query: "bill".into(),
+                container_query: None,
+                raw_prompt: prompt.into(),
+                ordinal_index: None,
+                is_last: false,
+                is_plural: false,
+                entry_url: Some("https://aws.amazon.com/billing/".into()),
+                primary_target_noun: Some("bill".into()),
+            },
+        }];
+        let baseline = service.list_playbooks().await.map_err(|_| "list")?.len();
+        // Run completes and is remembered in session memory.
+        service.remember_completed_run("run-consent", &portal, &steps, prompt);
+        // Declined: the card was shown and not accepted. Nothing persists.
+        assert_eq!(
+            service.list_playbooks().await.map_err(|_| "list")?.len(),
+            baseline,
+            "remembering a run must not persist it"
+        );
+        // Accepted: the explicit save command is the consent.
+        let id = service
+            .save_run_as_workflow(
+                "run-consent".into(),
+                "aws-bills".into(),
+                Some("Monthly AWS".into()),
+            )
+            .await
+            .map_err(|_| "save")?;
+        let listed = service.list_playbooks().await.map_err(|_| "list")?;
+        assert_eq!(listed.len(), baseline + 1);
+        let row = listed
+            .iter()
+            .find(|summary| summary.id == id)
+            .ok_or("saved row listed")?;
+        // Saved exactly what replays today — origin, entry route, slots — plus
+        // the prompt key that closes the loop. No imagined macro recording.
+        assert_eq!(
+            row.prompt_key.as_deref(),
+            Some("pull up what i owe on aws"),
+            "the prompt becomes the key"
+        );
+        assert_eq!(row.description.as_deref(), Some("Monthly AWS"));
+        let playbook = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .load_playbook(&id)
+            .await
+            .map_err(|_| "load")?;
+        assert_eq!(playbook.origin, portal);
+        let [playbook_store::Step::Semantic { intent }] = playbook.steps.as_slice() else {
+            return Err("single semantic step".into());
+        };
+        assert_eq!(
+            intent.entry_url.as_deref(),
+            Some("https://aws.amazon.com/billing/")
+        );
+        // Second invocation of the same phrasing is now a tier-1 hit: the
+        // command router matches the stored key instead of re-resolving.
+        let saved = service
+            .playbooks()
+            .await
+            .map_err(|_| "store")?
+            .list_playbooks()
+            .await
+            .map_err(|_| "list")?;
+        assert_eq!(
+            orchestration_engine::resolve_command(prompt, Some(&portal), &saved),
+            Some(orchestration_engine::CommandMatch::Saved { id: id.clone() }),
+            "learned phrasing replays from storage"
+        );
+        // An unknown or evicted run still fails closed rather than inventing
+        // a workflow to save.
+        assert!(matches!(
+            service
+                .save_run_as_workflow("no-such-run".into(), "ghost".into(), None)
+                .await,
+            Err(AppError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn intent_parser_seam_is_wired_but_declines_by_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Shipped posture: the seam exists and is consulted, but the default
+        // adapter declines, so no model is required, no key is needed, and no
+        // prompt leaves the machine. Low-confidence prompts degrade to raw
+        // search rather than failing.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        let irregular = "pull up what I owe on aws";
+        let slots = service.follow_slots(irregular);
+        assert_eq!(
+            slots.source,
+            orchestration_engine::SlotSource::Ungrounded,
+            "the stub declines, so slots stay ungrounded"
+        );
+        // Crisp prompts never reach the seam at all.
+        assert_eq!(
+            service.follow_slots("download invoices from github").source,
+            orchestration_engine::SlotSource::GrammarFastPath
+        );
+        // Swapping in an adapter is the only change needed to light up tier
+        // 2B — the plumbing above it is already live.
+        let double = std::sync::Arc::new(orchestration_engine::TestDoubleIntentParser::answering(
+            orchestration_engine::ParsedSlots {
+                action: "link".into(),
+                artifact_noun: Some("bill".into()),
+                site_context: Some("aws".into()),
+            },
+        ));
+        let wired = AppService::new(dir.path().to_owned(), dir.path().to_owned())
+            .with_intent_parser(double.clone());
+        let slots = wired.follow_slots(irregular);
+        assert_eq!(slots.source, orchestration_engine::SlotSource::IntentParser);
+        assert_eq!(slots.grammar.site_context.as_deref(), Some("aws"));
+        assert_eq!(double.calls(), 1);
         Ok(())
     }
 
@@ -3534,19 +4375,23 @@ mod tests {
             entry_url: None,
             primary_target_noun: Some("amazon".into()),
         };
-        let line = service
+        let proposed = service
             .propose_entry_url("open amazon for me", &mut intent)
             .await;
+        // Sanitized query: no `for`, no `me`, and no guessed amazon TLD.
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=open+amazon+for+me")
+            Some("https://www.google.com/search?q=open+amazon")
         );
-        let line = line.ok_or("route line")?;
+        assert!(proposed.needs_search_follow());
+        let line = proposed.log.ok_or("route line")?;
         assert!(line.starts_with("route_fallback: search"), "got {line:?}");
+        // The decoded query reads cleanly — never a doubled `q=q=`.
         assert!(
-            line.contains("open+amazon+for+me"),
-            "query journaled, got {line:?}"
+            line.contains("q='open amazon'"),
+            "decoded query journaled, got {line:?}"
         );
+        assert!(!line.contains("q='q="), "no doubled prefix, got {line:?}");
         assert!(
             !intent
                 .entry_url
@@ -3590,8 +4435,17 @@ mod tests {
         let events = service.test_session_events().await.map_err(|_| "events")?;
         assert!(
             events.iter().any(|outcome| outcome
-                == "route_fallback: search q='q=open+amazon+for+me' · url=https://www.google.com/search?q=open+amazon+for+me"),
-            "search fallback journaled, got {events:?}"
+                == "route_fallback: search q='open amazon' · url=https://www.google.com/search?q=open+amazon"),
+            "sanitized search fallback journaled, got {events:?}"
+        );
+        // Stage 2 never ran here (the browser could not launch), so no
+        // destination was claimed: the run failed instead of reporting the
+        // search page as the completed navigation.
+        assert!(
+            !events
+                .iter()
+                .any(|outcome| outcome.starts_with("search_followed:")),
+            "no destination claimed without a browser, got {events:?}"
         );
         // Session auto-anchored to the search origin (Portal URL was never
         // required).

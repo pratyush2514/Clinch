@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
 mod entity_resolver;
+mod intent_parser;
 mod intent_resolver;
-mod portal_routes;
 mod route_proposer;
 mod runner;
 mod store;
@@ -10,20 +10,23 @@ mod task;
 mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
+pub use intent_parser::{
+    IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,
+    parse_prompt_bounded,
+};
 pub use intent_resolver::{
-    CommandMatch, ExtractedVariable, ParsedIntent, VariableExtraction, VariableKind,
-    decompose_command, ephemeral_name, extract_dynamic_variables, extract_identifier,
-    parse_intent_structured, resolve_command,
+    CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent, VariableExtraction,
+    VariableKind, decompose_command, ephemeral_name, extract_dynamic_variables, extract_identifier,
+    parse_grammar, parse_intent_structured, prompt_key, resolve_command,
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
-pub use portal_routes::portal_route;
 pub use route_proposer::{
-    LlmUrlProposer, ResolutionContext, ResolvedRoute, RouteSource, detect_portal, propose_route,
-    resolve_entry_url,
+    LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, SlotSource,
+    resolve_entry_url, resolve_slots, sanitize_search_query, search_fallback_url,
 };
 pub use runner::{
-    SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError, StepOutcome,
-    execute_step, run_playbook_sequence,
+    IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,
+    StepOutcome, execute_step, run_playbook_sequence,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;

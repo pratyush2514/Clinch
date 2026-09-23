@@ -20,6 +20,10 @@ const MAX_NAME_LEN: usize = 64;
 /// Free-text memo bound: long enough for one UI line, short enough to keep
 /// workflow-list rows compact.
 pub const MAX_DESCRIPTION_LEN: usize = 280;
+/// Prompt-key bound. Keys are normalized user prompts, which the intent
+/// layer already truncates well below this; the cap exists so a pathological
+/// prompt cannot become an unbounded index key.
+pub const MAX_PROMPT_KEY_LEN: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -59,6 +63,19 @@ pub struct Playbook {
     /// envelopes byte-identical to v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Normalized prompt this workflow was learned from, if any.
+    ///
+    /// This is the learning loop's index: when a run resolved through the
+    /// intent-parser seam or raw search and the user chose to save it, the
+    /// prompt that produced it lands here. A later invocation of the same
+    /// prompt then matches this key exactly and replays from storage instead
+    /// of parsing again — the ambiguous phrasing is learned once.
+    ///
+    /// Metadata, never executed: it selects a workflow, it does not steer
+    /// one. `#[serde(default)]` plus skip-on-none keeps envelopes written
+    /// before the field existed byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_key: Option<String>,
 }
 
 impl Playbook {
@@ -71,6 +88,7 @@ impl Playbook {
             origin,
             steps,
             description: None,
+            prompt_key: None,
         };
         playbook.validate()?;
         Ok(playbook)
@@ -81,6 +99,16 @@ impl Playbook {
     #[must_use]
     pub fn with_description(mut self, description: Option<String>) -> Self {
         self.description = description;
+        self
+    }
+
+    /// Attach the normalized prompt this workflow was learned from, closing
+    /// the learning loop for that phrasing. Builder-style like
+    /// [`Self::with_description`]; bounds are enforced by
+    /// [`Playbook::validate`].
+    #[must_use]
+    pub fn with_prompt_key(mut self, prompt_key: Option<String>) -> Self {
+        self.prompt_key = prompt_key;
         self
     }
 
@@ -104,6 +132,16 @@ impl Playbook {
             .description
             .as_deref()
             .is_some_and(|memo| memo.len() > MAX_DESCRIPTION_LEN)
+        {
+            return Err(SchemaError::Invalid);
+        }
+        // A present key must be a usable index: blank keys would match every
+        // blank prompt, and oversized ones are refused rather than truncated
+        // (truncation would collide two different prompts into one workflow).
+        if self
+            .prompt_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty() || key.len() > MAX_PROMPT_KEY_LEN)
         {
             return Err(SchemaError::Invalid);
         }
@@ -178,6 +216,69 @@ impl Playbook {
         playbook.validate()?;
         Ok(playbook)
     }
+}
+
+/// Proven workflows seeded into a database on initialization, so resolution
+/// tier 1 (saved playbooks) answers the flows a static route table used to
+/// carry. Nothing about them is special at read or run time: they are
+/// ordinary validated envelopes, so replay, drift approval, renaming, and
+/// the workflow list treat them exactly like a user's own recordings.
+///
+/// # Errors
+/// Returns [`SchemaError::Invalid`] if a seed definition stops validating —
+/// asserted never to happen by this module's tests, since a seed that fails
+/// here would fail the whole database open.
+pub fn seeded_playbooks() -> Result<Vec<Playbook>, SchemaError> {
+    // GitHub invoice route. `github.com/account/billing/history` is the
+    // Billing History page whose per-payment table holds the invoice links;
+    // it sits behind sign-in, matching the app's authenticated-session model.
+    // The entry URL carries that route, so a replay lands on the invoice
+    // table instead of a portal home page.
+    //
+    // Single-target on purpose, and it is a choice rather than a limitation:
+    // `orchestration_engine::execute_step` honors `is_plural` on saved steps
+    // too, routing them through `execute_batch` behind the same
+    // candidate-preview approval gate the ad-hoc lane uses. This seed asks for
+    // one invoice because that is what it promises; "download *all* my
+    // invoices" phrases a plural intent, which the command resolver keeps
+    // ephemeral on first run and which replays plurally once saved.
+    //
+    // The noun is not redundant here: settle polling gates readiness on
+    // `resolve_batch`, so the run waits for real invoice rows to render
+    // rather than grounding on a bare column header.
+    let playbooks = vec![
+        Playbook::new(
+            "github-invoices".into(),
+            Url::parse("https://github.com/").map_err(|_| SchemaError::Invalid)?,
+            vec![Step::Semantic {
+                intent: SemanticIntent {
+                    role: "link".into(),
+                    label_query: "invoice".into(),
+                    container_query: None,
+                    raw_prompt: "download my invoice from github billing history".into(),
+                    ordinal_index: None,
+                    is_last: false,
+                    is_plural: false,
+                    entry_url: Some("https://github.com/account/billing/history".into()),
+                    primary_target_noun: Some("invoice".into()),
+                },
+            }],
+        )?
+        .with_description(Some(
+            "Download an invoice from GitHub billing history.".into(),
+        ))
+        // Pre-learned key: this phrasing is a tier-1 hit on a fresh install,
+        // with no run needed to teach it. Normalized form — lowercase,
+        // single-spaced — matching what the intent layer derives from a live
+        // prompt.
+        .with_prompt_key(Some("download github invoices".into())),
+    ];
+    // `with_description` is builder-style and does not re-validate, so the
+    // memo bound is enforced here before any seed reaches storage.
+    for playbook in &playbooks {
+        playbook.validate()?;
+    }
+    Ok(playbooks)
 }
 
 #[cfg(test)]

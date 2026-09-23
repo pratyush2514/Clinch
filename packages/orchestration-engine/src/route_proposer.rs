@@ -2,38 +2,62 @@
 //! Tiered cold-path entry resolution: attach a navigable `entry_url` to
 //! ad-hoc intents that have none, before dispatch reaches the macro engine.
 //!
-//! Tier order, first hit wins (tier 1 — the saved-playbook lookup — is the
+//! Tier order, first hit wins. Tier 1 — the saved-playbook lookup — is the
 //! caller's pre-step: this runs only when `resolve_command` already yielded
-//! an ephemeral intent, so nothing here reimplements matching):
+//! an ephemeral intent, so nothing here reimplements matching. Proven
+//! workflows (including the seeded GitHub invoice harvester) therefore
+//! answer before any tier below is consulted:
 //!
 //! 1. Saved playbook — decided upstream, never re-run here.
 //! 2. Connected-account entity (`entity_resolver`), only with a directory.
-//! 3. Curated portal route table (`portal_routes`).
-//! 4. LLM fallback, only with a configured adapter — and its output is
+//! 3. LLM fallback, only with a configured adapter — and its output is
 //!    untrusted input, validated like every other tier.
-//! 5. Grounded search fallback — fixed `https://www.google.com/search?q=…`
+//! 4. Grounded search-and-follow — fixed `https://www.google.com/search?q=…`
 //!    template over the raw prompt. Never guesses TLDs; the dispatcher
-//!    navigates to the search page and grounds the top result link from the
-//!    live AX tree.
+//!    navigates to the search page and grounds the destination host from a
+//!    real click on the live AX tree.
 //!
-//! Every tier's output passes through `url_policy` validation, including
-//! the route table itself. Any validation failure returns `None`
-//! immediately — a corrupt tier never falls through to a weaker one. The
-//! search tier only runs when no stronger tier proposed anything; an
-//! invalid stronger proposal still fails closed without falling through.
+//! There is deliberately no static route table between them: a curated
+//! `(portal, class) → URL` list needed a portal whitelist to stay
+//! meaningful, and both of its jobs are now covered — proven routes by
+//! tier 1, unknown ones by tier 4.
+//!
+//! Every tier's output passes through `url_policy` validation. Any
+//! validation failure returns `None` immediately — a corrupt tier never
+//! falls through to a weaker one. The search tier only runs when no
+//! stronger tier proposed anything; an invalid stronger proposal still
+//! fails closed without falling through.
+//!
+//! # Slot resolution runs alongside URL resolution
+//!
+//! The tiers above answer *where to start*. [`resolve_slots`] answers *what
+//! to look for once there* — the noun search-and-follow grounds on — and it
+//! has its own sub-cascade, because the search template is the same URL
+//! whether the slots came from grammar, a parser, or nowhere:
+//!
+//! * **Tier 2A** — the deterministic grammar parse reports
+//!   [`crate::Confidence::High`], so it is used as-is at zero token cost.
+//! * **Tier 2B** — low confidence with a parser configured: the fenced
+//!   [`crate::IntentParser`] seam supplies slots, bounded by
+//!   [`crate::PARSER_TIMEOUT_MS`].
+//! * **Tier 2C** — no parser, a declined parse, a timeout, or output that
+//!   failed the slot fence: the low-confidence grammar slots stand, and
+//!   Stage 2 falls back to the intent's own probe text over the raw search
+//!   page. Degradation, never failure — offline is a normal outcome.
 
 use crate::{
     entity_resolver::{AccountDirectory, resolve_repo_entity},
-    portal_routes::{PORTALS, portal_route},
+    intent_parser::{IntentParser, parse_prompt_bounded},
+    intent_resolver::ParsedGrammar,
     url_policy::validate_proposed_url,
 };
+use std::sync::Arc;
 
 /// Where a resolved route came from. Recorded on the resolution and logged
 /// with the navigation proposal so wrong sources are debuggable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteSource {
     AccountEntity,
-    PortalRouteTable,
     LlmFallback,
     SearchFallback,
 }
@@ -44,19 +68,40 @@ pub enum RouteSource {
 /// real AX result link, never a guessed TLD.
 const SEARCH_BASE: &str = "https://www.google.com/search";
 
+/// Strip conversational filler from an ad-hoc prompt before it becomes a
+/// search query: `"open amazon for me."` → `"open amazon"`.
+///
+/// Reuses the resolver's existing stopword vocabulary
+/// ([`crate::intent_resolver::content_tokens`]) instead of introducing a
+/// second filler list, so the words dropped here are exactly the words that
+/// already never identify a target anywhere else in the pipeline.
+/// Tokenization splits on non-alphanumerics, so trailing punctuation never
+/// reaches the query either. Falls back to the trimmed prompt when filtering
+/// would leave nothing, keeping the tier total on non-empty input.
+#[must_use]
+pub fn sanitize_search_query(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    let sanitized = crate::intent_resolver::content_tokens(trimmed).join(" ");
+    if sanitized.is_empty() {
+        trimmed.to_owned()
+    } else {
+        sanitized
+    }
+}
+
 /// Build the grounded search-fallback URL for an ad-hoc prompt.
 /// `None` for empty prompts (no query to ground), so callers keep the
 /// `route_resolution_miss` dead-end instead of navigating to an empty
 /// search. Never derives hosts from prompt words — the host is fixed.
 #[must_use]
 pub fn search_fallback_url(prompt: &str) -> Option<String> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
+    let sanitized = sanitize_search_query(prompt);
+    if sanitized.is_empty() {
         return None;
     }
     // `form_urlencoded` byte-serializes spaces as `+`, matching the
-    // `?q=open+amazon+for+me` contract.
-    let query: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+    // `?q=open+amazon` contract.
+    let query: String = url::form_urlencoded::byte_serialize(sanitized.as_bytes()).collect();
     if query.is_empty() {
         return None;
     }
@@ -70,13 +115,18 @@ pub struct ResolvedRoute {
     pub source: RouteSource,
 }
 
-/// Optional resolution inputs. Both tiers are inert when unset, which is
-/// the production default: no account directory is wired (no stored GitHub
-/// credential exists to back one) and no LLM adapter is configured. The
-/// table tier always runs.
+/// Optional resolution inputs. Every one is inert when unset, which is the
+/// production default: no account directory is wired (no stored GitHub
+/// credential exists to back one), no URL adapter is configured, and the
+/// shipped intent parser declines. Unset inputs degrade the cascade to
+/// grounded search rather than failing it.
 pub struct ResolutionContext<'a> {
     pub account_dir: Option<&'a dyn AccountDirectory>,
     pub llm: Option<&'a dyn LlmUrlProposer>,
+    /// Fenced slot parser consulted only for low-confidence prompts, and
+    /// only for slots — it never proposes a URL. See
+    /// [`crate::intent_parser`] for the fence and the timeout.
+    pub parser: Option<&'a Arc<dyn IntentParser>>,
 }
 
 /// Last-resort URL proposer. Synchronous by contract: adapters needing I/O
@@ -87,19 +137,6 @@ pub trait LlmUrlProposer: Send + Sync {
     fn propose_url(&self, prompt: &str) -> Option<String>;
 }
 
-/// Detect a portal token from the table's own vocabulary. Exact tokens
-/// only — unknown spellings fall through instead of guessing.
-/// Public so desktop callers can derive `(portal, intent_class)` from prompt
-/// tokens without hardcoding portal strings.
-#[must_use]
-pub fn detect_portal(prompt: &str) -> Option<&'static str> {
-    let tokens = crate::intent_resolver::tokens(prompt);
-    PORTALS
-        .iter()
-        .find(|portal| tokens.iter().any(|token| token == **portal))
-        .copied()
-}
-
 /// Validate one tier's output, halting the whole resolution on failure.
 fn accept(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
     validate_proposed_url(url)
@@ -107,57 +144,107 @@ fn accept(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
         .ok()
 }
 
-/// Tab-independent route proposal: derive `(portal, intent_class)` purely
-/// from natural-language prompt tokens plus the caller's topic word (the
-/// primary target noun), querying the normalized `portal_route` table
-/// directly. The active tab's URL is never inspected, vetoed, or filtered —
-/// `current_url` exists only for call-site compatibility and is ignored so
-/// starting on `google.com` or `about:blank` never blocks cross-domain
-/// pre-navigation.
-#[must_use]
-pub fn propose_route(
-    prompt: &str,
-    intent_class: &str,
-    current_url: Option<&url::Url>,
-    ctx: &ResolutionContext<'_>,
-) -> Option<ResolvedRoute> {
-    let _ = current_url;
-    resolve_entry_url(prompt, intent_class, ctx)
+/// Which sub-tier produced the search-and-follow slots. Journaled so a
+/// wrong follow is attributable to grammar, a parser, or neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotSource {
+    /// Tier 2A: deterministic grammar, high confidence, zero tokens.
+    GrammarFastPath,
+    /// Tier 2B: fenced parser seam answered and its slots passed the fence.
+    IntentParser,
+    /// Tier 2C: nobody grounded the slots. Whatever low-confidence grammar
+    /// found still travels, and Stage 2 falls back to the intent's own
+    /// probe text.
+    Ungrounded,
 }
 
-/// Resolve an entry URL for an ad-hoc prompt and intent class (the
-/// caller's normalized topic word — today, the ephemeral label or primary
-/// target noun).
-/// Deterministic, offline unless an adapter is configured. Tier 5 (search
-/// fallback) guarantees a grounded entry for any non-empty prompt, so
-/// `None` now means only empty prompts or fail-closed validation —
-/// table misses advance instead of terminating.
-/// Tab-independent: no current-tab URL is inspected.
+impl SlotSource {
+    /// Short tier label for journal lines.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GrammarFastPath => "grammar",
+            Self::IntentParser => "parser",
+            Self::Ungrounded => "ungrounded",
+        }
+    }
+}
+
+/// Grounded slots plus the tier that produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSlots {
+    pub grammar: ParsedGrammar,
+    pub source: SlotSource,
+}
+
+/// Resolve the slots search-and-follow grounds on, deferring to the parser
+/// seam only when the deterministic parse is not confident.
+///
+/// Total by construction — there is no failure mode, only progressively
+/// weaker evidence:
+///
+/// 1. High-confidence grammar wins outright and the parser is never called,
+///    so crisp commands cost nothing (tier 2A).
+/// 2. Otherwise a configured parser gets one bounded shot (tier 2B). Its
+///    output is sanitized before it is believed.
+/// 3. A missing, declining, stalled, or fence-failing parser leaves the
+///    low-confidence grammar in place (tier 2C).
+///
+/// Step 3 is why an offline machine still works: the raw search page is the
+/// same destination either way, and Stage 2 simply grounds on the intent's
+/// probe text instead of a parsed site name.
 #[must_use]
-pub fn resolve_entry_url(
+pub fn resolve_slots(
     prompt: &str,
-    intent_class: &str,
+    connected_origin: Option<&url::Url>,
     ctx: &ResolutionContext<'_>,
-) -> Option<ResolvedRoute> {
+) -> ResolvedSlots {
+    let grammar = crate::intent_resolver::parse_grammar(prompt, connected_origin);
+    if grammar.confidence.is_high() {
+        return ResolvedSlots {
+            grammar,
+            source: SlotSource::GrammarFastPath,
+        };
+    }
+    if let Some(parser) = ctx.parser
+        && let Some(slots) = parse_prompt_bounded(parser, prompt)
+    {
+        return ResolvedSlots {
+            grammar: ParsedGrammar::from_slots(&slots),
+            source: SlotSource::IntentParser,
+        };
+    }
+    ResolvedSlots {
+        grammar,
+        source: SlotSource::Ungrounded,
+    }
+}
+
+/// Resolve an entry URL for an ad-hoc prompt.
+///
+/// Deterministic and offline unless an adapter is configured. The prompt is
+/// the only input: no intent class, no topic word, and no current-tab URL,
+/// so starting on `google.com` or `about:blank` never blocks cross-domain
+/// pre-navigation. (The class parameter existed for the deleted route
+/// table; every remaining tier reads the prompt itself.)
+///
+/// The search tier guarantees a grounded entry for any non-empty prompt, so
+/// `None` means only an empty prompt or fail-closed validation.
+#[must_use]
+pub fn resolve_entry_url(prompt: &str, ctx: &ResolutionContext<'_>) -> Option<ResolvedRoute> {
     // Tier 2: connected-account entity, only with a directory wired.
     if let Some(dir) = ctx.account_dir
         && let Some(url) = resolve_repo_entity(prompt, dir)
     {
         return accept(&url, RouteSource::AccountEntity);
     }
-    // Tier 3: curated route table on detected portal + class.
-    if let Some(portal) = detect_portal(prompt)
-        && let Some(url) = portal_route(portal, intent_class)
-    {
-        return accept(url, RouteSource::PortalRouteTable);
-    }
-    // Tier 4: configured LLM adapter, output untrusted until validated.
+    // Tier 3: configured LLM adapter, output untrusted until validated.
     if let Some(llm) = ctx.llm
         && let Some(url) = llm.propose_url(prompt)
     {
         return accept(&url, RouteSource::LlmFallback);
     }
-    // Tier 5: grounded search fallback — fixed template, no TLD guessing.
+    // Tier 4: grounded search fallback — fixed template, no TLD guessing.
     // Only runs when no stronger tier proposed anything; invalid stronger
     // proposals already returned `None` above without falling through.
     if let Some(url) = search_fallback_url(prompt) {
@@ -203,13 +290,14 @@ mod tests {
         ResolutionContext {
             account_dir: None,
             llm: None,
+            parser: None,
         }
     }
 
     #[test]
-    fn tier_order_prefers_account_entity_over_route_table() {
-        // The prompt matches both tiers: a connected repo named like the
-        // class word, and the portal table. The entity must win.
+    fn tier_order_prefers_account_entity_over_search() {
+        // A connected repo named like the prompt's artifact must win over the
+        // grounded search tier below it.
         let dir = FixtureDirectory {
             repos: vec![
                 repo("fixture-owner", "invoices"),
@@ -219,10 +307,9 @@ mod tests {
         let ctx = ResolutionContext {
             account_dir: Some(&dir),
             llm: None,
+            parser: None,
         };
-        let Some(resolved) =
-            resolve_entry_url("download all my invoices from github", "invoices", &ctx)
-        else {
+        let Some(resolved) = resolve_entry_url("download all my invoices from github", &ctx) else {
             panic!("entity tier resolves");
         };
         assert_eq!(resolved.source, RouteSource::AccountEntity);
@@ -234,14 +321,10 @@ mod tests {
 
     #[test]
     fn entity_resolver_falls_through_to_search_without_connected_account() {
-        // No directory wired: entity-dependent prompts fall past tier 2.
-        // The class here matches no table row either, so tier 5 (grounded
-        // search) resolves instead of terminating as a miss.
-        let Some(resolved) = resolve_entry_url(
-            "check out my portopsy on github",
-            "repositories",
-            &empty_ctx(),
-        ) else {
+        // No directory wired: entity-dependent prompts fall past tier 2 to
+        // grounded search instead of terminating as a miss.
+        let Some(resolved) = resolve_entry_url("check out my portopsy on github", &empty_ctx())
+        else {
             panic!("search fallback resolves");
         };
         assert_eq!(resolved.source, RouteSource::SearchFallback);
@@ -257,25 +340,55 @@ mod tests {
     fn unknown_prompts_advance_to_search_template_without_tld_guessing() {
         // Regression: "open amazon for me" must never become amazon.com /
         // amazon.in — the only dynamic URL is the fixed search template.
-        let Some(resolved) = resolve_entry_url("open amazon for me", "amazon", &empty_ctx()) else {
+        let Some(resolved) = resolve_entry_url("open amazon for me", &empty_ctx()) else {
             panic!("unknown prompt advances to search");
         };
         assert_eq!(resolved.source, RouteSource::SearchFallback);
+        // Filler is stripped before encoding: no `for`, no `me`, no period.
         assert_eq!(
             resolved.url.as_str(),
-            "https://www.google.com/search?q=open+amazon+for+me"
+            "https://www.google.com/search?q=open+amazon"
         );
         assert!(!resolved.url.as_str().contains("amazon.com"));
         assert!(!resolved.url.as_str().contains("amazon.in"));
         // Search template helper is pure and total on non-empty prompts.
         assert_eq!(
             search_fallback_url("open amazon for me").as_deref(),
-            Some("https://www.google.com/search?q=open+amazon+for+me")
+            Some("https://www.google.com/search?q=open+amazon")
         );
         assert_eq!(search_fallback_url("   "), None);
         assert_eq!(search_fallback_url(""), None);
         // Empty prompts keep the miss dead-end (no empty search navigation).
-        assert_eq!(resolve_entry_url("   ", "amazon", &empty_ctx()), None);
+        assert_eq!(resolve_entry_url("   ", &empty_ctx()), None);
+    }
+
+    #[test]
+    fn search_query_sanitization_strips_filler_and_punctuation() {
+        // The reported formatting bug: conversational filler and trailing
+        // punctuation must never reach `?q=`.
+        assert_eq!(sanitize_search_query("open amazon for me."), "open amazon");
+        assert_eq!(
+            sanitize_search_query("  please open amazon!  "),
+            "open amazon"
+        );
+        // Only conversational filler goes (`my`). Prepositions that read
+        // naturally in a query (`from`) are left alone: this strips noise,
+        // it does not rewrite the user's search.
+        assert_eq!(
+            sanitize_search_query("download my invoices from github"),
+            "download invoices from github"
+        );
+        // Casing normalizes; multi-space collapses.
+        assert_eq!(sanitize_search_query("Open   AMAZON"), "open amazon");
+        // A prompt made only of filler still searches something rather than
+        // producing an empty query (keeps the tier total on non-empty input).
+        assert_eq!(sanitize_search_query("please the"), "please the");
+        assert_eq!(sanitize_search_query(""), "");
+        // And the URL built from it carries the sanitized form verbatim.
+        assert_eq!(
+            search_fallback_url("open amazon for me.").as_deref(),
+            Some("https://www.google.com/search?q=open+amazon")
+        );
     }
 
     #[test]
@@ -296,9 +409,10 @@ mod tests {
         let ctx = ResolutionContext {
             account_dir: Some(&evil_dir),
             llm: None,
+            parser: None,
         };
         assert_eq!(
-            resolve_entry_url("check out my portopsy on github", "portopsy", &ctx),
+            resolve_entry_url("check out my portopsy on github", &ctx),
             None
         );
         // LLM tier: credentials and non-https both fail closed.
@@ -314,16 +428,17 @@ mod tests {
             let ctx = ResolutionContext {
                 account_dir: None,
                 llm: Some(&evil),
+                parser: None,
             };
             assert_eq!(
-                resolve_entry_url("open the dashboard thing on github", "dashboard", &ctx),
+                resolve_entry_url("open the dashboard thing on github", &ctx),
                 None,
                 "{answer} must fail closed"
             );
         }
         // Search tier itself never emits credentials or non-https: fixed
         // https template over an allowlisted host.
-        let Some(resolved) = resolve_entry_url("open amazon for me", "amazon", &empty_ctx()) else {
+        let Some(resolved) = resolve_entry_url("open amazon for me", &empty_ctx()) else {
             panic!("search resolves");
         };
         assert_eq!(resolved.url.scheme(), "https");
@@ -340,9 +455,10 @@ mod tests {
         let ctx = ResolutionContext {
             account_dir: None,
             llm: Some(&evil),
+            parser: None,
         };
         assert_eq!(
-            resolve_entry_url("open the dashboard thing on github", "dashboard", &ctx),
+            resolve_entry_url("open the dashboard thing on github", &ctx),
             None
         );
         // A well-formed answer from a configured adapter flows through.
@@ -352,36 +468,32 @@ mod tests {
         let ctx = ResolutionContext {
             account_dir: None,
             llm: Some(&kind),
+            parser: None,
         };
-        let Some(resolved) =
-            resolve_entry_url("open the dashboard thing on github", "dashboard", &ctx)
-        else {
+        let Some(resolved) = resolve_entry_url("open the dashboard thing on github", &ctx) else {
             panic!("valid LLM answer resolves");
         };
         assert_eq!(resolved.source, RouteSource::LlmFallback);
     }
 
     #[test]
-    fn propose_route_ignores_current_tab_url_and_resolves_from_prompt() {
-        // Tab-independent by design: the active tab never vetoes resolution.
-        // The same prompt resolves from `google.com` or `about:blank` purely
-        // via prompt tokens + primary noun against the normalized table.
+    fn resolution_is_prompt_only_with_no_static_route_table() {
+        // Nothing between the entity tier and grounded search: a portal-shaped
+        // prompt that the deleted table used to answer now advances to the
+        // search template, where Stage 2 grounds the real destination from a
+        // live click instead of a curated deep link.
         let ctx = empty_ctx();
-        let prompt = "download all my invoices from github";
-        let expected = "https://github.com/account/billing/history";
-        for current in [
-            url::Url::parse("https://google.com").ok(),
-            url::Url::parse("about:blank").ok(),
-            None,
+        for prompt in [
+            "download all my invoices from github",
+            "download my github billing invoices",
         ] {
-            let current_ref = current.as_ref();
-            for intent_class in ["invoice", "invoices", "billing"] {
-                let Some(resolved) = propose_route(prompt, intent_class, current_ref, &ctx) else {
-                    panic!("prompt resolves from {current:?} for {intent_class}");
-                };
-                assert_eq!(resolved.source, RouteSource::PortalRouteTable);
-                assert_eq!(resolved.url.as_str(), expected);
-            }
+            let Some(resolved) = resolve_entry_url(prompt, &ctx) else {
+                panic!("{prompt} resolves");
+            };
+            assert_eq!(resolved.source, RouteSource::SearchFallback);
+            assert_eq!(resolved.url.host_str(), Some("www.google.com"));
+            // No invented deep link survives anywhere in the proposal.
+            assert!(!resolved.url.path().contains("billing"));
         }
     }
 }

@@ -6,6 +6,7 @@
     "dev": "npm run dev --workspace @clinch/desktop",
     "build": "npm run build --workspace @clinch/desktop",
     "check": "npm run check --workspace @clinch/desktop",
+    "test": "npm run test --workspace @clinch/desktop",
     "tauri": "npm run tauri --workspace @clinch/desktop --"
   }
 }

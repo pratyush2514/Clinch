@@ -40,6 +40,15 @@ pub(crate) fn content_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every role [`role_for`] can emit, and therefore the complete action
+/// vocabulary a [`SemanticIntent`] may carry.
+///
+/// Single source of truth on purpose: the intent-parser seam validates
+/// model-supplied actions against this same list, so a parser can never
+/// introduce a role the deterministic path would not have produced. Adding
+/// a role means extending [`role_for`], and both readers move together.
+pub(crate) const INTENT_ROLES: &[&str] = &["textbox", "button", "combobox", "link"];
+
 fn role_for(keywords: &[String]) -> &'static str {
     let has = |words: &[&str]| keywords.iter().any(|token| words.contains(&token.as_str()));
     if has(&["fill", "type", "enter"]) {
@@ -709,30 +718,245 @@ fn singular_stem(token: &str) -> String {
     }
 }
 
-/// Primary target noun: the last identifying keyword of the
-/// identifier-stripped prompt — the same stream the label comes from —
-/// stemmed (`download all my invoices` → `invoice`), skipping the
-/// connected portal's own host tokens and the curated portal vocabulary
-/// (`download all my invoices from github` still anchors `invoice`, never
-/// the `github` trailer — the same host/plumbing split the saved path uses,
-/// and it holds even when parked on another portal such as `google.com`).
-/// Collection modifiers never survive filtering, so the noun is always the
-/// content word — never `all`. `None` when stripping leaves no keywords (a
-/// lone identifier scopes by container instead and needs no anchor).
-fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Option<String> {
-    let host_tokens: Vec<String> = connected_origin.map_or_else(Vec::new, |origin| {
+/// Prepositional cues that introduce a destination complement
+/// (`… from github`, `… on github`, `… at github`). Closed English grammar
+/// vocabulary, never a site list: the complement itself is whatever word
+/// the user typed, and nothing here checks it against known portals.
+const PREPOSITION_CUES: &[&str] = &["from", "on", "at"];
+
+/// Verbs the parser reads as the clause's verb slot rather than a noun.
+/// Their only job is telling a real prepositional complement
+/// (`invoices from github`) from a phrasal-verb particle (`click on pay`):
+/// with no noun before the cue there is no artifact, so the prompt parses
+/// as a direct action instead. Closed English vocabulary — no site names,
+/// no portal spellings, nothing that grows per portal.
+const ACTION_VERBS: &[&str] = &[
+    "download", "get", "fetch", "grab", "pull", "export", "open", "show", "view", "find", "check",
+    "click", "press", "tap", "submit", "fill", "type", "enter", "select", "choose", "toggle",
+    "turn", "run", "go", "navigate",
+];
+
+/// Words that open a subordinate clause, which means the prompt is not a
+/// plain imperative. `"pull up what I owe on aws"` reads structurally like
+/// `"<verb> … <clause> on <site>"`, and the clause body (`owe`) is a verb
+/// phrase, not the artifact the user wants — so the fast path reports low
+/// confidence instead of anchoring on a misparse.
+///
+/// Structural, not topical: these are closed-class English function words,
+/// so the list never grows with portals, artifacts, or phrasings.
+const CLAUSE_MARKERS: &[&str] = &[
+    "what", "whatever", "which", "who", "whom", "whose", "how", "why", "where", "when", "whether",
+    "that", "if",
+];
+
+/// Host words of the connected portal, which name plumbing rather than
+/// intent and so never fill a noun slot. Empty without a connection.
+fn origin_tokens(connected_origin: Option<&url::Url>) -> Vec<String> {
+    connected_origin.map_or_else(Vec::new, |origin| {
         content_tokens(origin.as_str())
             .into_iter()
             .filter(|token| !URL_NOISE.contains(&token.as_str()))
             .collect()
-    });
-    label_keywords(prompt)
-        .into_iter()
+    })
+}
+
+/// How much the deterministic fast path trusts its own parse.
+///
+/// This gates the intent-parser seam: [`Confidence::High`] runs immediately
+/// at zero token cost, [`Confidence::Low`] defers to a structured parser
+/// (and, when none answers, to raw search). The bias is deliberately
+/// conservative — `Low` costs a bounded parser call, while a wrong `High`
+/// silently drives the browser at the wrong target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Confidence {
+    /// A plain imperative whose slots are all accounted for: a recognized
+    /// verb heads the clause, no subordinate clause muddies the object, and
+    /// the matched pattern filled every slot it needs.
+    High,
+    /// Anything else — no verb to anchor on, a subordinate clause, or a
+    /// pattern that came up short. The default, so an empty parse is never
+    /// mistaken for a confident one.
+    #[default]
+    Low,
+}
+
+impl Confidence {
+    /// Whether this parse may skip the intent-parser seam entirely.
+    #[must_use]
+    pub fn is_high(self) -> bool {
+        matches!(self, Self::High)
+    }
+}
+
+/// Grammar slots parsed out of one ad-hoc prompt.
+///
+/// Two shapes, told apart by sentence structure alone — no portal
+/// vocabulary is consulted anywhere:
+///
+/// * **Prepositional complement** — `download all my invoices from github`
+///   fills `artifact_noun: invoice` (the direct object, which downstream
+///   batch matching anchors on) and `site_context: github` (the
+///   prepositional complement naming the domain).
+/// * **Direct action** — `open amazon for me` has no complement, so the
+///   direct object *is* the destination: `target_noun: amazon`,
+///   `site_context: None`.
+///
+/// At most one of `artifact_noun` / `target_noun` is ever populated, which
+/// keeps [`Self::primary_noun`] unambiguous.
+///
+/// `confidence` reports whether the parse is trustworthy enough to act on
+/// without a structured parser. Low-confidence slots are still returned
+/// rather than discarded: when no parser answers they remain the best
+/// available evidence, which is what keeps the offline path working.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedGrammar {
+    pub artifact_noun: Option<String>,
+    pub site_context: Option<String>,
+    pub target_noun: Option<String>,
+    pub confidence: Confidence,
+}
+
+impl ParsedGrammar {
+    /// The noun downstream matching anchors on: the artifact when the prompt
+    /// carried a prepositional complement, else the direct object. Both are
+    /// stemmed, so a singular anchor covers inflected page text.
+    #[must_use]
+    pub fn primary_noun(&self) -> Option<&str> {
+        self.artifact_noun
+            .as_deref()
+            .or(self.target_noun.as_deref())
+    }
+
+    /// Adopt fenced parser slots as grammar slots.
+    ///
+    /// Stemming happens here rather than in the parser so model output and
+    /// deterministic output normalize identically — a parser answering
+    /// `bills` anchors on `bill` exactly as `download bills` would. The
+    /// slots arrive already sanitized ([`crate::ParsedSlots::sanitized`]);
+    /// this only maps and stems them.
+    ///
+    /// Confidence is [`Confidence::High`] because the seam has already been
+    /// consulted: the field gates *whether to call a parser*, and there is
+    /// no second parser behind this one.
+    #[must_use]
+    pub fn from_slots(slots: &crate::intent_parser::ParsedSlots) -> Self {
+        Self {
+            artifact_noun: slots.artifact_noun.as_deref().map(singular_stem),
+            site_context: slots.site_context.clone(),
+            target_noun: None,
+            confidence: Confidence::High,
+        }
+    }
+}
+
+/// Parse the prompt's grammar slots without any site whitelist.
+///
+/// Cues are scanned right to left so the complement nearest the end wins —
+/// destinations trail in English (`invoices from github`, never
+/// `github from invoices`). A cue only forms a prepositional reading when
+/// both slots are really there: the following token must be a content word
+/// (months, ordinals, digits, and bare stopwords are structure, not a
+/// destination), and some noun must precede it. Otherwise the prompt falls
+/// through to the direct-action reading, whose object is the last content
+/// word.
+///
+/// Portal host words are excluded from noun slots (plumbing, not intent),
+/// the same host/intent split the saved-playbook path already uses; the
+/// site slot keeps them, since naming your current portal is a legitimate
+/// destination.
+///
+/// # Confidence
+///
+/// A parse earns [`Confidence::High`] only when the prompt reads as a plain
+/// imperative *and* the matched pattern filled every slot it needs:
+///
+/// * a recognized verb heads the clause, so there is something to act on;
+/// * no [`CLAUSE_MARKERS`] word opens a subordinate clause, which is what
+///   separates `"download invoices from github"` from
+///   `"pull up what I owe on aws"` — the latter matches a preposition cue
+///   just as cleanly, yet its artifact slot lands on the clause verb
+///   (`owe`) rather than a real artifact;
+/// * the pattern is complete: prepositional needs both artifact and site,
+///   direct action needs its object.
+///
+/// Everything else is [`Confidence::Low`], which costs a bounded parser
+/// call rather than a wrong click.
+#[must_use]
+pub fn parse_grammar(prompt: &str, connected_origin: Option<&url::Url>) -> ParsedGrammar {
+    let host_tokens = origin_tokens(connected_origin);
+    let words = tokens(prompt);
+    // Same content filter the label stream uses: stopwords out, and
+    // positional/temporal/month/numeric structure words out.
+    let is_content = |token: &str| !STOPWORDS.contains(&token) && !is_non_identifying(token);
+    let is_noun = |token: &String| is_content(token.as_str()) && !host_tokens.contains(token);
+    // Structural preconditions, shared by both patterns below. A verb head
+    // proves the prompt commands something; a clause marker proves it does
+    // so in more grammar than this parser models.
+    let verb_led = words
+        .iter()
+        .any(|token| ACTION_VERBS.contains(&token.as_str()));
+    let subordinated = words
+        .iter()
+        .any(|token| CLAUSE_MARKERS.contains(&token.as_str()));
+    let plain_imperative = verb_led && !subordinated;
+    let confidence = |complete: bool| {
+        if plain_imperative && complete {
+            Confidence::High
+        } else {
+            Confidence::Low
+        }
+    };
+    for (position, word) in words.iter().enumerate().rev() {
+        if !PREPOSITION_CUES.contains(&word.as_str()) {
+            continue;
+        }
+        let Some(site) = words
+            .get(position + 1)
+            .filter(|token| is_content(token.as_str()))
+        else {
+            continue;
+        };
+        let Some(artifact) = words
+            .get(..position)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find(|token| is_noun(token) && !ACTION_VERBS.contains(&token.as_str()))
+        else {
+            continue;
+        };
+        return ParsedGrammar {
+            artifact_noun: Some(singular_stem(artifact)),
+            site_context: Some(site.clone()),
+            target_noun: None,
+            // Both slots are filled by construction here.
+            confidence: confidence(true),
+        };
+    }
+    let target_noun = words
+        .iter()
         .rev()
-        .find(|token| {
-            !host_tokens.contains(token) && !crate::portal_routes::PORTALS.contains(&token.as_str())
-        })
-        .map(|token| singular_stem(token.as_str()))
+        .find(|token| is_noun(token))
+        .map(|token| singular_stem(token));
+    ParsedGrammar {
+        artifact_noun: None,
+        site_context: None,
+        confidence: confidence(target_noun.is_some()),
+        target_noun,
+    }
+}
+
+/// Primary target noun for the ephemeral intent: the grammar's artifact
+/// noun when the prompt named a destination (`download all my invoices from
+/// github` → `invoice`, never the `github` trailer), else its direct object
+/// (`open amazon for me` → `amazon`). Collection modifiers and positional
+/// words never survive the content filter, so the noun is always the
+/// content word — never `all`. `None` when nothing content-bearing remains
+/// (a lone identifier scopes by container instead and needs no anchor).
+fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Option<String> {
+    parse_grammar(prompt, connected_origin)
+        .primary_noun()
+        .map(str::to_owned)
 }
 
 /// Deterministic structured fallback: instant, offline, no model call.
@@ -963,6 +1187,14 @@ pub fn decompose_command(
 
 /// `connected_origin` is presence-checked only — callers supply the portal
 /// for session scoping and execution.
+///
+/// An exact [`prompt_key`] match dominates candidate *ranking*, but it does
+/// not bypass the safety guards below it: a plural or scope-carrying prompt
+/// still takes the dynamic path even when its own saved workflow is sitting
+/// right there. The reason is execution shape, not matching — saved replay
+/// resolves one control per step, so replaying a learned `"download all …"`
+/// would click once and silently under-deliver. Those prompts re-resolve
+/// each run instead, which is slower but correct.
 #[must_use]
 pub fn resolve_command(
     prompt: &str,
@@ -973,8 +1205,19 @@ pub fn resolve_command(
     if keywords.is_empty() {
         return None;
     }
+    // The learning loop's index: a workflow saved from this exact phrasing
+    // is not a guess, so it outranks every token-overlap candidate. This is
+    // what turns a once-ambiguous prompt into a deterministic tier-1 hit —
+    // the phrasing was taught, not inferred.
+    let key = prompt_key(prompt);
     let mut best: Option<(&PlaybookSummary, usize)> = None;
     for playbook in saved {
+        if let Some(key) = key.as_deref()
+            && playbook.prompt_key.as_deref() == Some(key)
+        {
+            best = Some((playbook, usize::MAX));
+            break;
+        }
         // A token in the workflow's own name outweighs one in its URL: names
         // carry intent, hosts carry plumbing.
         let name_tokens = content_tokens(&playbook.name.replace(['-', '_'], " "));
@@ -1067,6 +1310,31 @@ pub fn resolve_command(
     })
 }
 
+/// Normalized matching key for one prompt — the learning loop's index.
+///
+/// Lowercased and whitespace-collapsed, so `"Download  GitHub Invoices "`
+/// and `"download github invoices"` are one key and a repeated phrasing
+/// resolves deterministically instead of racing token overlap. Deliberately
+/// *not* stemmed or stopword-filtered: this identifies an exact phrasing the
+/// user already saved, and loosening it would let one saved workflow capture
+/// prompts the user never taught it.
+///
+/// `None` for blank prompts (nothing to key) and for prompts past
+/// [`playbook_store::schema::MAX_PROMPT_KEY_LEN`], which keep matching by
+/// token overlap rather than being truncated into a colliding key.
+#[must_use]
+pub fn prompt_key(prompt: &str) -> Option<String> {
+    let key = prompt
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if key.is_empty() || key.len() > playbook_store::schema::MAX_PROMPT_KEY_LEN {
+        return None;
+    }
+    Some(key)
+}
+
 /// Filesystem-safe ephemeral workflow name from the prompt. Always passes
 /// `Playbook::new` validation by construction.
 #[must_use]
@@ -1096,6 +1364,15 @@ mod tests {
             step_count: 1,
             updated_at: String::new(),
             description: None,
+            prompt_key: None,
+        }
+    }
+
+    /// The same summary plus a learned prompt key.
+    fn learned(id: &str, name: &str, portal_url: &str, key: &str) -> PlaybookSummary {
+        PlaybookSummary {
+            prompt_key: Some(key.into()),
+            ..saved(id, name, portal_url)
         }
     }
 
@@ -1666,6 +1943,238 @@ mod tests {
     }
 
     #[test]
+    fn test_grammar_parsing_without_portal_whitelist() -> Result<(), url::ParseError> {
+        // Prepositional complement: the noun before the cue is the artifact
+        // the batch acts on, the token after it names the domain.
+        let parsed = parse_grammar("download all my invoices from github", None);
+        assert_eq!(parsed.artifact_noun.as_deref(), Some("invoice"));
+        assert_eq!(parsed.site_context.as_deref(), Some("github"));
+        assert_eq!(parsed.target_noun, None);
+        let parsed = parse_grammar("download reports from linear", None);
+        assert_eq!(parsed.artifact_noun.as_deref(), Some("report"));
+        assert_eq!(parsed.site_context.as_deref(), Some("linear"));
+        assert_eq!(parsed.target_noun, None);
+        // Direct action: no complement, so the direct object *is* the target.
+        let parsed = parse_grammar("open amazon for me", None);
+        assert_eq!(parsed.target_noun.as_deref(), Some("amazon"));
+        assert_eq!(parsed.site_context, None);
+        assert_eq!(parsed.artifact_noun, None);
+        // Structure decides, not vocabulary: a site nobody enumerated parses
+        // exactly like `github`, and `on`/`at` read the same as `from`.
+        for (prompt, artifact, site) in [
+            ("download invoices from acmecorp", "invoice", "acmecorp"),
+            ("grab my statements on zzyzxbank", "statement", "zzyzxbank"),
+            ("export receipts at quuxvendor", "receipt", "quuxvendor"),
+        ] {
+            let parsed = parse_grammar(prompt, None);
+            assert_eq!(parsed.artifact_noun.as_deref(), Some(artifact), "{prompt}");
+            assert_eq!(parsed.site_context.as_deref(), Some(site), "{prompt}");
+        }
+        // A cue with no noun before it is a phrasal-verb particle, not a
+        // complement: `click on pay now` still targets the control.
+        let parsed = parse_grammar("click on pay now", None);
+        assert_eq!(parsed.site_context, None);
+        assert_eq!(parsed.target_noun.as_deref(), Some("pay"));
+        // A cue followed by structure rather than a place is not a complement
+        // either: months, ordinals, and digits never name a destination.
+        let parsed = parse_grammar("download the declined invoice from June 12", None);
+        assert_eq!(parsed.site_context, None);
+        assert_eq!(parsed.target_noun.as_deref(), Some("invoice"));
+        // Parsing is connection-independent: the same prompt yields the same
+        // slots whether parked on the named portal, on another one, or on
+        // nothing at all.
+        let portal = portal()?;
+        let google = url::Url::parse("https://google.com")?;
+        for origin in [None, Some(&portal), Some(&google)] {
+            let parsed = parse_grammar("download all my invoices from github", origin);
+            assert_eq!(parsed.artifact_noun.as_deref(), Some("invoice"));
+            assert_eq!(parsed.site_context.as_deref(), Some("github"));
+        }
+        // Nothing content-bearing leaves every slot empty.
+        assert_eq!(parse_grammar("", None), ParsedGrammar::default());
+        assert_eq!(parse_grammar("the", None), ParsedGrammar::default());
+        Ok(())
+    }
+
+    #[test]
+    fn confidence_gates_on_structure_not_slot_count() -> Result<(), url::ParseError> {
+        // Plain imperatives with complete slots are trusted outright.
+        for prompt in [
+            "download invoices from github",
+            "download all my invoices from github",
+            "grab my statements on zzyzxbank",
+            "export receipts at quuxvendor",
+            // Direct action: the object is the destination, and that is a
+            // complete parse for its pattern.
+            "open amazon for me",
+            "click pay now",
+            "toggle dark mode",
+            "fill expense report",
+        ] {
+            assert_eq!(
+                parse_grammar(prompt, None).confidence,
+                Confidence::High,
+                "{prompt} is a plain imperative"
+            );
+        }
+        // A subordinate clause means more grammar than this parser models.
+        // Note both slots *are* populated here — slot count alone would have
+        // called this confident, and the artifact would have been `owe`.
+        let parsed = parse_grammar("pull up what I owe on aws", None);
+        assert_eq!(parsed.confidence, Confidence::Low);
+        assert_eq!(parsed.artifact_noun.as_deref(), Some("owe"));
+        assert_eq!(parsed.site_context.as_deref(), Some("aws"));
+        for prompt in [
+            "pull up what I owe on aws",
+            "show me which invoices are overdue",
+            "find whatever bills are on github",
+            "get the thing that I paid for",
+        ] {
+            assert_eq!(
+                parse_grammar(prompt, None).confidence,
+                Confidence::Low,
+                "{prompt} carries a subordinate clause"
+            );
+        }
+        // No verb to anchor on: a bare noun phrase is not a command.
+        for prompt in ["com", "statements", "my invoices", "the github thing"] {
+            assert_eq!(
+                parse_grammar(prompt, None).confidence,
+                Confidence::Low,
+                "{prompt} has no verb head"
+            );
+        }
+        // Nothing content-bearing is never confident, and the default agrees.
+        assert_eq!(parse_grammar("", None).confidence, Confidence::Low);
+        assert_eq!(Confidence::default(), Confidence::Low);
+        assert!(Confidence::High.is_high());
+        assert!(!Confidence::Low.is_high());
+        // Confidence is a property of the prompt, not of the live session.
+        let portal = portal()?;
+        assert_eq!(
+            parse_grammar("download invoices from github", Some(&portal)).confidence,
+            Confidence::High
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn role_inference_only_emits_the_shared_action_vocabulary() {
+        // The parser seam validates model output against `INTENT_ROLES`, so
+        // that list must stay exactly what `role_for` can produce — otherwise
+        // the two vocabularies drift and a valid parse gets rejected (or an
+        // invalid one accepted).
+        for prompt in [
+            "fill expense report",
+            "type my address",
+            "enter the code",
+            "click pay now",
+            "press submit",
+            "submit the form",
+            "tap continue",
+            "select a plan",
+            "choose the date",
+            "download invoices from github",
+            "open amazon",
+            "",
+        ] {
+            let role = role_for(&content_tokens(prompt));
+            assert!(INTENT_ROLES.contains(&role), "{prompt} inferred {role}");
+        }
+    }
+
+    #[test]
+    fn prompt_keys_normalize_phrasing_and_refuse_unusable_keys() {
+        // Casing and spacing collapse, so one phrasing is one key.
+        assert_eq!(
+            prompt_key("  Pull up   what I owe ON aws ").as_deref(),
+            Some("pull up what i owe on aws")
+        );
+        assert_eq!(
+            prompt_key("download github invoices").as_deref(),
+            Some("download github invoices")
+        );
+        // Deliberately not stemmed or stopword-filtered: a key identifies the
+        // exact phrasing the user saved, so distinct prompts stay distinct.
+        assert_ne!(
+            prompt_key("download my invoices"),
+            prompt_key("download invoices")
+        );
+        // Unusable keys are refused rather than stored: blanks would match
+        // every blank prompt, and truncating an oversized prompt would let
+        // two different commands collide on one workflow.
+        assert_eq!(prompt_key(""), None);
+        assert_eq!(prompt_key("   \n\t "), None);
+        let oversized = "a ".repeat(playbook_store::schema::MAX_PROMPT_KEY_LEN);
+        assert_eq!(prompt_key(&oversized), None);
+    }
+
+    #[test]
+    fn learned_prompt_keys_win_routing_without_bypassing_guards() -> Result<(), url::ParseError> {
+        let portal = portal()?;
+        // An exact key outranks a stronger token-overlap competitor: the
+        // phrasing was taught, so it is not a guess to be outvoted.
+        let with_key = vec![
+            saved("1", "github-invoices", "https://github.com/"),
+            learned(
+                "2",
+                "aws-bills",
+                "https://aws.amazon.com/",
+                "get my github bills",
+            ),
+        ];
+        assert_eq!(
+            resolve_command("get my github bills", Some(&portal), &with_key),
+            Some(CommandMatch::Saved { id: "2".into() }),
+            "the learned key wins over name overlap"
+        );
+        // Without the key, the same prompt routes by overlap as before, so
+        // the key is additive rather than a behavior change.
+        let unlearned = vec![
+            saved("1", "github-invoices", "https://github.com/"),
+            saved("2", "aws-bills", "https://aws.amazon.com/"),
+        ];
+        assert_eq!(
+            resolve_command("get my github bills", Some(&portal), &unlearned),
+            Some(CommandMatch::Saved { id: "1".into() })
+        );
+        // The key ranks candidates; it never overrides the guards that keep
+        // replay honest. Saved replay resolves one control per step, so a
+        // plural prompt still takes the dynamic path even with its own key
+        // stored — replaying it would click once and under-deliver.
+        let plural = vec![learned(
+            "9",
+            "all-invoices",
+            "https://github.com/",
+            "download all my invoices from github",
+        )];
+        assert!(
+            matches!(
+                resolve_command(
+                    "download all my invoices from github",
+                    Some(&portal),
+                    &plural
+                ),
+                Some(CommandMatch::Ephemeral { .. })
+            ),
+            "plurality still forces the dynamic batch lane"
+        );
+        // Same for a prompt carrying a specific scope: the recording has no
+        // parameter slot for `0LWQXDWW`.
+        let scoped = vec![learned(
+            "9",
+            "one-invoice",
+            "https://github.com/",
+            "download invoice 0lwqxdww",
+        )];
+        assert!(matches!(
+            resolve_command("download invoice 0LWQXDWW", Some(&portal), &scoped),
+            Some(CommandMatch::Ephemeral { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn primary_noun_strips_modifiers_and_singularizes() -> Result<(), url::ParseError> {
         // Modifiers never survive: the anchor is always the content word in
         // stem form. Lone identifiers carry no anchor at all.
@@ -1677,16 +2186,16 @@ mod tests {
             extract_primary_noun("open the Analytics", None).as_deref(),
             Some("analytic")
         );
-        // Trailing portal words yield to the object noun when the portal is
-        // connected — the host/plumbing split the saved path already uses.
+        // Trailing site words yield to the object noun: the grammar reads
+        // them as the destination complement, not the batch target.
         let portal = portal()?;
         assert_eq!(
             extract_primary_noun("download all my invoices from github", Some(&portal)).as_deref(),
             Some("invoice")
         );
         // Cross-portal starts hold too: parked on `google.com`, the `github`
-        // trailer is still plumbing (curated portal vocabulary), so the
-        // anchor stays the content noun and pre-navigation can fire.
+        // trailer is still the destination slot, so the anchor stays the
+        // content noun and pre-navigation can fire.
         let google = url::Url::parse("https://google.com")?;
         assert_eq!(
             extract_primary_noun("download all my invoices from github", Some(&google)).as_deref(),
