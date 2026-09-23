@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
+mod domain_grounder;
 mod entity_resolver;
 mod intent_parser;
 mod intent_resolver;
@@ -9,6 +10,7 @@ mod store;
 mod task;
 mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
+pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
 pub use intent_parser::{
     IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,
@@ -22,10 +24,11 @@ pub use intent_resolver::{
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use route_proposer::{
-    BraveSiteSearch, InMemoryShortcuts, LlmUrlProposer, ResolutionContext, ResolvedRoute,
-    ResolvedSlots, RouteSource, ShortcutStore, SiteSearchClient, SlotSource,
-    explicit_url_in_prompt, resolve_entry_url, resolve_slots, sanitize_search_query,
-    search_fallback_url,
+    BraveSiteSearch, DomainGrounder, InMemoryShortcuts, LlmUrlProposer, ResolutionContext,
+    ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore, SiteSearchClient, SlotSource,
+    StubDomainGrounder, explicit_url_in_prompt, region_hint_from_timezone, resolve_entry_url,
+    resolve_slots, sanitize_search_query, search_fallback_url, system_region_hint,
+    validate_grounded_domain,
 };
 pub use runner::{
     IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,

@@ -52,6 +52,8 @@ fn ctx_with(parser: Option<&Arc<dyn IntentParser>>) -> ResolutionContext<'_> {
         parser,
         shortcuts: None,
         site_search: None,
+        domain_grounder: None,
+        region_hint: "",
     }
 }
 

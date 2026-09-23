@@ -494,6 +494,8 @@ impl AppService {
             parser: Some(&self.intent_parser),
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         };
         orchestration_engine::resolve_slots(prompt, None, &ctx)
     }
@@ -1932,6 +1934,7 @@ impl AppService {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn propose_entry_url(
         &self,
         prompt: &str,
@@ -1960,6 +1963,14 @@ impl AppService {
         };
         let shortcut_store = orchestration_engine::InMemoryShortcuts::new(shortcuts);
         let site_search = orchestration_engine::BraveSiteSearch::from_env();
+        // Fenced domain grounder: an LLM-backed adapter when
+        // `CLINCH_GROUNDER_PROVIDER` selects one — `groq` reads its key from
+        // `GROQ_API_KEY`, `ollama` talks to the local daemon — and the
+        // declining stub otherwise. Unconfigured or offline stays a normal
+        // outcome: the ladder degrades to the honest miss.
+        let live_grounder = orchestration_engine::LlmDomainGrounder::from_env();
+        let stub_grounder = orchestration_engine::StubDomainGrounder;
+        let region_hint = orchestration_engine::system_region_hint();
         // The directory rung is synchronous network I/O (bounded at ten
         // seconds by the agent config). It runs on a blocking thread so it
         // can never stall the async runtime's workers; everything the
@@ -1967,6 +1978,13 @@ impl AppService {
         let prompt_owned = prompt.to_owned();
         let origin_owned = connected_origin.cloned();
         let resolved = tokio::task::spawn_blocking(move || {
+            // The live adapter when configured, the declining stub
+            // otherwise: the reference is built inside the closure from the
+            // moved-in owners, so it cannot outlive them.
+            let domain_grounder: &dyn orchestration_engine::DomainGrounder = match &live_grounder {
+                Some(grounder) => grounder,
+                None => &stub_grounder,
+            };
             let ctx = orchestration_engine::ResolutionContext {
                 account_dir: None,
                 llm: None,
@@ -1975,6 +1993,8 @@ impl AppService {
                 site_search: site_search
                     .as_ref()
                     .map(|client| client as &dyn orchestration_engine::SiteSearchClient),
+                domain_grounder: Some(domain_grounder),
+                region_hint: region_hint.as_str(),
             };
             orchestration_engine::resolve_entry_url(&prompt_owned, origin_owned.as_ref(), &ctx)
         });
@@ -2027,6 +2047,24 @@ impl AppService {
             );
             let _ = self.record(&line).await;
             intent.entry_url = Some(route.url.as_str().to_owned());
+            // Learning loop: a domain-grounded hit is a candidate shortcut.
+            // Journal the suggestion so the Action Thread can render the
+            // "Save as Shortcut" card; accepting stores
+            // `site name → https://domain` via the existing
+            // `save_site_shortcut` command, so the next run hits the
+            // shortcut rung with zero tokens.
+            if route.source == orchestration_engine::RouteSource::DomainGrounded {
+                let site = orchestration_engine::parse_grammar(prompt, connected_origin)
+                    .target_noun
+                    .unwrap_or_default();
+                if !site.is_empty() {
+                    let suggest = format!(
+                        "suggest_shortcut: '{site}' → {} · save via the shortcut manager to skip grounding next time",
+                        route.url.as_str()
+                    );
+                    let _ = self.record(&suggest).await;
+                }
+            }
             ProposedEntry {
                 log: Some(line),
                 source: Some(route.source),

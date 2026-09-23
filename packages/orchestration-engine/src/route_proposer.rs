@@ -17,11 +17,12 @@
 //! 4. LLM fallback, only with a configured adapter — and its output is
 //!    untrusted input, validated like every other tier.
 //! 5. Direct-open grounding ladder, only for high-confidence single-target
-//!    opens (`open amazon`): a user-saved site shortcut, then a structured
-//!    site directory (Brave Search API) when a key is configured. An
-//!    ungrounded site is a miss the UI can act on — it never falls through
-//!    to the search template, because a guessed SERP click is worse than
-//!    asking.
+//!    opens (`open amazon`): a user-saved site shortcut, then a fenced
+//!    domain grounder (site slot + region hint → bare domain, validated in
+//!    Rust), then a structured site directory (Brave Search API) when a key
+//!    is configured. An ungrounded site is a miss the UI can act on — it
+//!    never falls through to the search template, because a guessed SERP
+//!    click is worse than asking.
 //! 6. Grounded search-and-follow — fixed `https://www.google.com/search?q=…`
 //!    template over the raw prompt. Never guesses TLDs; the dispatcher
 //!    navigates to the search page and grounds the destination host from a
@@ -83,6 +84,11 @@ pub enum RouteSource {
     Shortcut,
     /// A structured site directory (Brave Search API) resolved the name.
     SiteSearch,
+    /// A fenced domain grounder resolved the site name to a bare domain
+    /// (e.g. `amazon` → `amazon.in`) using the site slot plus a region
+    /// hint. The domain is validated in Rust before navigation; see
+    /// [`validate_grounded_domain`].
+    DomainGrounded,
 }
 
 /// Fixed grounded search entry: the only dynamic URL the resolver ever
@@ -155,6 +161,13 @@ pub struct ResolutionContext<'a> {
     /// Structured site directory, consulted by the direct-open ladder when
     /// no shortcut or explicit domain grounded the site.
     pub site_search: Option<&'a dyn SiteSearchClient>,
+    /// Fenced domain grounder, consulted by the direct-open ladder after
+    /// shortcuts and before the site directory. Takes only the site slot
+    /// plus a region hint; returns a bare domain validated in Rust.
+    pub domain_grounder: Option<&'a dyn DomainGrounder>,
+    /// Region hint for the domain grounder (e.g. `IN`), or empty when
+    /// unknown. Derived from system timezone; see [`system_region_hint`].
+    pub region_hint: &'a str,
 }
 
 /// Last-resort URL proposer. Synchronous by contract: adapters needing I/O
@@ -290,6 +303,156 @@ impl SiteSearchClient for BraveSiteSearch {
             .ok()?;
         brave_top_url(&payload)
     }
+}
+
+/// A fenced domain grounder: a site name in, a bare domain out.
+///
+/// This is the Muse-like rung. The caller passes only the already-parsed
+/// site slot (e.g. `amazon`) plus a region hint (e.g. `IN` derived from
+/// `Asia/Kolkata`) — never the raw prompt, never page HTML. The grounder
+/// returns a single bare domain as strict JSON (`{"domain": "amazon.in"}`),
+/// or `None` when it cannot ground.
+///
+/// The returned domain is untrusted input: [`validate_grounded_domain`]
+/// enforces HTTPS, a well-formed hostname with a valid TLD, no credentials,
+/// and no raw IP addresses before anything navigates. A malformed or
+/// missing response degrades to the honest miss, never to a guessed
+/// `www.{noun}.com`.
+pub trait DomainGrounder: Send + Sync {
+    /// The best bare domain for `site_name` in `region_hint`, or `None`.
+    ///
+    /// `site_name` is the grammar's normalized target noun (e.g. `amazon`);
+    /// `region_hint` is an ISO region code like `IN` or `US`, or empty when
+    /// unknown. Implementations must return a bare domain only
+    /// (e.g. `amazon.in`), never a full URL, path, or credentials.
+    fn ground_domain(&self, site_name: &str, region_hint: &str) -> Option<String>;
+}
+
+/// Stub grounder for production default: always declines.
+///
+/// Like [`crate::StubIntentParser`], this keeps offline a normal outcome.
+/// Wire a real LLM-backed grounder here when the Tier 2B provider decision
+/// (local Ollama vs cloud API) is made; until then the ladder degrades to
+/// the honest miss.
+#[derive(Debug, Default)]
+pub struct StubDomainGrounder;
+
+impl DomainGrounder for StubDomainGrounder {
+    fn ground_domain(&self, _site_name: &str, _region_hint: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Derive an ISO region hint from an IANA timezone name.
+///
+/// `Asia/Kolkata` → `IN`, `America/New_York` → `US`, etc. This is a small
+/// closed mapping for the common cases; unknown zones yield `None` rather
+/// than a guess. The grounder treats an unknown region as empty hint.
+#[must_use]
+pub fn region_hint_from_timezone(tz: &str) -> Option<&'static str> {
+    // Continent/City → region. Keep this closed and small; it is a hint,
+    // not knowledge about sites.
+    if tz.starts_with("Asia/Kolkata")
+        || tz.starts_with("Asia/Calcutta")
+        || tz.starts_with("Asia/Delhi")
+        || tz.starts_with("Asia/Mumbai")
+    {
+        return Some("IN");
+    }
+    if tz.starts_with("America/") {
+        // Americas: map the common ones, default US for the rest.
+        if tz.starts_with("America/Sao_Paulo") {
+            return Some("BR");
+        }
+        if tz.starts_with("America/Mexico") {
+            return Some("MX");
+        }
+        if tz.starts_with("America/Toronto") || tz.starts_with("America/Vancouver") {
+            return Some("CA");
+        }
+        return Some("US");
+    }
+    if tz.starts_with("Europe/") {
+        if tz.starts_with("Europe/London") {
+            return Some("GB");
+        }
+        if tz.starts_with("Europe/Paris") {
+            return Some("FR");
+        }
+        if tz.starts_with("Europe/Berlin") {
+            return Some("DE");
+        }
+        return Some("EU");
+    }
+    if tz.starts_with("Asia/Tokyo") {
+        return Some("JP");
+    }
+    if tz.starts_with("Asia/Shanghai") || tz.starts_with("Asia/Hong_Kong") {
+        return Some("CN");
+    }
+    if tz.starts_with("Australia/") {
+        return Some("AU");
+    }
+    None
+}
+
+/// The system's region hint for the domain grounder.
+///
+/// Reads the `TZ` environment variable or falls back to a UTC default.
+/// Returns an ISO region code like `IN`, or empty string when unknown —
+/// the grounder must handle empty as "no preference".
+#[must_use]
+pub fn system_region_hint() -> String {
+    // Try TZ env, then /etc/timezone (Debian), then empty.
+    if let Ok(tz) = std::env::var("TZ")
+        && let Some(region) = region_hint_from_timezone(tz.trim())
+    {
+        return region.to_owned();
+    }
+    if let Ok(tz) = std::fs::read_to_string("/etc/timezone")
+        && let Some(region) = region_hint_from_timezone(tz.trim())
+    {
+        return region.to_owned();
+    }
+    String::new()
+}
+
+/// Validate a grounder-returned bare domain and build the navigation URL.
+///
+/// Enforces, in Rust (never trusting the grounder):
+/// - well-formed hostname via [`is_bare_domain`] (dot-separated labels,
+///   2+ letter TLD),
+/// - no raw IP addresses (v4 or v6),
+/// - absolute `https` URL with no embedded credentials (via
+///   [`validate_user_directed_url`]).
+///
+/// Returns the validated `https://{domain}` URL string, or `None` when the
+/// domain is malformed. Callers degrade to the honest miss on `None`.
+#[must_use]
+pub fn validate_grounded_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    if domain.is_empty() || domain.len() > 253 {
+        return None;
+    }
+    // The grounder returns a bare domain only — no paths, no credentials.
+    // (`is_bare_domain` tolerates a single path for the explicit-domain
+    // tier; this rung is stricter by design.)
+    if domain.contains('/') || domain.contains('@') || domain.contains(':') {
+        return None;
+    }
+    // Reject raw IPs: the TLD check in `is_bare_domain` already blocks most,
+    // but be explicit — a grounder must never yield a literal address.
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if !is_bare_domain(&domain) {
+        return None;
+    }
+    let url = format!("https://{domain}");
+    // Structural validation only (no allowlist): this is name resolution
+    // like SiteSearch, not a machine-proposed allowlisted target.
+    validate_user_directed_url(&url).ok()?;
+    Some(url)
 }
 
 /// Whether `token` is shaped like a bare domain: dot-separated labels of
@@ -449,9 +612,9 @@ pub fn resolve_slots(
 ///    malformed one fails closed: a typo is not fixed by a model guess.
 /// 1. Connected-account entity, only with a directory wired.
 /// 2. Configured LLM adapter, output untrusted until validated.
-/// 3. Direct-open grounding ladder — saved shortcut, then structured
-///    directory. An ungrounded site returns `None` so the caller can ask
-///    the user instead of scraping a search page.
+/// 3. Direct-open grounding ladder — saved shortcut, then fenced domain
+///    grounder, then structured directory. An ungrounded site returns `None`
+///    so the caller can ask the user instead of scraping a search page.
 /// 4. Grounded search fallback for prompts that are not direct opens, so
 ///    `None` otherwise still means only an empty prompt or fail-closed
 ///    validation.
@@ -481,7 +644,8 @@ pub fn resolve_entry_url(
     }
     // Tier 3: direct-open grounding ladder. High-confidence single-target
     // opens never touch the search template: the destination comes from
-    // the user's own data, a structured directory, or nowhere.
+    // the user's own data, a fenced grounder, a structured directory, or
+    // nowhere.
     let grammar = parse_grammar(prompt, connected_origin);
     if is_direct_open(prompt, &grammar) {
         let target = grammar.target_noun.as_deref();
@@ -494,7 +658,21 @@ pub fn resolve_entry_url(
         {
             return Some(route);
         }
-        // 3b. Structured site directory, only when a key is configured.
+        // 3b. Fenced domain grounder: site slot + region hint → bare domain.
+        // The grounder sees only the normalized site name and the region
+        // code, never the raw prompt. Its output is validated in Rust
+        // (https, valid TLD, no credentials, no raw IP) before navigation.
+        // A malformed response degrades to the next rung, never to a
+        // guessed `www.{noun}.com`.
+        if let Some(grounder) = ctx.domain_grounder
+            && let Some(name) = target
+            && let Some(domain) = grounder.ground_domain(name, ctx.region_hint)
+            && let Some(url) = validate_grounded_domain(&domain)
+            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
+        {
+            return Some(route);
+        }
+        // 3c. Structured site directory, only when a key is configured.
         // Trust note: the directory resolves a *name the user typed*, the
         // same way asking an assistant to "open amazon" does — it is name
         // resolution, not a machine-invented destination. Strict
@@ -515,7 +693,7 @@ pub fn resolve_entry_url(
         {
             return Some(route);
         }
-        // 3c. Ungrounded and no directory: a miss. The caller surfaces
+        // 3d. Ungrounded and no directory: a miss. The caller surfaces
         // "try a full domain or save a site shortcut" — asking once beats
         // a scraped SERP that may be a challenge page or an ad.
         return None;
@@ -570,6 +748,8 @@ mod tests {
             parser: None,
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         }
     }
 
@@ -589,6 +769,8 @@ mod tests {
             parser: None,
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         };
         let Some(resolved) = resolve_entry_url("download all my invoices from github", None, &ctx)
         else {
@@ -699,6 +881,8 @@ mod tests {
             parser: None,
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         };
         assert_eq!(
             resolve_entry_url("check out my portopsy on github", None, &ctx),
@@ -720,6 +904,8 @@ mod tests {
                 parser: None,
                 shortcuts: None,
                 site_search: None,
+                domain_grounder: None,
+                region_hint: "",
             };
             assert_eq!(
                 resolve_entry_url("open the dashboard thing on github", None, &ctx),
@@ -761,6 +947,8 @@ mod tests {
             parser: None,
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         };
         assert_eq!(
             resolve_entry_url("open the dashboard thing on github", None, &ctx),
@@ -776,6 +964,8 @@ mod tests {
             parser: None,
             shortcuts: None,
             site_search: None,
+            domain_grounder: None,
+            region_hint: "",
         };
         let Some(resolved) = resolve_entry_url("open the dashboard thing on github", None, &ctx)
         else {
@@ -804,6 +994,8 @@ mod tests {
             parser: None,
             shortcuts: Some(&store),
             site_search: Some(&directory),
+            domain_grounder: None,
+            region_hint: "",
         };
         let Some(resolved) = resolve_entry_url("open github.com/pratyush2514", None, &ctx) else {
             panic!("explicit domain resolves");
@@ -846,6 +1038,8 @@ mod tests {
     fn ladder_ctx<'a>(
         shortcuts: Option<&'a dyn ShortcutStore>,
         site_search: Option<&'a dyn SiteSearchClient>,
+        domain_grounder: Option<&'a dyn DomainGrounder>,
+        region_hint: &'a str,
     ) -> ResolutionContext<'a> {
         ResolutionContext {
             account_dir: None,
@@ -853,6 +1047,8 @@ mod tests {
             parser: None,
             shortcuts,
             site_search,
+            domain_grounder,
+            region_hint,
         }
     }
 
@@ -860,7 +1056,7 @@ mod tests {
     fn ladder_explicit_domain_wins_without_any_lookup() {
         // "open amazon.in" names the destination outright: no shortcut, no
         // directory, no network — and no TLD was guessed, it was typed.
-        let ctx = ladder_ctx(None, None);
+        let ctx = ladder_ctx(None, None, None, "");
         let Some(resolved) = resolve_entry_url("open amazon.in", None, &ctx) else {
             panic!("explicit domain resolves");
         };
@@ -890,7 +1086,7 @@ mod tests {
         let directory = MockDirectory {
             url: Some("https://www.amazon.in/".to_owned()),
         };
-        let ctx = ladder_ctx(Some(&shortcuts), Some(&directory));
+        let ctx = ladder_ctx(Some(&shortcuts), Some(&directory), None, "");
         let Some(resolved) = resolve_entry_url("open amazon.in", None, &ctx) else {
             panic!("explicit domain resolves");
         };
@@ -907,7 +1103,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let ctx = ladder_ctx(Some(&shortcuts), None);
+        let ctx = ladder_ctx(Some(&shortcuts), None, None, "");
         for prompt in ["open amazon", "open amazon for me", "please open amazon"] {
             let Some(resolved) = resolve_entry_url(prompt, None, &ctx) else {
                 panic!("{prompt} resolves via shortcut");
@@ -924,7 +1120,7 @@ mod tests {
         let directory = MockDirectory {
             url: Some("https://www.amazon.in/".to_owned()),
         };
-        let ctx = ladder_ctx(None, Some(&directory));
+        let ctx = ladder_ctx(None, Some(&directory), None, "");
         let Some(resolved) = resolve_entry_url("open amazon for me", None, &ctx) else {
             panic!("directory resolves the cold name");
         };
@@ -932,11 +1128,155 @@ mod tests {
         assert_eq!(resolved.url.as_str(), "https://www.amazon.in/");
     }
 
+    struct MockGrounder {
+        domain: Option<String>,
+        expect_region: Option<String>,
+    }
+
+    impl DomainGrounder for MockGrounder {
+        fn ground_domain(&self, site_name: &str, region_hint: &str) -> Option<String> {
+            if let Some(expected) = &self.expect_region {
+                assert_eq!(region_hint, expected, "region hint passed through");
+            }
+            // Only answer for the site the test set up — proves the ladder
+            // passes the parsed slot, not the raw prompt.
+            if site_name == "amazon" {
+                self.domain.clone()
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn ladder_domain_grounder_grounds_with_region_hint() {
+        // Muse-like: "open amazon for me" with no shortcut and no directory
+        // key still opens directly via the fenced grounder — site slot
+        // ("amazon") + region hint ("IN") → bare domain ("amazon.in").
+        let grounder = MockGrounder {
+            domain: Some("amazon.in".to_owned()),
+            expect_region: Some("IN".to_owned()),
+        };
+        let ctx = ladder_ctx(None, None, Some(&grounder), "IN");
+        let Some(resolved) = resolve_entry_url("open amazon for me", None, &ctx) else {
+            panic!("grounder resolves the cold name");
+        };
+        assert_eq!(resolved.source, RouteSource::DomainGrounded);
+        assert_eq!(resolved.url.as_str(), "https://amazon.in/");
+    }
+
+    #[test]
+    fn ladder_domain_grounder_beats_site_search_but_loses_to_shortcut() {
+        // Precedence: shortcut (user data) > grounder > site directory.
+        let shortcuts = InMemoryShortcuts::new(
+            [("amazon".to_owned(), "https://www.amazon.in/".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        let grounder = MockGrounder {
+            domain: Some("amazon.com".to_owned()),
+            expect_region: None,
+        };
+        let directory = MockDirectory {
+            url: Some("https://www.amazon.co.uk/".to_owned()),
+        };
+        // Shortcut wins over grounder.
+        let ctx = ladder_ctx(Some(&shortcuts), Some(&directory), Some(&grounder), "IN");
+        let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
+            panic!("shortcut wins");
+        };
+        assert_eq!(resolved.source, RouteSource::Shortcut);
+        // Without shortcut, grounder wins over directory.
+        let ctx = ladder_ctx(None, Some(&directory), Some(&grounder), "IN");
+        let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
+            panic!("grounder beats directory");
+        };
+        assert_eq!(resolved.source, RouteSource::DomainGrounded);
+        assert_eq!(resolved.url.as_str(), "https://amazon.com/");
+    }
+
+    #[test]
+    fn ladder_domain_grounder_malformed_falls_through() {
+        // A grounder that returns junk never navigates: malformed domains
+        // degrade to the next rung, never to a guessed URL.
+        for bad in [
+            "not a domain",
+            "192.168.1.1",
+            "https://amazon.in/", // full URL, not a bare domain
+            "amazon",
+            "",
+        ] {
+            let grounder = MockGrounder {
+                domain: Some(bad.to_owned()),
+                expect_region: None,
+            };
+            let directory = MockDirectory {
+                url: Some("https://www.amazon.in/".to_owned()),
+            };
+            let ctx = ladder_ctx(None, Some(&directory), Some(&grounder), "IN");
+            let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {
+                panic!("falls through to directory for {bad:?}");
+            };
+            assert_eq!(
+                resolved.source,
+                RouteSource::SiteSearch,
+                "bad grounder output {bad:?} must not navigate"
+            );
+        }
+        // And when nothing else grounds it, the miss is honest.
+        let grounder = MockGrounder {
+            domain: Some("bogus!!".to_owned()),
+            expect_region: None,
+        };
+        let ctx = ladder_ctx(None, None, Some(&grounder), "IN");
+        assert_eq!(resolve_entry_url("open amazon", None, &ctx), None);
+    }
+
+    #[test]
+    fn validate_grounded_domain_policy() {
+        // Valid bare domains → https URLs.
+        assert_eq!(
+            validate_grounded_domain("amazon.in").as_deref(),
+            Some("https://amazon.in")
+        );
+        assert_eq!(
+            validate_grounded_domain("  WWW.AMAZON.IN. ").as_deref(),
+            Some("https://www.amazon.in")
+        );
+        // Rejected: no TLD, raw IPs, credentials, URLs, empty.
+        assert_eq!(validate_grounded_domain("amazon"), None);
+        assert_eq!(validate_grounded_domain("192.168.1.1"), None);
+        assert_eq!(validate_grounded_domain("::1"), None);
+        assert_eq!(validate_grounded_domain("user:pass@amazon.in"), None);
+        assert_eq!(validate_grounded_domain("https://amazon.in"), None);
+        assert_eq!(validate_grounded_domain(""), None);
+        assert_eq!(validate_grounded_domain("amazon.in/path"), None);
+    }
+
+    #[test]
+    fn region_hint_mapping() {
+        assert_eq!(region_hint_from_timezone("Asia/Kolkata"), Some("IN"));
+        assert_eq!(region_hint_from_timezone("Asia/Calcutta"), Some("IN"));
+        assert_eq!(region_hint_from_timezone("America/New_York"), Some("US"));
+        assert_eq!(region_hint_from_timezone("Europe/Paris"), Some("FR"));
+        assert_eq!(region_hint_from_timezone("Europe/London"), Some("GB"));
+        assert_eq!(region_hint_from_timezone("Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn stub_grounder_declines() {
+        let stub = StubDomainGrounder;
+        assert_eq!(stub.ground_domain("amazon", "IN"), None);
+        // With only the stub wired, the cold name still misses honestly.
+        let ctx = ladder_ctx(None, None, Some(&stub), "IN");
+        assert_eq!(resolve_entry_url("open amazon for me", None, &ctx), None);
+    }
+
     #[test]
     fn ladder_malformed_explicit_domain_fails_closed() {
         // A typed destination that is not navigable (non-https) is a miss,
         // not a search: Googling a typo'd scheme fixes nothing.
-        let ctx = ladder_ctx(None, None);
+        let ctx = ladder_ctx(None, None, None, "");
         assert_eq!(resolve_entry_url("open http://amazon.in", None, &ctx), None);
     }
 

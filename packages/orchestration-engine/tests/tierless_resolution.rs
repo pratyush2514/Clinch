@@ -49,6 +49,8 @@ fn offline_ctx() -> ResolutionContext<'static> {
         parser: None,
         shortcuts: None,
         site_search: None,
+        domain_grounder: None,
+        region_hint: "",
     }
 }
 
