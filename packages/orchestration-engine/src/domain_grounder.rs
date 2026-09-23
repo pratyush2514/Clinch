@@ -223,8 +223,12 @@ impl LlmDomainGrounder {
         self.last_error.lock().ok().and_then(|guard| guard.clone())
     }
 
-    /// Record a sanitized provider failure for [`Self::last_error`].
+    /// Record a sanitized provider failure for [`Self::last_error`]. Also
+    /// echoes to stderr: under `npm run tauri dev` the terminal is the
+    /// reliable channel when the UI is the thing misbehaving. Sanitized —
+    /// never contains credentials.
     fn record_error(&self, detail: String) {
+        eprintln!("[clinch:grounder] {detail}");
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = Some(detail);
         }
