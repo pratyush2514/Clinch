@@ -1727,17 +1727,10 @@ impl AppService {
             .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
         // Strict validation before any navigation or session write.
         // Provenance-aware: user-directed destinations (a typed domain, a
-        // saved shortcut, a confirmed directory hit) were named by the
-        // user, so structural validation suffices. Machine-proposed URLs
-        // keep the host allowlist.
-        let valid = match proposed.source {
-            Some(
-                orchestration_engine::RouteSource::ExplicitDomain
-                | orchestration_engine::RouteSource::Shortcut
-                | orchestration_engine::RouteSource::SiteSearch,
-            ) => orchestration_engine::validate_user_directed_url(entry_url.as_str()).is_ok(),
-            _ => orchestration_engine::validate_proposed_url(entry_url.as_str()).is_ok(),
-        };
+        // saved shortcut, a confirmed directory hit, a domain-grounded hit)
+        // were named by the user, so structural validation suffices.
+        // Machine-proposed URLs keep the host allowlist.
+        let valid = orchestration_engine::entry_url_valid(proposed.source, entry_url.as_str());
         if !valid {
             return Err(AppError::InvalidInput(
                 "The derived intent is not runnable.",

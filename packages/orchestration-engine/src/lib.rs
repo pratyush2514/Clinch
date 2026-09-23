@@ -39,7 +39,9 @@ use sqlx::SqlitePool;
 use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
-pub use url_policy::{UrlRejected, validate_proposed_url, validate_user_directed_url};
+pub use url_policy::{
+    UrlRejected, entry_url_valid, validate_proposed_url, validate_user_directed_url,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

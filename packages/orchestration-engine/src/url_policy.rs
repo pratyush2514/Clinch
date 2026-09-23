@@ -9,6 +9,8 @@
 //! observed from a real click on a live search result, not proposed, so it
 //! re-anchors confinement instead of passing through here.
 
+use super::route_proposer::RouteSource;
+
 /// Hosts navigation may target. Exact matches only.
 /// `www.google.com` / `google.com` back the grounded search tier
 /// (`/search?q=…` template, never guessed TLDs); the entity tier resolves
@@ -84,6 +86,29 @@ pub fn validate_user_directed_url(url: &str) -> Result<url::Url, UrlRejected> {
     Ok(parsed)
 }
 
+/// Validation bar for a proposed entry URL, by route provenance.
+/// User-directed destinations — a typed domain, a saved shortcut, a site
+/// the directory resolved, a site the domain grounder resolved — were named
+/// by the user; the model or directory only resolved the name. Structural
+/// validation (absolute `https`, no embedded credentials) suffices there.
+/// Everything else keeps the host allowlist.
+///
+/// Refusing `https://amazon.in` here because no tier predicted it would
+/// make direct opens impossible by construction: the grounder exists
+/// precisely to resolve names no table knows.
+#[must_use]
+pub fn entry_url_valid(source: Option<RouteSource>, entry_url: &str) -> bool {
+    match source {
+        Some(
+            RouteSource::ExplicitDomain
+            | RouteSource::Shortcut
+            | RouteSource::SiteSearch
+            | RouteSource::DomainGrounded,
+        ) => validate_user_directed_url(entry_url).is_ok(),
+        _ => validate_proposed_url(entry_url).is_ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +151,48 @@ mod tests {
         assert!(validate_user_directed_url("").is_err());
         // The machine-proposed gate still refuses what the user never named.
         assert!(validate_proposed_url("https://www.amazon.in/").is_err());
+    }
+
+    #[test]
+    fn entry_url_valid_treats_domain_grounded_as_user_directed() {
+        // Regression: a grounder hit for amazon.in must take the
+        // user-directed bar, not the machine-proposed host allowlist (which
+        // only knows github.com and google.com). Routing it through the
+        // allowlist made every grounded direct open fail dispatch with
+        // "The derived intent is not runnable."
+        assert!(entry_url_valid(
+            Some(RouteSource::DomainGrounded),
+            "https://www.amazon.in/"
+        ));
+        assert!(entry_url_valid(
+            Some(RouteSource::ExplicitDomain),
+            "https://www.amazon.in/"
+        ));
+        assert!(entry_url_valid(
+            Some(RouteSource::Shortcut),
+            "https://www.amazon.in/"
+        ));
+        assert!(entry_url_valid(
+            Some(RouteSource::SiteSearch),
+            "https://www.amazon.in/"
+        ));
+        // Machine-proposed tiers keep the allowlist.
+        assert!(!entry_url_valid(
+            Some(RouteSource::SearchFallback),
+            "https://www.amazon.in/"
+        ));
+        assert!(entry_url_valid(
+            Some(RouteSource::SearchFallback),
+            "https://www.google.com/search?q=open+amazon"
+        ));
+        // The structural bar still applies to user-directed URLs.
+        assert!(!entry_url_valid(
+            Some(RouteSource::DomainGrounded),
+            "http://www.amazon.in/"
+        ));
+        assert!(!entry_url_valid(
+            Some(RouteSource::DomainGrounded),
+            "https://user:pass@www.amazon.in/"
+        ));
     }
 }
