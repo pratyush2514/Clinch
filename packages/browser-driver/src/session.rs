@@ -124,6 +124,44 @@ const CHALLENGE_BODY_MARKERS: [&str; 8] = [
     "protect against malicious bots",
 ];
 
+/// Markers that only appear on *interactive* human-verification gates
+/// (reCAPTCHA checkbox / hCaptcha): a human must click, or a session must
+/// be lent — L1's off-screen re-navigation can never clear these, so the
+/// detector routes them straight to the card instead of burning ~30s on a
+/// pointless escalation. Parent-document text only: the checkbox itself
+/// renders inside a cross-origin iframe whose contents `innerText` cannot
+/// see (e.g. reddit's "Prove your humanity" page never contains the
+/// "i'm not a robot" marker above, which is why it once completed
+/// silently).
+const CHALLENGE_INTERACTIVE_MARKERS: [&str; 2] =
+    ["prove your humanity", "complete the challenge below"];
+
+/// What kind of human-verification gate the detector found. `Interstitial`
+/// pages (Cloudflare "Just a moment" / Turnstile) may clear on their own in
+/// an off-screen headed browser, so L1 auto-escalation is worth trying.
+/// `InteractiveGate` pages (reCAPTCHA checkbox) never clear without a human
+/// click or a lent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeKind {
+    Interstitial,
+    InteractiveGate,
+}
+
+fn challenge_kind(title: &str, url: &Url, body_text: &str) -> Option<ChallengeKind> {
+    // Interactive markers are the more specific signal: check them first
+    // so a gate page is never misrouted through L1. Existing markers keep
+    // their current classification — nothing already detected changes
+    // behavior.
+    let body = body_text.to_lowercase();
+    if CHALLENGE_INTERACTIVE_MARKERS
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        return Some(ChallengeKind::InteractiveGate);
+    }
+    is_challenge_page(title, url, body_text).then_some(ChallengeKind::Interstitial)
+}
+
 fn is_challenge_page(title: &str, url: &Url, body_text: &str) -> bool {
     // Cloudflare's challenge-platform path is a strong signal on its own:
     // the destination has not rendered yet.
@@ -156,13 +194,15 @@ impl ManagedBrowser {
         Ok(detect_auth_signal(&current, portal))
     }
 
-    /// Detect a bot-mitigation interstitial on the live page: returns the
-    /// page URL when the title, URL, or visible text says this is a
-    /// human-verification gate (Cloudflare "Just a moment" / Turnstile,
-    /// reCAPTCHA "I'm not a robot") rather than the destination itself.
-    /// The thread uses this to route the human check to the user — a headed
-    /// takeover where they solve it once — instead of silently completing
-    /// on a CAPTCHA page.
+    /// Detect a bot-mitigation gate on the live page: returns the page URL
+    /// when the title, URL, or visible text says this is a human-verification
+    /// gate (Cloudflare "Just a moment" / Turnstile, reCAPTCHA "I'm not a
+    /// robot") rather than the destination itself. The thread uses this to
+    /// route the human check to the user — a headed takeover where they
+    /// solve it once — instead of silently completing on a CAPTCHA page.
+    /// Kind-agnostic: covers both interstitial and interactive gates (the
+    /// old version missed interactive parent-page markers, so a re-probe
+    /// after session lending could falsely report a cleared gate).
     ///
     /// Fail-closed: any CDP, timeout, or parse failure yields `None`, never
     /// a false challenge. No flags are toggled here: the launch already
@@ -170,6 +210,23 @@ impl ManagedBrowser {
     /// Cloudflare still challenges headless CDP-driven Chromium on its
     /// remaining signals — an arms race no launch flag wins.
     pub async fn challenge_detected(&self) -> Option<String> {
+        self.challenge_detected_kind().await.map(|(url, _)| url)
+    }
+
+    /// Kind-aware challenge detection: the page URL plus whether the gate
+    /// is an auto-clearable interstitial or an interactive gate that L1
+    /// must not waste an escalation on. Fail-closed like
+    /// [`ManagedBrowser::challenge_detected`].
+    pub async fn challenge_detected_kind(&self) -> Option<(String, ChallengeKind)> {
+        let (url, title, body) = self.challenge_probe().await?;
+        let kind = challenge_kind(&title, &url, &body)?;
+        Some((url.to_string(), kind))
+    }
+
+    /// Shared live-page probe for challenge detection: current URL plus
+    /// the title and visible text the markers match against. `None` on any
+    /// CDP, timeout, or parse failure — callers fail closed.
+    async fn challenge_probe(&self) -> Option<(Url, String, String)> {
         let url = self.current_url().await.ok()??;
         let pair = tokio::time::timeout(IO_TIMEOUT, async {
             self.page
@@ -184,7 +241,8 @@ impl ManagedBrowser {
         .await
         .ok()?
         .ok()?;
-        is_challenge_page(&pair[0], &url, &pair[1]).then(|| url.to_string())
+        let [title, body] = pair;
+        Some((url, title, body))
     }
 
     /// Resolve a backend node id to its viewport rectangle via
@@ -502,6 +560,39 @@ mod tests {
             &url("https://example.com/signin")?,
             "Enter your email to sign in",
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_kind_routes_interactive_gates_past_l1() -> Result<(), Box<dyn std::error::Error>> {
+        // Reddit's reCAPTCHA parent page: the checkbox lives in a
+        // cross-origin iframe, so the parent text carries the gate signal.
+        assert_eq!(
+            challenge_kind(
+                "Reddit - Dive into anything",
+                &url("https://www.reddit.com/")?,
+                "Prove your humanity\nComplete the challenge below to continue to Reddit.",
+            ),
+            Some(ChallengeKind::InteractiveGate)
+        );
+        // Cloudflare interstitial copy stays on the L1 path.
+        assert_eq!(
+            challenge_kind(
+                "Just a moment...",
+                &url("https://claude.ai/")?,
+                "Verifying you are human. This may take a few seconds.",
+            ),
+            Some(ChallengeKind::Interstitial)
+        );
+        // A login form is neither.
+        assert_eq!(
+            challenge_kind(
+                "Sign in",
+                &url("https://example.com/signin")?,
+                "Enter your email to sign in",
+            ),
+            None
+        );
         Ok(())
     }
 

@@ -122,6 +122,7 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
       onSave={vi.fn()}
       onFile={vi.fn()}
       onTakeControl={vi.fn()}
+      onLendSession={vi.fn()}
       onRelease={vi.fn()}
       onConnect={vi.fn()}
       onSaveShortcut={vi.fn()}

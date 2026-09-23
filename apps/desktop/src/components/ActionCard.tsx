@@ -30,6 +30,7 @@ export default function ActionCard({
   onSave,
   onFile,
   onTakeControl,
+  onLendSession,
   onRelease,
   onConnect,
   onSaveShortcut,
@@ -46,6 +47,7 @@ export default function ActionCard({
   onSave: () => void;
   onFile: (chip: OutputChip, reveal: boolean) => void;
   onTakeControl: (url?: string) => void;
+  onLendSession: (runId: string) => void;
   onRelease: () => void;
   onConnect: () => void;
   onSaveShortcut: () => void;
@@ -92,8 +94,11 @@ export default function ActionCard({
       {entry.challenge && (
         <ChallengeCard
           url={entry.challenge}
+          runId={entry.runId}
           busy={browserBusy}
+          lend={entry.lend}
           onTakeControl={url => onTakeControl(url)}
+          onLendSession={onLendSession}
         />
       )}
       {entry.shortcutOffer && !entry.shortcutDismissed && (

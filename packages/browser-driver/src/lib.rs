@@ -31,7 +31,7 @@ pub use picker::{
 };
 pub use preview::{DomRegion, Viewport};
 pub use screencast::{SCREENCAST_JPEG_QUALITY, ScreencastFrame};
-pub use session::{AuthSignal, detect_auth_signal};
+pub use session::{AuthSignal, ChallengeKind, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
 use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
@@ -555,8 +555,27 @@ impl ManagedBrowser {
     /// # Errors
     /// Reports rejected or timed-out commands; never marks partial import successful.
     pub async fn inject(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
+        self.inject_inner(cookies, false).await
+    }
+
+    /// Inject a cookie set as *session-only* cookies: `expires` is stripped
+    /// so Chromium keeps them in process memory and never writes them to
+    /// the app profile's cookie database on disk. Used by L1.5 session
+    /// lending — the lent identity must not outlive the browser process.
+    ///
+    /// # Errors
+    /// Reports rejected or timed-out commands; never marks partial import successful.
+    pub async fn inject_session(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
+        self.inject_inner(cookies, true).await
+    }
+
+    async fn inject_inner(
+        &self,
+        cookies: &[Cookie],
+        session_only: bool,
+    ) -> Result<(), BrowserError> {
         for cookie in cookies {
-            let params = cookie_params(cookie)?;
+            let params = cookie_params(cookie, session_only)?;
             // Current CDP returns an empty result on success and a protocol error on failure.
             tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
                 .await
@@ -713,7 +732,13 @@ impl Drop for ManagedBrowser {
     }
 }
 
-fn cookie_params(cookie: &Cookie) -> Result<SetCookieParams, BrowserError> {
+/// Map a bridge cookie to CDP `Network.setCookie` params. When
+/// `session_only` is set, `expires` is stripped so Chromium treats the
+/// cookie as a session cookie — process memory only, never persisted to
+/// the profile's cookie database. L1.5 session lending requires this: a
+/// lent identity with a year-long expiry would otherwise be written to
+/// disk, silently violating the in-memory-only promise.
+fn cookie_params(cookie: &Cookie, session_only: bool) -> Result<SetCookieParams, BrowserError> {
     let mut builder = SetCookieParams::builder()
         .name(&cookie.name)
         .value(cookie.value.as_str())
@@ -733,7 +758,7 @@ fn cookie_params(cookie: &Cookie) -> Result<SetCookieParams, BrowserError> {
         CookieSameSite::Lax => builder.same_site(CdpSameSite::Lax),
         CookieSameSite::Strict => builder.same_site(CdpSameSite::Strict),
     };
-    if let Some(expires) = cookie.expires {
+    if !session_only && let Some(expires) = cookie.expires {
         // Avoid a 2038 cutoff. CDP represents seconds as a floating-point number.
         if !(0..=253_402_300_799).contains(&expires) {
             return Err(BrowserError::Injection);
@@ -763,13 +788,27 @@ mod tests {
     }
     #[test]
     fn preserves_host_only_and_session_cookie_semantics() -> Result<(), BrowserError> {
-        let host = cookie_params(&cookie("example.com"))?;
+        let host = cookie_params(&cookie("example.com"), false)?;
         assert!(host.domain.is_none());
         assert_eq!(host.url.as_deref(), Some("https://example.com/"));
         assert!(host.expires.is_none());
-        let domain = cookie_params(&cookie(".example.com"))?;
+        let domain = cookie_params(&cookie(".example.com"), false)?;
         assert_eq!(domain.domain.as_deref(), Some(".example.com"));
         assert!(domain.url.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn session_only_injection_strips_expiry() -> Result<(), BrowserError> {
+        // Regression: a lent cookie with a year-long expiry must reach CDP
+        // with no `expires`, or Chromium persists the lent identity to the
+        // app profile's cookie database on disk.
+        let mut lent = cookie("example.com");
+        lent.expires = Some(1_893_456_000); // 2030-01-01
+        let persistent = cookie_params(&lent, false)?;
+        assert!(persistent.expires.is_some());
+        let session_only = cookie_params(&lent, true)?;
+        assert!(session_only.expires.is_none());
         Ok(())
     }
 

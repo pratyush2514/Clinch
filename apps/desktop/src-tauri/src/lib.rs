@@ -5,7 +5,7 @@ mod ws_server;
 use auth::AuthPanel;
 use service::{
     AppError, AppService, ApprovalPreview, BridgeStatus, ContextStatus, DispatchOutcome,
-    IntentPreview, PickerStatus, PocMetrics, SessionStatus, StorageStatus,
+    IntentPreview, LendOutcome, PickerStatus, PocMetrics, SessionStatus, StorageStatus,
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
@@ -119,6 +119,16 @@ async fn bridge_sync_session(
     state: tauri::State<'_, AppService>,
 ) -> Result<SessionStatus, AppError> {
     state.bridge_sync(&portal_url).await
+}
+/// L1.5 session lending: the challenge-card "Sync my session" tap. The tap
+/// is the consent event; the backend resolves the challenged host from the
+/// run registry, never from client input.
+#[tauri::command]
+async fn lend_challenge_session(
+    run_id: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<LendOutcome, AppError> {
+    state.lend_challenge_session(run_id).await
 }
 #[tauri::command]
 async fn auth_status(state: tauri::State<'_, AppService>) -> Result<Option<AuthPanel>, AppError> {
@@ -294,6 +304,7 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         close_browser,
         bridge_status,
         bridge_sync_session,
+        lend_challenge_session,
         auth_status,
         begin_embedded_auth,
         complete_embedded_auth,

@@ -132,6 +132,54 @@ describe("threadReducer", () => {
     expect(settled[0].frame).toBe("live");
   });
 
+  it("carries the backend run id onto the settled entry for session lending", () => {
+    const settled = fold([
+      SUBMIT,
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+        challenge: "https://www.reddit.com/login",
+        runId: "journal-42",
+      },
+    ]);
+    expect(settled[0].runId).toBe("journal-42");
+    expect(settled[0].lend).toBeNull();
+  });
+
+  it("tracks the L1.5 lend lifecycle and swaps in the cleared frame", () => {
+    const base = fold([SUBMIT]);
+    const busy = threadReducer(base, {
+      type: "lendState",
+      id: "e1",
+      lend: { status: "busy", reason: null, frame: null },
+    });
+    expect(busy[0].lend?.status).toBe("busy");
+    const cleared = threadReducer(busy, {
+      type: "lendState",
+      id: "e1",
+      lend: { status: "cleared", reason: null, frame: "fresh-frame" },
+    });
+    expect(cleared[0].lend?.status).toBe("cleared");
+    expect(cleared[0].frame).toBe("fresh-frame");
+    const persistent = threadReducer(cleared, {
+      type: "lendState",
+      id: "e1",
+      lend: { status: "persistent", reason: "Still there.", frame: null },
+    });
+    expect(persistent[0].lend?.status).toBe("persistent");
+    expect(persistent[0].lend?.reason).toBe("Still there.");
+    // A persistent lend keeps the previously settled frame.
+    expect(persistent[0].frame).toBe("fresh-frame");
+  });
   it("carries the challenge URL onto the settled entry for takeover", () => {
     // A completed run that landed on a human-verification gate keeps the
     // challenge URL so the card can offer headed takeover.

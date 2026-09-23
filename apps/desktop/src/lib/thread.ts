@@ -102,6 +102,10 @@ export type ThreadEntry = {
    * offers headed takeover so the user solves the check once.
    */
   challenge: string | null;
+  /** Backend run id for challenged runs, so the card can lend a session. */
+  runId: string | null;
+  /** L1.5 session-lend state for this entry's challenge card. */
+  lend: LendUiState | null;
   elapsedMs: number | null;
   result: EntryResult | null;
   saveName: string;
@@ -115,6 +119,15 @@ export type ThreadEntry = {
   error: { message: string; code: string | null } | null;
 };
 
+/** L1.5 session-lend UI state for a challenged entry. */
+export type LendUiState = {
+  status: "busy" | "cleared" | "persistent";
+  /** Static user-facing reason when the gate did not clear. */
+  reason: string | null;
+  /** Fresh settle-time frame captured after a cleared lend. */
+  frame: string | null;
+};
+
 export type ThreadAction =
   | { type: "submit"; id: string; lane: Lane; prompt: string; at: number }
   | { type: "handle"; id: string; handle: number }
@@ -123,8 +136,9 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; runId?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
+  | { type: "lendState"; id: string; lend: LendUiState }
   | { type: "rename"; id: string; saveName: string }
   | { type: "saved"; id: string; savedId: string }
   | { type: "shortcutSaved"; id: string }
@@ -166,6 +180,8 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           notes: [],
           frame: null,
           challenge: null,
+          runId: null,
+          lend: null,
           elapsedMs: null,
           result: null,
           saveName: "",
@@ -237,6 +253,17 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         // A completed run that landed on a human-verification gate keeps
         // the challenge URL so the thread can offer headed takeover.
         challenge: action.challenge ?? null,
+        // Backend run id travels so the challenge card can lend a session;
+        // a fresh settle resets any previous lend state.
+        runId: action.runId ?? null,
+        lend: null,
+      }));
+    case "lendState":
+      return patch(entries, action.id, entry => ({
+        ...entry,
+        lend: action.lend,
+        // A cleared lend brings a fresh frame of the landed page.
+        frame: action.lend.frame ?? entry.frame,
       }));
     case "failed":
       return patch(entries, action.id, entry => ({

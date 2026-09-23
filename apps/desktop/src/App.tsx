@@ -134,6 +134,7 @@ export default function App() {
         onSave={id => void thread.save(id)}
         onFile={(id, chip, reveal) => void thread.openFile(id, chip, reveal)}
         onTakeControl={url => void screencast.takeControl(url)}
+        onLendSession={(entryId, runId) => void thread.lendSession(entryId, runId)}
         onRelease={() => void screencast.release()}
         onConnect={() => setSessionOpen(true)}
         onSaveShortcut={id => void thread.saveShortcut(id)}

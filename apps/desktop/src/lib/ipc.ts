@@ -107,6 +107,15 @@ export type DispatchOutcome = {
   challenge?: string | null;
 };
 
+/** Result of one L1.5 session-lend attempt (`lend_challenge_session`). */
+export type LendOutcome = {
+  cleared: boolean;
+  cookiesLent: number;
+  reason: string | null;
+  /** Fresh settle-time frame when the gate cleared. */
+  finalFrame: string | null;
+};
+
 export type PlaybookSummary = {
   id: string;
   name: string;

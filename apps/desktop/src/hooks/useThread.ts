@@ -13,6 +13,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   PLAYBOOKS_CHANGED,
   type DispatchOutcome,
+  type LendOutcome,
   type PlaybookEvent,
   type PlaybookSummary,
   type SequenceOutcome,
@@ -55,6 +56,12 @@ export type ThreadApi = {
   /** Decline the post-landing shortcut offer: keep nothing. */
   dismissShortcut: (entryId: string) => void;
   openFile: (entryId: string, chip: OutputChip, reveal: boolean) => Promise<void>;
+  /**
+   * L1.5 session lending: the challenge-card consent tap. Pulls the
+   * challenged site's cookies from the companion extension into the managed
+   * browser (session-only) and re-probes the gate. One attempt per run.
+   */
+  lendSession: (entryId: string, runId: string) => Promise<void>;
   /** Attribute the newest frame to whichever entry is currently live. */
   noteFrame: (frame: string) => void;
 };
@@ -185,6 +192,8 @@ export function useThread(
           // Human-verification gate instead of the destination: the card
           // offers headed takeover so the user solves it once.
           challenge: outcome.challenge ?? null,
+          // Backend run id so the challenge card can lend a session.
+          runId: outcome.runId ?? null,
         });
       } catch (error) {
         fail(id, error);
@@ -376,6 +385,40 @@ export function useThread(
     dispatch({ type: "shortcutDismissed", id: entryId });
   }, []);
 
+  const lendSession = useCallback(
+    async (entryId: string, runId: string) => {
+      dispatch({
+        type: "lendState",
+        id: entryId,
+        lend: { status: "busy", reason: null, frame: null },
+      });
+      try {
+        const outcome = await invoke<LendOutcome>("lend_challenge_session", { runId });
+        dispatch({
+          type: "lendState",
+          id: entryId,
+          lend: {
+            status: outcome.cleared ? "cleared" : "persistent",
+            reason: outcome.reason,
+            frame: outcome.finalFrame,
+          },
+        });
+        report(
+          outcome.cleared
+            ? `Session synced (${outcome.cookiesLent} cookies) — the page should now load as you.`
+            : (outcome.reason ?? "The human check is still there after syncing."),
+        );
+      } catch (error) {
+        dispatch({
+          type: "lendState",
+          id: entryId,
+          lend: { status: "persistent", reason: message(error), frame: null },
+        });
+      }
+    },
+    [report],
+  );
+
   const openFile = useCallback(
     async (entryId: string, chip: OutputChip, reveal: boolean) => {
       const entry = latest.current.find(candidate => candidate.id === entryId);
@@ -410,6 +453,7 @@ export function useThread(
     saveShortcut,
     dismissShortcut,
     openFile,
+    lendSession,
     noteFrame,
   };
 }

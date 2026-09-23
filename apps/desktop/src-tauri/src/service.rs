@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 use crate::auth::{AuthPanel, ReauthReason, reason_for_signal};
-use browser_driver::{Action, LaunchOptions, ManagedBrowser, WindowMode};
+use browser_driver::{Action, ChallengeKind, LaunchOptions, ManagedBrowser, WindowMode};
 use futures::StreamExt;
 use orchestration_engine::{Engine, EngineError, Task, TaskEvent, TaskId, TaskRequest};
 use serde::Serialize;
@@ -482,6 +482,11 @@ pub struct AppService {
     /// (origin plus steps) keyed by journal id, newest last. Session memory
     /// only — `save_run_as_workflow` drains entries into durable playbooks.
     completed_runs: Mutex<VecDeque<CompletedRun>>,
+    /// L1.5 session-lend registry: challenged runs awaiting a possible
+    /// consent tap, oldest first. The tap is the consent event — the
+    /// bridge is never asked without it — and each run gets exactly one
+    /// attempt. Session memory only, capped like `completed_runs`.
+    challenge_lends: Mutex<VecDeque<(String, ChallengeLendState)>>,
     next_playbook_run: AtomicU64,
     /// Fenced structured-intent parser consulted only when the deterministic
     /// grammar parse is not confident, and only for slots — never for URLs,
@@ -504,6 +509,32 @@ pub struct AppService {
 /// workflow's prompt key if — and only if — the user chooses to save, which
 /// is what closes the learning loop: an irregular prompt that needed the
 /// parser seam once resolves from storage every time after.
+/// L1.5 session-lend state for one challenged run: the challenged page URL
+/// (resolved server-side from the settle, never trusted from the frontend)
+/// plus whether the single consent-gated attempt already ran and what it
+/// returned. Repeat taps return the recorded outcome — no retry loop, no
+/// second bridge request.
+#[derive(Clone)]
+struct ChallengeLendState {
+    challenge_url: String,
+    /// The one recorded outcome. Set after the first consent tap so a
+    /// repeat tap replays it instead of re-running the bridge exchange.
+    outcome: Option<LendOutcome>,
+}
+
+/// Outcome of one L1.5 session-lend attempt, surfaced on the challenge
+/// card. `cleared` means the re-probe found no gate after lending;
+/// otherwise `reason` carries the static user-facing string and Take
+/// Control stays the fallback.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LendOutcome {
+    cleared: bool,
+    cookies_lent: usize,
+    reason: Option<String>,
+    final_frame: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct CompletedRun {
     id: String,
@@ -534,6 +565,7 @@ impl AppService {
             playbook_gate: Mutex::new(None),
             screencast: Mutex::new(None),
             completed_runs: Mutex::new(VecDeque::new()),
+            challenge_lends: Mutex::new(VecDeque::new()),
             next_playbook_run: AtomicU64::new(1),
             intent_parser: Arc::new(orchestration_engine::StubIntentParser),
         }
@@ -994,21 +1026,20 @@ impl AppService {
         })
     }
 
-    /// Zero-touch sync via the Clinch Companion extension: the live session
-    /// (cookies + User-Agent) arrives over loopback, is validated against the
-    /// portal scope, and is injected into the managed browser — raw values are
-    /// never persisted. Long-polls up to the bridge response timeout.
-    pub async fn bridge_sync(&self, portal_url: &str) -> Result<SessionStatus, AppError> {
+    /// Request the companion extension's live session (cookies +
+    /// User-Agent) for `portal` over the loopback bridge. Shared by portal
+    /// sync and L1.5 challenge lending: both fire only on an explicit UI
+    /// action — the tap is the consent event — never from detection alone.
+    /// Bridge failures map to static user-facing strings; raw payloads are
+    /// never surfaced. Long-polls up to the bridge response timeout.
+    async fn request_bridge_session(
+        &self,
+        portal: &url::Url,
+    ) -> Result<crate::ws_server::BridgeSession, AppError> {
         use crate::ws_server::BridgeError;
-        let portal = session_sync::validate_portal(portal_url)
-            .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
-        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
-        self.database().await?;
-        // Request first: a missing companion fails fast without opening a window.
-        let session = self
-            .bridge_server()
+        self.bridge_server()
             .await?
-            .request_sync(&portal, crate::ws_server::RESPONSE_TIMEOUT)
+            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT)
             .await
             .map_err(|error| match error {
                 BridgeError::NoExtension => AppError::InvalidInput(
@@ -1021,7 +1052,20 @@ impl AppService {
                     "The companion found no cookies for this portal. Sign in there first.",
                 ),
                 _ => AppError::WorkflowFailed,
-            })?;
+            })
+    }
+
+    /// Zero-touch sync via the Clinch Companion extension: the live session
+    /// (cookies + User-Agent) arrives over loopback, is validated against the
+    /// portal scope, and is injected into the managed browser — raw values are
+    /// never persisted. Long-polls up to the bridge response timeout.
+    pub async fn bridge_sync(&self, portal_url: &str) -> Result<SessionStatus, AppError> {
+        let portal = session_sync::validate_portal(portal_url)
+            .map_err(|_| AppError::InvalidInput("Enter a valid HTTPS portal URL."))?;
+        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        self.database().await?;
+        // Request first: a missing companion fails fast without opening a window.
+        let session = self.request_bridge_session(&portal).await?;
         // Interactive: same reason as local-profile sync — the landing may
         // be a challenge page the user must finish.
         let browser = self.browser(BrowserIntent::Interactive).await?;
@@ -1046,6 +1090,172 @@ impl AppService {
             });
         }
         Ok(SessionStatus::CookiesImported { count })
+    }
+
+    /// L1.5 session lending: the consent-gated rung between L1
+    /// auto-escalation and L2 Take Control. The challenge-card tap is the
+    /// consent event — this never fires from detection alone. Pulls the
+    /// challenged site's cookies from the Clinch Companion extension,
+    /// injects them **session-only** (no `expires`, so Chromium keeps them
+    /// in process memory and never writes them to the app profile's cookie
+    /// database), re-navigates, and re-probes the gate.
+    ///
+    /// One attempt per run: repeat taps return the recorded outcome. The
+    /// challenged host is resolved server-side from the run registry — a
+    /// host string from the frontend is never trusted here.
+    /// Remember a challenged run so the card's consent tap can lend a
+    /// session. Re-registration refreshes the entry; the registry is
+    /// session memory capped like `completed_runs` — oldest evicted first.
+    fn remember_challenge_lend(&self, run_id: String, challenge_url: String) {
+        if let Ok(mut lends) = self.challenge_lends.lock() {
+            if let Some((_, state)) = lends.iter_mut().find(|(id, _)| *id == run_id) {
+                state.challenge_url = challenge_url;
+                state.outcome = None;
+                return;
+            }
+            lends.push_back((
+                run_id,
+                ChallengeLendState {
+                    challenge_url,
+                    outcome: None,
+                },
+            ));
+            while lends.len() > MAX_COMPLETED_RUNS {
+                lends.pop_front();
+            }
+        }
+    }
+
+    pub async fn lend_challenge_session(&self, run_id: String) -> Result<LendOutcome, AppError> {
+        let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        let challenge_url =
+            {
+                let mut lends = self
+                    .challenge_lends
+                    .lock()
+                    .map_err(|_| AppError::Internal)?;
+                let (_, state) = lends.iter_mut().find(|(id, _)| *id == run_id).ok_or(
+                    AppError::InvalidInput(
+                        "This run has no pending challenge to lend a session to.",
+                    ),
+                )?;
+                // Second tap: the recorded outcome, no second bridge request.
+                if let Some(outcome) = state.outcome.clone() {
+                    return Ok(outcome);
+                }
+                state.challenge_url.clone()
+            };
+        let host = url::Url::parse(&challenge_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| challenge_url.clone());
+        // The tap is consent: journal before any bridge I/O.
+        self.journal_line(format!("session_lend_requested: {host}"))
+            .await;
+        let outcome = self
+            .lend_challenge_session_inner(&challenge_url, &host)
+            .await;
+        if let Ok(mut lends) = self.challenge_lends.lock()
+            && let Some((_, state)) = lends.iter_mut().find(|(id, _)| *id == run_id)
+        {
+            state.outcome = Some(outcome.clone());
+        }
+        Ok(outcome)
+    }
+
+    /// The lend attempt itself: bridge request, session-only injection,
+    /// re-navigation, re-probe. Every exit journals exactly one
+    /// `session_lent:` / `session_lend_failed:` line with counts and hosts
+    /// only — cookie values never appear.
+    async fn lend_challenge_session_inner(&self, challenge_url: &str, host: &str) -> LendOutcome {
+        let failed = |label: &str| LendOutcome {
+            cleared: false,
+            cookies_lent: 0,
+            reason: Some(label.to_owned()),
+            final_frame: None,
+        };
+        let portal = match url::Url::parse(challenge_url) {
+            Ok(url) if url.scheme() == "https" => url,
+            _ => {
+                self.journal_line(format!("session_lend_failed: {host} · bad challenge url"))
+                    .await;
+                return failed("The challenged page URL is not usable.");
+            }
+        };
+        let session = match self.request_bridge_session(&portal).await {
+            Ok(session) => session,
+            Err(AppError::InvalidInput(reason)) => {
+                self.journal_line(format!("session_lend_failed: {host} · bridge: {reason}"))
+                    .await;
+                return failed(reason);
+            }
+            Err(_) => {
+                self.journal_line(format!("session_lend_failed: {host} · bridge unavailable"))
+                    .await;
+                return failed("The session sync failed unexpectedly.");
+            }
+        };
+        let Some(browser) = self.browser.lock().ok().and_then(|guard| (*guard).clone()) else {
+            self.journal_line(format!("session_lend_failed: {host} · browser unavailable"))
+                .await;
+            return failed("The managed browser is no longer attached.");
+        };
+        // Identity first: the session must not arrive under a mismatched UA.
+        if browser
+            .mirror_user_agent(&session.user_agent)
+            .await
+            .is_err()
+        {
+            self.journal_line(format!("session_lend_failed: {host} · identity mismatch"))
+                .await;
+            return failed("The managed browser is no longer attached.");
+        }
+        let count = session.cookies.len();
+        // Session-only injection: `expires` is stripped, so the lent
+        // identity lives in process memory and never reaches disk.
+        if browser.inject_session(&session.cookies).await.is_err() {
+            self.journal_line(format!("session_lend_failed: {host} · injection failed"))
+                .await;
+            return failed("The session could not be injected.");
+        }
+        if count == 0 {
+            // Nothing to lend with: skip re-navigation, keep the card.
+            self.journal_line(format!("session_lent: {host} · 0 cookies · persistent"))
+                .await;
+            return LendOutcome {
+                cleared: false,
+                cookies_lent: 0,
+                reason: Some("The companion found no usable cookies for this site.".to_owned()),
+                final_frame: None,
+            };
+        }
+        if browser.navigate(&portal).await.is_err() {
+            self.journal_line(format!(
+                "session_lend_failed: {host} · re-navigation failed"
+            ))
+            .await;
+            return failed("The managed browser could not re-open the page.");
+        }
+        let cleared = browser.challenge_detected().await.is_none();
+        let (frame, _) = self.capture_final_frame().await;
+        let (outcome_label, reason) = if cleared {
+            ("cleared", None)
+        } else {
+            (
+                "persistent",
+                Some("The human check is still there after syncing.".to_owned()),
+            )
+        };
+        self.journal_line(format!(
+            "session_lent: {host} · {count} cookies · {outcome_label}"
+        ))
+        .await;
+        LendOutcome {
+            cleared,
+            cookies_lent: count,
+            reason,
+            final_frame: frame,
+        }
     }
 
     pub async fn manual_login(&self, portal_url: &str) -> Result<SessionStatus, AppError> {
@@ -1880,16 +2090,34 @@ impl AppService {
         // launch placeholder instead of showing the destination.
         self.attach_final_frame(outcome).await;
         // A completed run that landed on a human-verification gate is not
-        // a silent success. L1: try the automatic off-screen headed
-        // escalation first (zero clicks); only a persistent challenge keeps
-        // the L2 Take Control card, routing the check to the user.
+        // a silent success. Interactive gates (reCAPTCHA checkbox) skip L1:
+        // no off-screen re-navigation can click a checkbox, so escalation
+        // would burn ~30s polling for a miracle — the card offers L1.5
+        // session lending and L2 Take Control immediately. Interstitials
+        // (Cloudflare / Turnstile) keep the automatic L1 path first; only a
+        // persistent challenge keeps the card, routing the check to the
+        // user.
         if outcome.result.status == orchestration_engine::SequenceStatus::Completed
-            && let Some(challenge_url) = self.detect_challenge().await
+            && let Some((challenge_url, kind)) = self.detect_challenge_kind().await
         {
             let host = url::Url::parse(&challenge_url)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_else(|| challenge_url.clone());
+            // Register the run for a possible consent tap before branching:
+            // the lend command resolves the challenged URL from this
+            // registry, never from a frontend-supplied host string.
+            if let Some(run_id) = outcome.run_id.clone() {
+                self.remember_challenge_lend(run_id, challenge_url.clone());
+            }
+            if kind == ChallengeKind::InteractiveGate {
+                self.journal_line(format!(
+                    "challenge_detected: {host} · interactive gate (L1 skipped)"
+                ))
+                .await;
+                outcome.challenge = Some(challenge_url);
+                return;
+            }
             // Every escalation outcome is journaled — cleared, persistent,
             // or failed — so the thread explains why the card did or did
             // not appear. Persistent and failed escalations both keep the
@@ -3346,18 +3574,16 @@ impl AppService {
         }
     }
 
-    /// Best-effort bot-challenge verdict on the attached browser's live
-    /// page: `Some(url)` when the page looks like a human-verification
-    /// interstitial rather than the destination. Peeks at the live session
-    /// without launching; `None` when no browser is attached or detection
-    /// fails — never a false challenge.
-    async fn detect_challenge(&self) -> Option<String> {
+    /// Kind-aware challenge verdict on the attached browser's live page:
+    /// the page URL plus whether L1 auto-escalation is worth trying
+    /// (`Interstitial`) or must be skipped (`InteractiveGate`).
+    async fn detect_challenge_kind(&self) -> Option<(String, ChallengeKind)> {
         let browser = self
             .browser
             .lock()
             .ok()
             .and_then(|guard| (*guard).clone())?;
-        browser.challenge_detected().await
+        browser.challenge_detected_kind().await
     }
 
     /// Gracefully shut down the attached (headed, post-escalation) browser
@@ -3616,6 +3842,63 @@ pub(crate) mod tests {
             AppService::final_frame_failure_label(&BrowserError::Navigation),
             "unexpected"
         );
+    }
+    #[test]
+    fn challenge_lend_registry_evicts_oldest_past_the_cap() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        for n in 0..(MAX_COMPLETED_RUNS + 5) {
+            service.remember_challenge_lend(format!("run-{n}"), "https://example.com/".to_owned());
+        }
+        let lends = service
+            .challenge_lends
+            .lock()
+            .map_err(|_| "challenge lends")?;
+        assert_eq!(lends.len(), MAX_COMPLETED_RUNS);
+        assert_eq!(lends.front().map(|(id, _)| id.as_str()), Some("run-5"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn lend_challenge_session_rejects_unknown_run_before_consent() {
+        // No registry entry, no bridge exchange: an unknown run id fails
+        // before any consent journaling or bridge I/O.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        assert!(matches!(
+            service.lend_challenge_session("ghost".to_owned()).await,
+            Err(AppError::InvalidInput(_))
+        ));
+    }
+    #[tokio::test]
+    async fn lend_challenge_session_replays_recorded_outcome_without_a_second_bridge_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A repeat tap replays the first attempt's recorded outcome. The
+        // service has no database and no bridge server here, so any second
+        // bridge request would fail — returning Ok proves the short-circuit.
+        let service = AppService::new(PathBuf::new(), PathBuf::new());
+        let outcome = LendOutcome {
+            cleared: true,
+            cookies_lent: 7,
+            reason: None,
+            final_frame: None,
+        };
+        service
+            .challenge_lends
+            .lock()
+            .map_err(|_| "challenge lends")?
+            .push_back((
+                "run-1".to_owned(),
+                ChallengeLendState {
+                    challenge_url: "https://www.reddit.com/login".to_owned(),
+                    outcome: Some(outcome),
+                },
+            ));
+        let replayed = service
+            .lend_challenge_session("run-1".to_owned())
+            .await
+            .map_err(|_| "recorded lend outcome")?;
+        assert!(replayed.cleared);
+        assert_eq!(replayed.cookies_lent, 7);
+        Ok(())
     }
     #[tokio::test]
     async fn task_run_requires_a_connected_session_and_exclusive_browser_access()
