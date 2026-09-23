@@ -1021,9 +1021,11 @@ pub fn settle_probe_text(intent: &SemanticIntent) -> &str {
 ///   `site_context` is `github` and Stage 2 follows the GitHub result. The
 ///   artifact (`invoice`) stays on the intent, where [`resolve_batch`] gates
 ///   with it once the destination has loaded.
-/// * `open amazon for me` carries no complement, so the direct object is
+/// * `find amazon` carries no complement, so the direct object is
 ///   itself the destination and this falls back to
-///   [`settle_probe_text`] — the intent's target noun.
+///   [`settle_probe_text`] — the intent's target noun. (Direct opens like
+///   `open amazon for me` never reach search-and-follow; the ladder grounds
+///   them or misses.)
 ///
 /// Blank or missing site contexts fall back rather than failing: an empty
 /// noun makes [`select_search_result`] return `None`, and losing a

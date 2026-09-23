@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Command } from "cmdk";
-import type { PlaybookSummary } from "../lib/ipc";
+import type { PlaybookSummary, SiteShortcut } from "../lib/ipc";
 
 /** Workflow and playbook names are ASCII identifiers, as the schema requires. */
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -23,6 +23,9 @@ export default function CommandPalette({
   attached,
   headless,
   playbooks,
+  shortcuts,
+  onSaveShortcut,
+  onDeleteShortcut,
   onConnect,
   onReauthenticate,
   onReplayPlaybook,
@@ -38,6 +41,9 @@ export default function CommandPalette({
   attached: boolean;
   headless: boolean;
   playbooks: PlaybookSummary[];
+  shortcuts: SiteShortcut[];
+  onSaveShortcut: (name: string, url: string) => Promise<void>;
+  onDeleteShortcut: (name: string) => Promise<void>;
   onConnect: () => void;
   onReauthenticate: () => void;
   onReplayPlaybook: (playbook: PlaybookSummary) => void;
@@ -47,11 +53,33 @@ export default function CommandPalette({
   onCloseBrowser: () => void;
 }) {
   const [search, setSearch] = useState("");
+  const [addingShortcut, setAddingShortcut] = useState(false);
+  const [shortcutName, setShortcutName] = useState("");
+  const [shortcutUrl, setShortcutUrl] = useState("");
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [shortcutBusy, setShortcutBusy] = useState(false);
 
   function choose(run: () => void) {
     onOpenChange(false);
     setSearch("");
     run();
+  }
+
+  async function saveShortcut() {
+    setShortcutBusy(true);
+    setShortcutError(null);
+    try {
+      await onSaveShortcut(shortcutName, shortcutUrl);
+      setShortcutName("");
+      setShortcutUrl("");
+      setAddingShortcut(false);
+    } catch (error) {
+      setShortcutError(
+        error instanceof Error ? error.message : "Could not save that shortcut.",
+      );
+    } finally {
+      setShortcutBusy(false);
+    }
   }
 
   const macroName = search.trim();
@@ -122,6 +150,79 @@ export default function CommandPalette({
           <Command.Item disabled={!ready} onSelect={() => choose(onCloseBrowser)}>
             Close managed browser &amp; forget session
           </Command.Item>
+        </Command.Group>
+        <Command.Group heading="Site shortcuts">
+          <div className="shortcut-hint">
+            “Open amazon” resolves here first — no search, no guessing.
+          </div>
+          {shortcuts.map(shortcut => (
+            <div key={shortcut.name} className="shortcut-row">
+              <span className="shortcut-name">{shortcut.name}</span>
+              <small className="shortcut-url">{shortcut.url}</small>
+              <button
+                type="button"
+                className="shortcut-remove"
+                disabled={shortcutBusy}
+                onClick={() => {
+                  setShortcutBusy(true);
+                  onDeleteShortcut(shortcut.name).finally(() =>
+                    setShortcutBusy(false),
+                  );
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          {addingShortcut ? (
+            <div className="shortcut-form">
+              <input
+                value={shortcutName}
+                onChange={event => setShortcutName(event.target.value)}
+                onKeyDown={event => event.stopPropagation()}
+                placeholder="Name — e.g. amazon"
+                aria-label="Shortcut name"
+              />
+              <input
+                value={shortcutUrl}
+                onChange={event => setShortcutUrl(event.target.value)}
+                onKeyDown={event => event.stopPropagation()}
+                placeholder="https://…"
+                aria-label="Shortcut URL"
+              />
+              <div className="shortcut-form-actions">
+                <button
+                  type="button"
+                  disabled={shortcutBusy || !shortcutName.trim() || !shortcutUrl.trim()}
+                  onClick={() => void saveShortcut()}
+                >
+                  {shortcutBusy ? "Saving…" : "Save shortcut"}
+                </button>
+                <button
+                  type="button"
+                  disabled={shortcutBusy}
+                  onClick={() => {
+                    setAddingShortcut(false);
+                    setShortcutError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+              {shortcutError && (
+                <div className="shortcut-error">{shortcutError}</div>
+              )}
+            </div>
+          ) : (
+            <Command.Item
+              onSelect={() => {
+                setAddingShortcut(true);
+                setShortcutError(null);
+              }}
+            >
+              Add site shortcut…
+            </Command.Item>
+          )}
         </Command.Group>
       </Command.List>
     </Command.Dialog>

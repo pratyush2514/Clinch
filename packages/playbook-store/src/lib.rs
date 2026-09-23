@@ -24,6 +24,27 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("Playbook not found")]
     NotFound,
+    #[error("Invalid site shortcut: {0}")]
+    Shortcut(String),
+}
+
+/// One user-saved site shortcut: the direct-open ladder's learned rung.
+/// Names are stored normalized (lowercase, trimmed); the URL is always an
+/// absolute `https` URL, validated on write.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SiteShortcut {
+    pub name: String,
+    pub url: String,
+}
+
+/// Normalize a shortcut name into the ladder's keyspace: lowercase,
+/// trimmed, interior whitespace collapsed. Grammar target nouns are
+/// already lowercase single tokens, so saves and lookups meet here.
+fn normalize_shortcut_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Summary row for the workflow list: identity and shape, never secrets.
@@ -224,6 +245,92 @@ impl PlaybookStore {
         Ok(row.map(|(url,)| url))
     }
 
+    /// Save (or replace) a site shortcut: a user-chosen name → destination
+    /// URL. The name is normalized before storage; the URL must be an
+    /// absolute `https` URL — anything else is a [`StoreError::Shortcut`],
+    /// so a typo can never land a broken rung in the direct-open ladder.
+    ///
+    /// # Errors
+    /// Returns shortcut-validation or database errors.
+    pub async fn set_site_shortcut(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<SiteShortcut, StoreError> {
+        let name = normalize_shortcut_name(name);
+        if name.is_empty() || name.len() > 64 {
+            return Err(StoreError::Shortcut(
+                "name must be 1-64 characters".to_owned(),
+            ));
+        }
+        let parsed = url::Url::parse(url)
+            .ok()
+            .filter(|parsed| parsed.scheme() == "https" && parsed.has_host());
+        let Some(parsed) = parsed else {
+            return Err(StoreError::Shortcut(
+                "URL must be an absolute https URL".to_owned(),
+            ));
+        };
+        sqlx::query(
+            "INSERT INTO site_shortcuts(name, url, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(name) DO UPDATE SET url=excluded.url, updated_at=CURRENT_TIMESTAMP",
+        )
+        .bind(&name)
+        .bind(parsed.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(SiteShortcut {
+            name,
+            url: parsed.as_str().to_owned(),
+        })
+    }
+
+    /// Read one shortcut by name. Unknown names read back as unset rather
+    /// than erroring: the ladder treats them as "no shortcut", not a fault.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn site_shortcut(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let name = normalize_shortcut_name(name);
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT url FROM site_shortcuts WHERE name = ?")
+                .bind(&name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(url,)| url))
+    }
+
+    /// Every saved shortcut, newest-name-first for the palette editor. A
+    /// single corrupt row fails the listing closed rather than silently
+    /// dropping a shortcut.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn list_site_shortcuts(&self) -> Result<Vec<SiteShortcut>, StoreError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, url FROM site_shortcuts ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, url)| SiteShortcut { name, url })
+            .collect())
+    }
+
+    /// Delete a shortcut. Returns whether a row existed: deleting a name
+    /// the user never saved is a no-op, not an error.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn delete_site_shortcut(&self, name: &str) -> Result<bool, StoreError> {
+        let name = normalize_shortcut_name(name);
+        let done = sqlx::query("DELETE FROM site_shortcuts WHERE name = ?")
+            .bind(&name)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Newest-first summaries for the workflow list. A single corrupt row
     /// fails the listing closed rather than silently hiding a workflow.
     ///
@@ -393,6 +500,19 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     // when unset — steps without entries resolve exactly as before.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS entry_urls (playbook_id TEXT PRIMARY KEY, entry_url TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await?;
+    // User-saved site shortcuts: the direct-open ladder's learned rung
+    // (`open amazon` → the user's URL, no search involved). Names are
+    // normalized at the Rust boundary — lowercase, trimmed, interior
+    // whitespace collapsed — so saves and ladder lookups share one
+    // keyspace regardless of SQLite collation. Upserted on set, absent
+    // when unset; prompts without a saved shortcut resolve exactly as
+    // before. Additive and idempotent like every table here: existing
+    // databases gain it on next open.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS site_shortcuts (name TEXT PRIMARY KEY, url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     )
     .execute(&pool)
     .await?;
@@ -837,6 +957,92 @@ mod tests {
         pool.close().await;
         let pool = super::initialize(&path).await?;
         pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn site_shortcuts_round_trip_with_normalization() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, store) = store().await?;
+        // Names normalize to the ladder's keyspace: case and padding
+        // never create a second entry.
+        let saved = store
+            .set_site_shortcut("  Amazon ", "https://www.amazon.in/")
+            .await?;
+        assert_eq!(saved.name, "amazon");
+        assert_eq!(saved.url, "https://www.amazon.in/");
+        assert_eq!(
+            store.site_shortcut("AMAZON").await?.as_deref(),
+            Some("https://www.amazon.in/")
+        );
+        // Overwrite is an upsert, not a duplicate.
+        store
+            .set_site_shortcut("amazon", "https://www.amazon.com/")
+            .await?;
+        assert_eq!(
+            store.site_shortcut("amazon").await?.as_deref(),
+            Some("https://www.amazon.com/")
+        );
+        let listed = store.list_site_shortcuts().await?;
+        assert_eq!(
+            listed,
+            vec![super::SiteShortcut {
+                name: "amazon".to_owned(),
+                url: "https://www.amazon.com/".to_owned(),
+            }]
+        );
+        // Unknown names read as unset; deleting them is a no-op.
+        assert_eq!(store.site_shortcut("flipkart").await?, None);
+        assert!(!store.delete_site_shortcut("flipkart").await?);
+        // Delete removes the row for real.
+        assert!(store.delete_site_shortcut("Amazon").await?);
+        assert_eq!(store.site_shortcut("amazon").await?, None);
+        assert!(store.list_site_shortcuts().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn site_shortcuts_reject_bad_names_and_urls() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, store) = store().await?;
+        for (name, url) in [
+            ("", "https://www.amazon.in/"),
+            ("   ", "https://www.amazon.in/"),
+            ("amazon", "http://www.amazon.in/"),
+            ("amazon", "www.amazon.in"),
+            ("amazon", "not a url"),
+            ("amazon", "https://"),
+        ] {
+            let Err(err) = store.set_site_shortcut(name, url).await else {
+                panic!("invalid shortcut must fail: ({name:?}, {url:?})")
+            };
+            assert!(
+                matches!(err, super::StoreError::Shortcut(_)),
+                "unexpected error for ({name:?}, {url:?}): {err}"
+            );
+        }
+        // Nothing invalid was persisted.
+        assert!(store.list_site_shortcuts().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn site_shortcuts_survive_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        // The additive table is there on databases created before it, and
+        // rows persist across opens — the ladder's learned rung is durable.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("clinch.db");
+        let pool = super::initialize(&path).await?;
+        let store = PlaybookStore::new(pool);
+        store
+            .set_site_shortcut("github", "https://github.com/")
+            .await?;
+        drop(store);
+        let pool = super::initialize(&path).await?;
+        let store = PlaybookStore::new(pool);
+        assert_eq!(
+            store.site_shortcut("github").await?.as_deref(),
+            Some("https://github.com/")
+        );
         Ok(())
     }
 }

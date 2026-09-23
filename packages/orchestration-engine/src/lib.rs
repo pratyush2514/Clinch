@@ -15,14 +15,17 @@ pub use intent_parser::{
     parse_prompt_bounded,
 };
 pub use intent_resolver::{
-    CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent, VariableExtraction,
-    VariableKind, decompose_command, ephemeral_name, extract_dynamic_variables, extract_identifier,
-    parse_grammar, parse_intent_structured, prompt_key, resolve_command,
+    AppCommand, CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent,
+    VariableExtraction, VariableKind, decompose_command, ephemeral_name, extract_dynamic_variables,
+    extract_identifier, is_direct_open, parse_grammar, parse_intent_structured, prompt_key,
+    resolve_app_command, resolve_command,
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use route_proposer::{
-    LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, SlotSource,
-    resolve_entry_url, resolve_slots, sanitize_search_query, search_fallback_url,
+    BraveSiteSearch, InMemoryShortcuts, LlmUrlProposer, ResolutionContext, ResolvedRoute,
+    ResolvedSlots, RouteSource, ShortcutStore, SiteSearchClient, SlotSource,
+    explicit_url_in_prompt, resolve_entry_url, resolve_slots, sanitize_search_query,
+    search_fallback_url,
 };
 pub use runner::{
     IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,
@@ -33,7 +36,7 @@ use sqlx::SqlitePool;
 use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
-pub use url_policy::{UrlRejected, validate_proposed_url};
+pub use url_policy::{UrlRejected, validate_proposed_url, validate_user_directed_url};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

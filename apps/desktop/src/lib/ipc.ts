@@ -111,6 +111,12 @@ export type PlaybookSummary = {
   updatedAt: string;
 };
 
+/** A user-saved site shortcut: the direct-open ladder's learned rung. */
+export type SiteShortcut = {
+  name: string;
+  url: string;
+};
+
 export type Action =
   | { type: "navigate"; url: string }
   | { type: "click"; selector: string }

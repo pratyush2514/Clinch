@@ -16,6 +16,7 @@
 //! so a wrong UA can never be worse than the status quo.
 
 use crate::BrowserSource;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::path::PathBuf;
 
 /// Longest version token accepted from install metadata (`major.minor.build.patch`).
@@ -135,6 +136,8 @@ fn application_dir_version(dirs: &[PathBuf]) -> Option<String> {
 }
 
 /// Numeric dotted-version comparison (`131.0.6778.87` > `130.0.1.0`).
+/// The lib caller is Windows-only; the unit test runs everywhere.
+#[cfg(any(target_os = "windows", test))]
 fn version_greater(left: &str, right: &str) -> bool {
     let parse = |version: &str| {
         version

@@ -15,12 +15,13 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+ureq = { version = "3", features = ["json"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 playbook-store = { path = "../playbook-store" }
 tempfile.workspace = true
 session-sync = { path = "../session-sync" }
-zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -7,6 +7,7 @@ import CommandPalette from "./components/CommandPalette";
 import SessionDialog from "./components/SessionDialog";
 import { usePlaybooks } from "./hooks/usePlaybooks";
 import { useScreencast } from "./hooks/useScreencast";
+import { useSiteShortcuts } from "./hooks/useSiteShortcuts";
 import { useThread } from "./hooks/useThread";
 import { message } from "./lib/errors";
 import type { AuthPanelState, StorageStatus } from "./lib/ipc";
@@ -36,6 +37,7 @@ export default function App() {
   const report = useCallback((text: string) => setStatus(text), []);
   const screencast = useScreencast(ready, report);
   const playbooks = usePlaybooks(ready);
+  const { shortcuts, saveShortcut, deleteShortcut } = useSiteShortcuts(ready);
   const thread = useThread(screencast.ensure, portal, report);
 
   useEffect(() => {
@@ -168,6 +170,9 @@ export default function App() {
         attached={screencast.status.attached}
         headless={screencast.status.headless}
         playbooks={playbooks}
+        shortcuts={shortcuts}
+        onSaveShortcut={(name, url) => saveShortcut(name, url).then(() => {})}
+        onDeleteShortcut={name => deleteShortcut(name).then(() => {})}
         onConnect={() => setSessionOpen(true)}
         onReauthenticate={() => void reauthenticate()}
         onReplayPlaybook={playbook => void thread.replayPlaybook(playbook)}

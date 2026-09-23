@@ -127,6 +127,18 @@ dialog form { margin-top: 24px; }
 [cmdk-item][data-disabled=true] { opacity: .4; cursor: not-allowed; }
 [cmdk-empty] { padding: 18px 15px; font-size: 13px; color: #6a6d61; }
 
+/* ── Site shortcuts (command palette) ──────────────────────────────────── */
+.shortcut-hint { padding: 0 15px 8px; font-size: 12px; color: #767b6a; }
+.shortcut-row { display: flex; align-items: baseline; gap: 10px; padding: 8px 15px; font-size: 13px; }
+.shortcut-name { font-weight: 600; }
+.shortcut-url { color: #898f78; font-size: 11px; overflow-wrap: anywhere; flex: 1; }
+.shortcut-remove { padding: 4px 10px; font-size: 11px; margin-left: auto; }
+.shortcut-form { padding: 4px 15px 10px; display: flex; flex-direction: column; gap: 8px; }
+.shortcut-form input { border: 1px solid #cecec4; border-radius: 6px; padding: 8px 10px; font-size: 13px; background: #fff; }
+.shortcut-form-actions { display: flex; gap: 8px; }
+.shortcut-form-actions button { padding: 8px 14px; font-size: 12px; }
+.shortcut-error { font-size: 12px; color: #a33b2e; }
+
 @media (max-width: 850px) {
   .thread { padding: 8px 24px 24px; }
   header, .stage { padding-left: 24px; padding-right: 24px; }

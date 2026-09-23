@@ -17,8 +17,8 @@ use playbook_store::PlaybookSummary;
 /// ephemeral role inference below. Cue words (`for`, `id`, `with`, …) stay
 /// out: they introduce identifiers, which `extract_identifier` handles.
 const STOPWORDS: &[&str] = &[
-    "my", "the", "a", "an", "please", "now", "latest", "new", "here", "this", "that", "me", "for",
-    "to", "on", "and", "or", "of", "in", "is", "it", "id", "with", "named", "called",
+    "my", "the", "a", "an", "please", "kindly", "now", "latest", "new", "here", "this", "that",
+    "me", "for", "to", "on", "and", "or", "of", "in", "is", "it", "id", "with", "named", "called",
 ];
 
 /// URL tokens that must never match (`https`, TLDs): they appear in every
@@ -733,7 +733,7 @@ const PREPOSITION_CUES: &[&str] = &["from", "on", "at"];
 const ACTION_VERBS: &[&str] = &[
     "download", "get", "fetch", "grab", "pull", "export", "open", "show", "view", "find", "check",
     "click", "press", "tap", "submit", "fill", "type", "enter", "select", "choose", "toggle",
-    "turn", "run", "go", "navigate",
+    "turn", "run", "go", "navigate", "visit", "launch",
 ];
 
 /// Words that open a subordinate clause, which means the prompt is not a
@@ -957,6 +957,139 @@ fn extract_primary_noun(prompt: &str, connected_origin: Option<&url::Url>) -> Op
     parse_grammar(prompt, connected_origin)
         .primary_noun()
         .map(str::to_owned)
+}
+
+/// A closed app-local command: Tier 0 of the dispatch cascade, checked
+/// before saved playbooks, grammar, and every networked tier.
+///
+/// Closed means closed: the set below names app behavior, never sites, so
+/// it cannot drift into world knowledge and never needs a search call.
+/// Matching is a frozen normalizer plus exact-phrase equality — never the
+/// full stopword filter, which would eat content words like `new` in
+/// `new blank page` and collapse near-misses into the command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCommand {
+    /// Ensure the managed browser is attached (launching it if needed) and
+    /// showing a blank tab. No navigation, no search, no network.
+    OpenBlankBrowser,
+}
+
+/// Politeness filler the Tier-0 normalizer strips from prompt ends before
+/// the closed match. Frozen vocabulary: only these phrases, applied
+/// repeatedly, so filler can pad a command but never smuggle a
+/// non-command in.
+const POLITE_AFFIXES: &[&str] = &[
+    "please",
+    "kindly",
+    "for me",
+    "for us",
+    "thanks",
+    "thank you",
+];
+
+/// Closed command phrases, after normalization. Every phrasing names the
+/// browser or a blank page/tab explicitly; a prompt with any other content
+/// word (`open browser settings`, `open amazon`) is not a member.
+const BLANK_BROWSER_PHRASES: &[&str] = &[
+    "spin up browser",
+    "spin up the browser",
+    "spin up a browser",
+    "open browser",
+    "open the browser",
+    "launch browser",
+    "launch the browser",
+    "start browser",
+    "start the browser",
+    "show browser",
+    "show the browser",
+    "show me the browser",
+    "open a blank tab",
+    "open blank tab",
+    "new blank tab",
+    "new blank page",
+];
+
+/// Normalize for Tier 0: lowercase, collapse whitespace, strip the frozen
+/// politeness affixes from both ends until none remain.
+fn normalize_app_command(prompt: &str) -> String {
+    // Punctuation at token edges is orthography, not content: "spin up
+    // browser, thanks" normalizes the same as "spin up browser thanks".
+    // Internal punctuation (`amazon.in`, `don't`) is untouched.
+    let mut text: String = prompt
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    loop {
+        let mut stripped = false;
+        for affix in POLITE_AFFIXES {
+            if text == *affix {
+                text.clear();
+                stripped = true;
+            } else if let Some(rest) = text.strip_prefix(&format!("{affix} ")) {
+                text = rest.to_owned();
+                stripped = true;
+            } else if let Some(rest) = text.strip_suffix(&format!(" {affix}")) {
+                text = rest.to_owned();
+                stripped = true;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    text
+}
+
+/// Resolve a Tier-0 app command from the prompt, if it names one.
+///
+/// The match is closed-world: the normalized prompt must equal a phrase in
+/// [`BLANK_BROWSER_PHRASES`], so `\"open browser settings\"` (extra word
+/// `settings`) and `\"open amazon\"` (no lifecycle vocabulary) fall through
+/// instead of being swallowed. `None` is the common case — most prompts
+/// are not app commands.
+#[must_use]
+pub fn resolve_app_command(prompt: &str) -> Option<AppCommand> {
+    if BLANK_BROWSER_PHRASES.contains(&normalize_app_command(prompt).as_str()) {
+        Some(AppCommand::OpenBlankBrowser)
+    } else {
+        None
+    }
+}
+
+/// Verbs that phrase a direct site open. Closed vocabulary: everything
+/// else (`download`, `find`, `check`) keeps the search-grounded path, so a
+/// retrieval verb can never silently become a navigation.
+const OPEN_VERBS: &[&str] = &["open", "go", "navigate", "launch", "visit"];
+
+/// Whether the grammar describes a direct site open: high confidence, one
+/// target noun, no artifact (no prepositional complement), an open-class
+/// verb heading the prompt, and no coordinators.
+///
+/// The coordinator check is what keeps `"open amazon and flipkart"` out of
+/// this path: a multi-target prompt must re-resolve through the
+/// batch-consent lane, never silently open one of its targets. Raw tokens
+/// (stopwords kept) are checked so the `and`/`or` the content filter drops
+/// still vetoes.
+#[must_use]
+pub fn is_direct_open(prompt: &str, grammar: &ParsedGrammar) -> bool {
+    if !grammar.confidence.is_high() {
+        return false;
+    }
+    if grammar.artifact_noun.is_some() || grammar.target_noun.is_none() {
+        return false;
+    }
+    if tokens(prompt)
+        .iter()
+        .any(|token| matches!(token.as_str(), "and" | "or"))
+    {
+        return false;
+    }
+    let content = content_tokens(prompt);
+    content
+        .first()
+        .is_some_and(|verb| OPEN_VERBS.contains(&verb.as_str()))
 }
 
 /// Deterministic structured fallback: instant, offline, no model call.
@@ -2238,5 +2371,91 @@ mod tests {
         );
         assert!(matches!(matched, Some(CommandMatch::Ephemeral { .. })));
         Ok(())
+    }
+
+    #[test]
+    fn tier_zero_matches_lifecycle_commands_through_filler() {
+        // Every phrasing of "start the browser" resolves without a search —
+        // the frozen normalizer strips politeness affixes from the ends and
+        // matches the closed phrase set exactly, so "new blank page" works
+        // (the full stopword filter would eat "new").
+        for prompt in [
+            "spin up browser for me",
+            "spin up the browser",
+            "please spin up browser",
+            "spin up browser for us",
+            "spin up browser, thanks",
+            "spin up browser thank you",
+            "open the browser",
+            "launch browser",
+            "show me the browser",
+            "open a blank tab",
+            "open a blank tab for me",
+            "new blank page",
+        ] {
+            assert_eq!(
+                resolve_app_command(prompt),
+                Some(AppCommand::OpenBlankBrowser),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_zero_rejects_near_misses() {
+        // Closed-world: an extra content token, or no lifecycle verb, falls
+        // through instead of being swallowed.
+        for prompt in [
+            "open amazon for me",
+            "open browser settings",
+            "download the browser",
+            "browser",
+            "spin up",
+            "",
+            "open amazon and flipkart",
+        ] {
+            assert_eq!(resolve_app_command(prompt), None, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn direct_open_covers_open_phrasings_and_filler() {
+        // High-confidence single-target opens, with and without filler.
+        for prompt in [
+            "open amazon",
+            "open amazon for me",
+            "please open amazon",
+            "kindly open amazon",
+            "open amazon.in",
+            "visit github",
+            "launch amazon",
+            "go to amazon",
+        ] {
+            let grammar = parse_grammar(prompt, None);
+            assert!(grammar.confidence.is_high(), "{prompt}");
+            assert!(is_direct_open(prompt, &grammar), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn direct_open_rejects_artifacts_clauses_and_batches() {
+        // Retrieval keeps the search path.
+        for prompt in [
+            "download all my invoices from github",
+            "find amazon",
+            "check amazon prices",
+        ] {
+            let grammar = parse_grammar(prompt, None);
+            assert!(!is_direct_open(prompt, &grammar), "{prompt}");
+        }
+        // Multi-target prompts must re-resolve through batch consent, never
+        // silently open one target.
+        for prompt in ["open amazon and flipkart", "open amazon or flipkart"] {
+            let grammar = parse_grammar(prompt, None);
+            assert!(!is_direct_open(prompt, &grammar), "{prompt}");
+        }
+        // A subordinate clause is not a plain imperative.
+        let grammar = parse_grammar("pull up what I owe on aws", None);
+        assert!(!is_direct_open("pull up what I owe on aws", &grammar));
     }
 }

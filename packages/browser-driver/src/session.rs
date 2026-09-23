@@ -137,7 +137,7 @@ impl ManagedBrowser {
         }
         let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
         let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for pair in points.chunks_exact(2) {
+        for pair in points.as_chunks::<2>().0 {
             min_x = min_x.min(pair[0]);
             min_y = min_y.min(pair[1]);
             max_x = max_x.max(pair[0]);

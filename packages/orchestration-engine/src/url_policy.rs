@@ -53,6 +53,37 @@ pub fn validate_proposed_url(url: &str) -> Result<url::Url, UrlRejected> {
     Ok(parsed)
 }
 
+/// Validate a user-directed navigation target: the user named the
+/// destination themselves (a typed domain, a saved site shortcut) or named
+/// the site a directory resolved. Absolute `https`, no embedded
+/// credentials — the same structural bar as [`validate_proposed_url`], but
+/// with no host allowlist.
+///
+/// The allowlist guards *machine-proposed* URLs (entity tier, LLM tier,
+/// search template) against a compromised proposer inventing destinations.
+/// Here the user is the authority for where they asked to go: refusing
+/// `https://amazon.in` because no tier predicted it would make direct opens
+/// impossible by construction. Approval gates still guard submits and
+/// downloads after navigation, and portal confinement re-anchors to the
+/// landed origin instead of trusting a predicted one.
+///
+/// # Errors
+/// Returns [`UrlRejected`] for unparseable, non-`https`, or
+/// credential-carrying URLs.
+pub fn validate_user_directed_url(url: &str) -> Result<url::Url, UrlRejected> {
+    let parsed = url::Url::parse(url).map_err(|_| UrlRejected::Unparseable)?;
+    if parsed.scheme() != "https" {
+        return Err(UrlRejected::Scheme);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(UrlRejected::Credentials);
+    }
+    if parsed.host_str().is_none() {
+        return Err(UrlRejected::Unparseable);
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +111,20 @@ mod tests {
         assert!(validate_proposed_url("https://user:pass@www.google.com/search?q=hi").is_err());
         assert!(validate_proposed_url("http://www.google.com/search?q=hi").is_err());
         assert!(validate_proposed_url("https://www.google.com.evil.com/search?q=hi").is_err());
+    }
+
+    #[test]
+    fn user_directed_validation_allows_any_https_host_but_keeps_structure() {
+        // User-directed targets skip the host allowlist (the user named the
+        // destination) but keep every structural check.
+        assert!(validate_user_directed_url("https://www.amazon.in/").is_ok());
+        assert!(validate_user_directed_url("https://github.com/settings/billing").is_ok());
+        assert!(validate_user_directed_url("http://amazon.in/").is_err());
+        assert!(validate_user_directed_url("https://user:pass@amazon.in/").is_err());
+        assert!(validate_user_directed_url("javascript:alert(1)").is_err());
+        assert!(validate_user_directed_url("not a url").is_err());
+        assert!(validate_user_directed_url("").is_err());
+        // The machine-proposed gate still refuses what the user never named.
+        assert!(validate_proposed_url("https://www.amazon.in/").is_err());
     }
 }

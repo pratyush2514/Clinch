@@ -9,10 +9,15 @@
 //!   seeded playbook, so `"download github invoices"` routes to a saved
 //!   workflow and that workflow loads back with its billing-history entry
 //!   URL intact.
-//! * **Tier 2** — anything tier 1 does not claim advances to the grounded
-//!   search template, and the prompt's own grammar (never a site list)
-//!   supplies the noun that picks the destination link out of a live
-//!   results tree.
+//! * **Direct-open ladder** — `"open amazon for me"` no longer scrapes a
+//!   search page. The destination comes from the prompt's own explicit
+//!   domain, a user-saved shortcut, or a structured directory — and an
+//!   ungrounded site is a miss the caller turns into ask-and-learn guidance,
+//!   never a fabricated destination.
+//! * **Search-and-follow** — prompts that are not direct opens (retrieval
+//!   verbs like `"find"`) still advance to the grounded search template,
+//!   and the prompt's own grammar (never a site list) supplies the noun
+//!   that picks the destination link out of a live results tree.
 
 use browser_driver::AxElement;
 use orchestration_engine::{CommandMatch, ResolutionContext, RouteSource};
@@ -42,6 +47,8 @@ fn offline_ctx() -> ResolutionContext<'static> {
         account_dir: None,
         llm: None,
         parser: None,
+        shortcuts: None,
+        site_search: None,
     }
 }
 
@@ -112,26 +119,60 @@ async fn tier_one_loads_seeded_playbooks_without_a_route_table()
 }
 
 #[tokio::test]
-async fn tier_two_search_and_follow_survives_the_deleted_route_table()
--> Result<(), Box<dyn std::error::Error>> {
+async fn direct_open_miss_replaces_search_scrape() -> Result<(), Box<dyn std::error::Error>> {
     let (_dir, store) = store().await?;
     let saved = store.list_playbooks().await?;
     let search_origin = url::Url::parse("https://www.google.com/")?;
     let prompt = "open amazon for me";
+    // No stored workflow claims this prompt, so it resolves as ephemeral.
+    let Some(CommandMatch::Ephemeral { .. }) =
+        orchestration_engine::resolve_command(prompt, Some(&search_origin), &saved)
+    else {
+        return Err("unclaimed prompt resolves ephemeral".into());
+    };
+    // With no explicit domain, no saved shortcut, and no directory key, the
+    // ladder misses — and a miss is `None`, not a scraped search page. The
+    // dispatcher turns this into "try the full domain or save a site
+    // shortcut" instead of a fabricated destination.
+    assert_eq!(
+        orchestration_engine::resolve_entry_url(prompt, None, &offline_ctx()),
+        None
+    );
+    // The prompt's own explicit domain grounds without any of that: no
+    // shortcut, no key, no search.
+    let Some(route) =
+        orchestration_engine::resolve_entry_url("open amazon.in", None, &offline_ctx())
+    else {
+        return Err("explicit domain grounds".into());
+    };
+    assert_eq!(route.source, RouteSource::ExplicitDomain);
+    assert_eq!(route.url.as_str(), "https://amazon.in/");
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_and_follow_survives_for_non_direct_opens() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_dir, store) = store().await?;
+    let saved = store.list_playbooks().await?;
+    let search_origin = url::Url::parse("https://www.google.com/")?;
+    // "find" is a retrieval verb, not an open verb, so this prompt is not a
+    // direct open and keeps the grounded search path.
+    let prompt = "find amazon";
     // No stored workflow claims this prompt, so it resolves as ephemeral.
     let Some(CommandMatch::Ephemeral { intent }) =
         orchestration_engine::resolve_command(prompt, Some(&search_origin), &saved)
     else {
         return Err("unclaimed prompt resolves ephemeral".into());
     };
-    // Tier 2: the fixed search template, never an invented host.
-    let Some(route) = orchestration_engine::resolve_entry_url(prompt, &offline_ctx()) else {
+    // The fixed search template, never an invented host.
+    let Some(route) = orchestration_engine::resolve_entry_url(prompt, None, &offline_ctx()) else {
         return Err("grounded search resolves".into());
     };
     assert_eq!(route.source, RouteSource::SearchFallback);
     assert_eq!(
         route.url.as_str(),
-        "https://www.google.com/search?q=open+amazon"
+        "https://www.google.com/search?q=find+amazon"
     );
     for guess in ["amazon.com", "amazon.in"] {
         assert!(!route.url.as_str().contains(guess), "no TLD guessing");

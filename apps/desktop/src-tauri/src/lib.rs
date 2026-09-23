@@ -190,6 +190,27 @@ async fn list_playbooks(
     state.list_playbooks().await
 }
 #[tauri::command]
+async fn save_site_shortcut(
+    name: String,
+    url: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<playbook_store::SiteShortcut, AppError> {
+    state.save_site_shortcut(name, url).await
+}
+#[tauri::command]
+async fn list_site_shortcuts(
+    state: tauri::State<'_, AppService>,
+) -> Result<Vec<playbook_store::SiteShortcut>, AppError> {
+    state.list_site_shortcuts().await
+}
+#[tauri::command]
+async fn delete_site_shortcut(
+    name: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<bool, AppError> {
+    state.delete_site_shortcut(name).await
+}
+#[tauri::command]
 async fn execute_playbook(
     id: String,
     progress: tauri::ipc::Channel<service::PlaybookEvent>,
@@ -282,6 +303,9 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         save_playbook,
         save_run_as_workflow,
         list_playbooks,
+        save_site_shortcut,
+        list_site_shortcuts,
+        delete_site_shortcut,
         execute_playbook,
         decide_playbook,
         dispatch_natural_command,
@@ -370,7 +394,12 @@ mod tests {
             .build(mock_context(noop_assets()))?;
         let webview =
             tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
-        let origin = url::Url::parse("http://tauri.localhost")?;
+        // `tauri://localhost` is the local origin on desktop: Tauri skips the
+        // capability ACL for app commands invoked locally (the app defines
+        // no app ACL manifest). `http://tauri.localhost` is the Windows
+        // form and counts as *remote* here, so every command is rejected
+        // with "not allowed".
+        let origin = url::Url::parse("tauri://localhost")?;
         let _chromium = ChromiumEnvGuard::hold_bogus();
         let request = InvokeRequest {
             cmd: "dispatch_natural_command".into(),
@@ -424,7 +453,7 @@ mod tests {
             cmd: "run_task".into(),
             callback: CallbackFn(0),
             error: CallbackFn(1),
-            url: url::Url::parse("http://tauri.localhost")?,
+            url: url::Url::parse("tauri://localhost")?,
             body: InvokeBody::Json(serde_json::json!({
                 "request": {"workflow":"reports", "portalUrl":"https://example.com/files", "linkSelector":null, "downloadSelector":"a.report"},
                 "progress":"__CHANNEL__:7"
@@ -450,7 +479,8 @@ mod tests {
             .build(mock_context(noop_assets()))?;
         let webview =
             tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
-        let origin = url::Url::parse("http://tauri.localhost")?;
+        // Local origin: without it every command is ACL-rejected as remote.
+        let origin = url::Url::parse("tauri://localhost")?;
         let request = |cmd: &str, body| InvokeRequest {
             cmd: cmd.into(),
             callback: CallbackFn(0),

@@ -50,6 +50,8 @@ fn ctx_with(parser: Option<&Arc<dyn IntentParser>>) -> ResolutionContext<'_> {
         account_dir: None,
         llm: None,
         parser,
+        shortcuts: None,
+        site_search: None,
     }
 }
 
@@ -162,7 +164,7 @@ fn test_parser_timeout_degrades_to_raw_search() {
     );
     // Tier 2C: the raw search template still resolves, so navigation happens.
     let ctx = ctx_with(Some(&parser));
-    let Some(route) = orchestration_engine::resolve_entry_url(IRREGULAR, &ctx) else {
+    let Some(route) = orchestration_engine::resolve_entry_url(IRREGULAR, None, &ctx) else {
         panic!("raw search still resolves");
     };
     assert_eq!(
