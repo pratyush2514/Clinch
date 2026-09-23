@@ -37,8 +37,13 @@ const GROUNDER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default Groq OpenAI-compatible base URL. Overridable for tests via
 /// `CLINCH_GROQ_BASE_URL`.
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
-/// Fast small Groq chat model. Overridable via `CLINCH_GROQ_MODEL`.
-const GROQ_MODEL: &str = "llama-3.1-8b-instant";
+/// Default Groq chat model: Groq's recommended replacement for the retired
+/// `llama-3.1-8b-instant` (decommissioned 2026-08-16; requests to it fail
+/// with a `model_decommissioned` error). Overridable via `CLINCH_GROQ_MODEL`.
+/// Groq retires models aggressively — re-check
+/// <https://console.groq.com/docs/deprecations> when grounding starts
+/// missing; the miss journal line carries the provider's error code.
+const GROQ_MODEL: &str = "openai/gpt-oss-20b";
 /// Default local Ollama base URL. Overridable via `CLINCH_OLLAMA_URL`.
 const OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Small local model that answers JSON reliably. Overridable via
@@ -99,6 +104,11 @@ pub struct LlmDomainGrounder {
     base_url: String,
     model: String,
     agent: ureq::Agent,
+    /// Sanitized failure detail from the most recent `ground_domain` call
+    /// (`None` when the last call succeeded or declined without a provider
+    /// failure). Never holds credentials: the key travels only in the
+    /// Authorization header, which never appears in error text.
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl LlmDomainGrounder {
@@ -189,6 +199,10 @@ impl LlmDomainGrounder {
     fn new(provider: GrounderProvider, api_key: &str, base_url: &str, model: &str) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(GROUNDER_TIMEOUT))
+            // Error statuses must stay readable: the provider's error code
+            // (e.g. Groq's `model_decommissioned`) is the diagnostic that
+            // tells a provider failure apart from a clean decline.
+            .http_status_as_error(false)
             .build()
             .into();
         Self {
@@ -197,18 +211,73 @@ impl LlmDomainGrounder {
             base_url: base_url.to_owned(),
             model: model.to_owned(),
             agent,
+            last_error: std::sync::Mutex::new(None),
         }
     }
 
+    /// Sanitized failure detail from the most recent [`DomainGrounder::ground_domain`]
+    /// call, or `None` when the last call succeeded or declined without a
+    /// provider failure. Never contains credentials.
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Record a sanitized provider failure for [`Self::last_error`].
+    fn record_error(&self, detail: String) {
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = Some(detail);
+        }
+    }
+
+    /// POST a JSON body and parse the JSON response, or return a sanitized
+    /// one-line failure: transport/timeout kind, HTTP status plus the
+    /// provider's error code, or malformed body. The detail never includes
+    /// credentials — the key travels only in the Authorization header.
+    fn post_json(
+        &self,
+        provider: &str,
+        url: &str,
+        auth: Option<&str>,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let request = self.agent.post(url);
+        let request = match auth {
+            Some(token) => request.header("Authorization", token),
+            None => request,
+        };
+        let response = request.send_json(body).map_err(|err| {
+            let message = err.to_string().to_lowercase();
+            let kind = if message.contains("timed out") || message.contains("timeout") {
+                "timeout"
+            } else {
+                "transport error"
+            };
+            format!("{provider} request failed ({kind})")
+        })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "{provider} http {status} ({})",
+                error_body_detail(provider, response.into_body())
+            ));
+        }
+        response
+            .into_body()
+            .read_json::<serde_json::Value>()
+            .map_err(|_| format!("{provider} malformed response body"))
+    }
+
     /// One Groq chat completion; the assistant message content is the raw
-    /// strict-JSON payload (or `None` on any failure).
+    /// strict-JSON payload (or `None` on any failure, with the sanitized
+    /// cause recorded for [`Self::last_error`]).
     fn groq_completion(&self, site: &str, region: &str) -> Option<String> {
         let auth = format!("Bearer {}", self.api_key.as_str());
-        let payload: serde_json::Value = self
-            .agent
-            .post(&format!("{}/chat/completions", self.base_url))
-            .header("Authorization", auth.as_str())
-            .send_json(serde_json::json!({
+        let payload = match self.post_json(
+            "groq",
+            &format!("{}/chat/completions", self.base_url),
+            Some(auth.as_str()),
+            serde_json::json!({
                 "model": self.model,
                 "temperature": 0,
                 "max_tokens": 32,
@@ -216,39 +285,92 @@ impl LlmDomainGrounder {
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": format!("site: {site}\nregion: {region}")},
                 ],
-            }))
-            .ok()?
-            .into_body()
-            .read_json()
-            .ok()?;
-        payload
-            .get("choices")?
-            .as_array()?
-            .first()?
-            .get("message")?
-            .get("content")?
-            .as_str()
-            .map(str::to_owned)
+            }),
+        ) {
+            Ok(payload) => payload,
+            Err(detail) => {
+                self.record_error(detail);
+                return None;
+            }
+        };
+        let content: Option<String> = (|| {
+            payload
+                .get("choices")?
+                .as_array()?
+                .first()?
+                .get("message")?
+                .get("content")?
+                .as_str()
+                .map(str::to_owned)
+        })();
+        if let Some(content) = content {
+            Some(content)
+        } else {
+            self.record_error("groq malformed response (no choices/message/content)".to_owned());
+            None
+        }
     }
 
     /// One Ollama generation with `format: "json"`; the `response` field is
-    /// the raw strict-JSON payload (or `None` on any failure).
+    /// the raw strict-JSON payload (or `None` on any failure, with the
+    /// sanitized cause recorded for [`Self::last_error`]).
     fn ollama_generate(&self, site: &str, region: &str) -> Option<String> {
-        let payload: serde_json::Value = self
-            .agent
-            .post(&format!("{}/api/generate", self.base_url))
-            .send_json(serde_json::json!({
+        let payload = match self.post_json(
+            "ollama",
+            &format!("{}/api/generate", self.base_url),
+            None,
+            serde_json::json!({
                 "model": self.model,
                 "stream": false,
                 "format": "json",
                 "prompt": format!("{SYSTEM_PROMPT}\nsite: {site}\nregion: {region}"),
-            }))
-            .ok()?
-            .into_body()
-            .read_json()
-            .ok()?;
-        payload.get("response")?.as_str().map(str::to_owned)
+            }),
+        ) {
+            Ok(payload) => payload,
+            Err(detail) => {
+                self.record_error(detail);
+                return None;
+            }
+        };
+        if let Some(response) = payload.get("response").and_then(|r| r.as_str()) {
+            Some(response.to_owned())
+        } else {
+            self.record_error("ollama malformed response (no response field)".to_owned());
+            None
+        }
     }
+}
+
+/// The useful fragment of an HTTP error body: Groq's OpenAI-compatible
+/// envelope carries `{"error": {"code": ...}}` (e.g. `model_decommissioned`,
+/// `invalid_api_key`, `rate_limit_exceeded`); anything else is returned as a
+/// truncated raw excerpt. Capped at 160 chars — error payloads are small,
+/// and the journal line must stay one line.
+fn error_body_detail(provider: &str, mut body: ureq::Body) -> String {
+    let text = body.read_to_string().unwrap_or_default();
+    let excerpt: String = text.chars().take(160).collect();
+    let groq_code = (provider == "groq")
+        .then(|| groq_error_code(&excerpt))
+        .flatten();
+    if let Some(code) = groq_code {
+        return code;
+    }
+    if excerpt.trim().is_empty() {
+        "empty error body".to_owned()
+    } else {
+        excerpt
+    }
+}
+
+/// Groq's OpenAI-compatible error envelope carries
+/// `{"error": {"code": ...}}` (e.g. `model_decommissioned`,
+/// `invalid_api_key`, `rate_limit_exceeded`).
+fn groq_error_code(excerpt: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(excerpt)
+        .ok()?
+        .pointer("/error/code")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Extract the `domain` field from a grounder's strict-JSON response.
@@ -272,6 +394,11 @@ fn extract_domain(content: &str) -> Option<String> {
 
 impl DomainGrounder for LlmDomainGrounder {
     fn ground_domain(&self, site_name: &str, region_hint: &str) -> Option<String> {
+        // A fresh call supersedes any previous failure detail: `last_error`
+        // always describes the call that just ran.
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = None;
+        }
         // The fence: only the normalized slot and the region code are ever
         // sent. An empty slot never touches the network.
         let site = site_name.trim();
@@ -296,7 +423,7 @@ mod tests {
     /// adapter at — hermetic: no internet, no fixed port. `None` when the
     /// loopback bind itself fails (the test then fails closed with a
     /// clear panic instead of an `expect`).
-    fn mock_server(response_body: String) -> Option<String> {
+    fn mock_server(status: u16, response_body: String) -> Option<String> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let addr = listener.local_addr().ok()?;
         std::thread::spawn(move || {
@@ -341,7 +468,7 @@ mod tests {
                 body_read += n;
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
                 response_body.len()
             );
             let _ = stream.write_all(response.as_bytes());
@@ -353,7 +480,16 @@ mod tests {
     /// Bind a mock server or fail the test with a clear message. Keeps the
     /// happy-path tests readable without `expect`.
     fn mock_base(response_body: String) -> String {
-        match mock_server(response_body) {
+        match mock_server(200, response_body) {
+            Some(base) => base,
+            None => panic!("loopback mock failed to bind"),
+        }
+    }
+
+    /// Bind a mock server answering with an HTTP error status (Groq error
+    /// envelope when `response_body` carries one).
+    fn mock_status(status: u16, response_body: String) -> String {
+        match mock_server(status, response_body) {
             Some(base) => base,
             None => panic!("loopback mock failed to bind"),
         }
@@ -423,6 +559,92 @@ mod tests {
         let base = mock_base(envelope);
         let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
         assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        // A clean decline is not a provider failure: nothing to diagnose.
+        assert_eq!(grounder.last_error(), None);
+    }
+
+    #[test]
+    fn groq_malformed_body_records_diagnostic() {
+        let base = mock_base("this is not json".to_owned());
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
+        assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        let Some(err) = grounder.last_error() else {
+            panic!("malformed body records a diagnostic");
+        };
+        assert!(err.contains("malformed"), "unexpected detail: {err}");
+        assert!(
+            !err.contains("test-key"),
+            "detail must never echo credentials"
+        );
+    }
+
+    #[test]
+    fn groq_http_error_records_provider_code() {
+        // The exact failure mode of a decommissioned model: HTTP 400 with
+        // Groq's OpenAI-compatible error envelope.
+        let envelope = serde_json::json!({
+            "error": {
+                "message": "The model `llama-3.1-8b-instant` has been decommissioned.",
+                "type": "invalid_request_error",
+                "code": "model_decommissioned",
+            },
+        })
+        .to_string();
+        let base = mock_status(400, envelope);
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
+        assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        assert_eq!(
+            grounder.last_error().as_deref(),
+            Some("groq http 400 (model_decommissioned)")
+        );
+    }
+
+    #[test]
+    fn groq_http_error_without_envelope_records_excerpt() {
+        let base = mock_status(500, "upstream exploded".to_owned());
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
+        assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        assert_eq!(
+            grounder.last_error().as_deref(),
+            Some("groq http 500 (upstream exploded)")
+        );
+    }
+
+    #[test]
+    fn groq_transport_failure_records_kind() {
+        // Unroutable port: connection refused before any byte is sent.
+        let grounder = LlmDomainGrounder::groq("key", "http://127.0.0.1:9", "model");
+        assert_eq!(grounder.ground_domain("amazon", "IN"), None);
+        assert_eq!(
+            grounder.last_error().as_deref(),
+            Some("groq request failed (transport error)")
+        );
+    }
+
+    #[test]
+    fn ollama_http_error_records_status() {
+        let base = mock_status(500, "model not found".to_owned());
+        let grounder = LlmDomainGrounder::ollama(&base, "test-model");
+        assert_eq!(grounder.ground_domain("flipkart", "IN"), None);
+        assert_eq!(
+            grounder.last_error().as_deref(),
+            Some("ollama http 500 (model not found)")
+        );
+    }
+
+    #[test]
+    fn successful_call_leaves_no_diagnostic() {
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": "{\"domain\": \"amazon.in\"}"}}],
+        })
+        .to_string();
+        let base = mock_base(envelope);
+        let grounder = LlmDomainGrounder::groq("test-key", &base, "test-model");
+        assert_eq!(
+            grounder.ground_domain("amazon", "IN").as_deref(),
+            Some("amazon.in")
+        );
+        assert_eq!(grounder.last_error(), None);
     }
 
     #[test]
@@ -502,7 +724,7 @@ mod tests {
         };
         assert_eq!(grounder.provider, GrounderProvider::Groq);
         assert_eq!(grounder.base_url, "https://api.groq.com/openai/v1");
-        assert_eq!(grounder.model, "llama-3.1-8b-instant");
+        assert_eq!(grounder.model, "openai/gpt-oss-20b");
     }
 
     #[test]

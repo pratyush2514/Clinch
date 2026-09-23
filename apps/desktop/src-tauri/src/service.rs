@@ -2075,11 +2075,20 @@ impl AppService {
                 domain_grounder: Some(domain_grounder),
                 region_hint: region_hint.as_str(),
             };
-            orchestration_engine::resolve_entry_url(&prompt_owned, origin_owned.as_ref(), &ctx)
+            let route =
+                orchestration_engine::resolve_entry_url(&prompt_owned, origin_owned.as_ref(), &ctx);
+            // Sanitized provider failure from the grounder's one call, if it
+            // made one and it failed — the ladder itself only reports the
+            // miss. Read here, inside the closure, while the concrete
+            // adapter is still owned.
+            let grounder_error = live_grounder
+                .as_ref()
+                .and_then(orchestration_engine::LlmDomainGrounder::last_error);
+            (route, grounder_error)
         });
         // A panicked blocking thread means the directory rung never ran;
         // journal it and yield a neutral proposal rather than a guess.
-        let Ok(resolved) = resolved.await else {
+        let Ok((resolved, grounder_error)) = resolved.await else {
             return self
                 .proposal_skipped("route_proposal_skipped: site directory thread failed")
                 .await;
@@ -2155,13 +2164,17 @@ impl AppService {
             let line = if direct_open {
                 // Ask-and-learn: the miss names the way out — and which
                 // rungs were even live. An unconfigured grounder is a setup
-                // problem ("set CLINCH_GROUNDER_PROVIDER"); a configured
-                // one that declined is a genuine miss. Without this, both
-                // look identical and the failure is undebuggable.
-                let grounder_state = if grounder_configured {
-                    "grounder attempted, no domain returned"
-                } else {
+                // problem ("set CLINCH_GROUNDER_PROVIDER"); a configured one
+                // that errored names the provider failure (e.g. a retired
+                // model); a clean decline is a genuine miss. Without this,
+                // all three look identical and the failure is undebuggable.
+                let grounder_state = if !grounder_configured {
                     "grounder unconfigured (set CLINCH_GROUNDER_PROVIDER=groq or =ollama)"
+                        .to_owned()
+                } else if let Some(err) = grounder_error {
+                    format!("grounder error: {err}")
+                } else {
+                    "grounder attempted, no domain returned".to_owned()
                 };
                 let directory_state = if site_search_configured {
                     "directory attempted, no match"
@@ -4099,8 +4112,8 @@ pub(crate) mod tests {
         let line = proposed.log.clone().unwrap_or_default();
         if proposed.grounder_configured {
             assert!(
-                line.contains("grounder attempted"),
-                "configured grounder that declined says so: {line}"
+                line.contains("grounder attempted") || line.contains("grounder error:"),
+                "configured grounder names the outcome, got: {line}"
             );
         } else {
             assert!(
