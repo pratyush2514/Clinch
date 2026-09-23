@@ -86,6 +86,52 @@ describe("threadReducer", () => {
     expect(settled[0].status).toBe("completed");
   });
 
+  it("prefers the backend's settle-time capture over the last live frame", () => {
+    // Direct opens can freeze the live screencast on the launch
+    // placeholder; the one-shot capture taken at settle is the evidence.
+    const settled = fold([
+      SUBMIT,
+      { type: "frame", id: "e1", frame: "placeholder" },
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+        finalFrame: "amazon-at-settle",
+      },
+    ]);
+    expect(settled[0].frame).toBe("amazon-at-settle");
+  });
+
+  it("keeps the last live frame when the backend reports no capture", () => {
+    const settled = fold([
+      SUBMIT,
+      { type: "frame", id: "e1", frame: "live" },
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+        finalFrame: null,
+      },
+    ]);
+    expect(settled[0].frame).toBe("live");
+  });
+
   it("prefers a backend-reported duration over the client stopwatch", () => {
     const [entry] = fold([
       SUBMIT,

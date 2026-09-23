@@ -399,6 +399,15 @@ pub struct DispatchOutcome {
     /// (stored replays, single-step ephemerals snapshotting inside the
     /// macro engine). Additive: older clients ignore unknown keys.
     telemetry_log: Option<String>,
+    /// One-shot JPEG viewport (base64) captured when the run settled, so
+    /// the thread's final frame is evidence of what the run saw. The live
+    /// screencast is armed on the pre-navigation session and does not
+    /// survive cross-origin navigation, which left settled direct opens
+    /// frozen on the launch placeholder; this capture happens after the
+    /// landing, on the live target. `None` when no browser is attached or
+    /// capture fails — the run outcome is unaffected. Additive: older
+    /// clients ignore unknown keys.
+    final_frame: Option<String>,
 }
 
 /// POC health metrics for local testing: playbook runs, macro-replay share
@@ -1678,6 +1687,8 @@ impl AppService {
                     run_id: None,
                     route_log: None,
                     telemetry_log: Some(line.to_owned()),
+                    // Lifecycle commands show no page: no final frame.
+                    final_frame: None,
                 })
             }
         }
@@ -1793,6 +1804,12 @@ impl AppService {
                 None => line,
             });
         }
+        // Settle evidence: one-shot viewport of the live target, captured
+        // after the landing. The streaming screencast is armed on the
+        // pre-navigation session and does not survive cross-origin
+        // navigation, so without this the settled card freezes on the
+        // launch placeholder instead of showing the destination.
+        outcome.final_frame = self.capture_final_frame().await;
         Ok(outcome)
     }
 
@@ -1920,6 +1937,9 @@ impl AppService {
             run_id: None,
             route_log: None,
             telemetry_log: None,
+            // Saved replays render the live screencast while running; the
+            // settled card keeps the last live frame.
+            final_frame: None,
         })
     }
 
@@ -2401,6 +2421,9 @@ impl AppService {
                 run_id: None,
                 route_log,
                 telemetry_log,
+                // The ad-hoc auto-acquire lane captures the final frame
+                // after delegation returns; this inner outcome carries none.
+                final_frame: None,
             });
         }
         self.verify_bridge_auth(&portal).await?;
@@ -2434,6 +2457,9 @@ impl AppService {
             // has no journal access — but the re-anchor line (if the anchor
             // changed) still surfaces above the outcome.
             telemetry_log,
+            // The ad-hoc auto-acquire lane captures the final frame after
+            // delegation returns; this inner outcome carries none itself.
+            final_frame: None,
         })
     }
 
@@ -2942,6 +2968,9 @@ impl AppService {
                 .then(|| journal_id.to_owned()),
             route_log,
             telemetry_log,
+            // Batch outcomes settle through the ad-hoc lane, which captures
+            // the final frame once after delegation.
+            final_frame: None,
         }
     }
 
@@ -3101,6 +3130,19 @@ impl AppService {
         })
     }
 
+    /// Best-effort one-shot viewport capture of the attached browser, for a
+    /// settling run's final frame. Peeks at the live session without
+    /// launching: `None` when no browser is attached or capture fails. The
+    /// run outcome is never affected by a capture failure.
+    async fn capture_final_frame(&self) -> Option<String> {
+        let browser = self
+            .browser
+            .lock()
+            .ok()
+            .and_then(|guard| (*guard).clone())?;
+        browser.viewport().await.ok().map(|viewport| viewport.data)
+    }
+
     /// Lazily attach the app-owned background Chromium (headless: no OS
     /// window, dedicated Clinch profile) and stream its viewport into
     /// `emit` until released, retaken, or re-acquired. Reuses the live
@@ -3112,12 +3154,14 @@ impl AppService {
         emit: impl Fn(browser_driver::ScreencastFrame) + Send + 'static,
     ) -> Result<ContextStatus, AppError> {
         let browser = self.browser(BrowserIntent::Background).await?;
-        browser
-            .start_screencast()
-            .await
-            .map_err(|_| AppError::BrowserUnavailable)?;
+        // Subscribe before starting: the opening frames are lost to an
+        // unregistered listener otherwise.
         let mut frames = browser
             .screencast_frames()
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        browser
+            .start_screencast()
             .await
             .map_err(|_| AppError::BrowserUnavailable)?;
         if let Ok(mut pump) = self.screencast.lock() {

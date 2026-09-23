@@ -101,6 +101,8 @@ export type DispatchOutcome = {
   runId?: string | null;
   routeLog?: string | null;
   telemetryLog?: string | null;
+  /** One-shot JPEG viewport (base64) captured when the run settled. */
+  finalFrame?: string | null;
 };
 
 export type PlaybookSummary = {

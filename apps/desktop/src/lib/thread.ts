@@ -117,7 +117,7 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "rename"; id: string; saveName: string }
   | { type: "saved"; id: string; savedId: string }
@@ -223,6 +223,10 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         elapsedMs: action.elapsedMs ?? action.at - entry.startedAt,
         result: action.result,
         saveName: entry.saveName || action.result.save?.suggested || "",
+        // The backend's settle-time capture is evidence of what the run
+        // saw; without it the card would keep the last live frame, which
+        // for direct opens is the launch placeholder.
+        frame: action.finalFrame ?? entry.frame,
       }));
     case "failed":
       return patch(entries, action.id, entry => ({

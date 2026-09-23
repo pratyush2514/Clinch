@@ -178,6 +178,10 @@ export function useThread(
           id,
           at: Date.now(),
           result: sequenceResult(outcome.result, approved(), saveTargetFor(outcome, portalUrl)),
+          // Settle-time capture from the backend wins over the last live
+          // screencast frame: the stream is armed pre-navigation and can
+          // freeze on the launch placeholder for direct opens.
+          finalFrame: outcome.finalFrame ?? null,
         });
       } catch (error) {
         fail(id, error);

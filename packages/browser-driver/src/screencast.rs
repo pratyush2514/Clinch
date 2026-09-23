@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 /// JPEG quality for preview frames: legible text at modest frame sizes.
 pub const SCREENCAST_JPEG_QUALITY: i64 = 80;
 
+/// Maximum screencast frame width in CSS pixels. Chromium downscales before
+/// JPEG encoding, so the IPC payload stays small and frames render quickly;
+/// the thread card shows the viewport at roughly half window width, where
+/// 800px is legible without the multi-megabyte cost of a full-viewport
+/// capture on every paint.
+pub const SCREENCAST_MAX_WIDTH: i64 = 800;
+
 /// One compressed viewport frame, base64 JPEG, ready for a
 /// `data:image/jpeg;base64,…` source. `session_id` feeds the mandatory
 /// per-frame ack back to the renderer.
@@ -30,8 +37,9 @@ pub struct ScreencastFrame {
 }
 
 impl ManagedBrowser {
-    /// Start streaming JPEG viewport frames at [`SCREENCAST_JPEG_QUALITY`].
-    /// Frames flow until [`ManagedBrowser::stop_screencast`]; pair with
+    /// Start streaming JPEG viewport frames at [`SCREENCAST_JPEG_QUALITY`],
+    /// downscaled to [`SCREENCAST_MAX_WIDTH`]. Frames flow until
+    /// [`ManagedBrowser::stop_screencast`]; pair with
     /// [`ManagedBrowser::screencast_frames`] plus
     /// [`ManagedBrowser::ack_screencast_frame`] — an unacked stream stalls.
     ///
@@ -41,6 +49,7 @@ impl ManagedBrowser {
         let params = StartScreencastParams::builder()
             .format(StartScreencastFormat::Jpeg)
             .quality(SCREENCAST_JPEG_QUALITY)
+            .max_width(SCREENCAST_MAX_WIDTH)
             .build();
         tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
             .await
