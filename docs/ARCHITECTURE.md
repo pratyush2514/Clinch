@@ -2,6 +2,8 @@
 
 Reconciled against the working-tree implementation on 2026-09-22. Code is authoritative; this document describes existing paths, not a target architecture.
 
+Addendum on 2026-09-23: the entry-routing paragraphs below were updated for the route-table deletion and the domain-grounder wiring; the rest still reflects the 2026-09-22 tree.
+
 ## Runtime and ownership
 
 The React/TypeScript frontend runs in Tauri's webview. Rust commands in [lib.rs](../apps/desktop/src-tauri/src/lib.rs) delegate to [AppService](../apps/desktop/src-tauri/src/service.rs), which owns the database pool, managed browser handle, connected portal, pending approvals, and completed-run registry.
@@ -42,7 +44,7 @@ Playbooks contain legacy selector steps or semantic intents. Legacy playbook ste
 
 `CommandBar → dispatch_natural_command → resolve_command` chooses a saved playbook, one ephemeral semantic intent, or a plural batch. Saved-name/host matching is deterministic. Ephemeral parsing can invoke a configured intent provider, with a deterministic fallback for returned failures or invalid output.
 
-Cold-path entry routing uses the curated portal-route table in production. Account-directory and LLM route tiers exist as library interfaces but are not wired by AppService. An entry URL on the first semantic step supports pre-navigation and re-anchoring; the separate `entry_urls` table is not read on this dispatch path.
+Cold-path entry routing uses a tiered resolver, not a curated route table (deleted): explicit domain → account directory (unwired) → LLM intent adapter (unwired) → direct-open grounding ladder (saved site shortcut → fenced domain grounder → structured site directory) → honest miss or grounded search fallback. The production grounder is `LlmDomainGrounder::from_env()` — Groq cloud via `GROQ_API_KEY`, or local Ollama via `CLINCH_GROUNDER_PROVIDER` — declining to a stub when unconfigured or offline. It returns only a bare domain from the site slot plus a region hint; the domain is validated in Rust (https, valid TLD, no credentials, no raw IP) before anything navigates, and a malformed response degrades to the next rung, never to a guessed `www.{noun}.com`. An entry URL on the first semantic step supports pre-navigation and re-anchoring; the separate `entry_urls` table is not read on this dispatch path. After a domain-grounded navigation succeeds, the service journals a consent-gated shortcut offer; an accepted save persists a site shortcut that later runs resolve through the shortcut rung with no model call.
 
 Plural dispatch snapshots candidates, asks for batch approval, and checks approval before each click. It caps execution at 30 candidates and stops on drift/failure. Candidate ordering follows snapshot document order, not a geometric visual sort.
 
@@ -64,4 +66,4 @@ Session import is explicit and supports Chrome, Brave, and Edge. The extension l
 
 Manual login uses the managed Chromium window. The URL classifier distinguishes same-origin landings, login path markers, known SSO challenges, and unknown origin mismatches. Known SSO is still pending auth until returning to the portal. This classifier is a heuristic, not proof of account access.
 
-No cloud provider is configured by default. Optional adapters are trusted executables, not sandboxed model runtimes. See [TRD.md](TRD.md) for privacy, timeout, and action limits, [STATUS.md](STATUS.md) for validation, and [FUTURE_FEATURES.md](FUTURE_FEATURES.md) for unimplemented ideas.
+No cloud provider is configured by default. The domain grounder activates only through explicit environment configuration (`CLINCH_GROUNDER_PROVIDER`); unset means the declining stub and the ladder degrades to shortcuts, directory, or the honest miss. Optional adapters are trusted executables, not sandboxed model runtimes. See [TRD.md](TRD.md) for privacy, timeout, and action limits, [STATUS.md](STATUS.md) for validation, and [FUTURE_FEATURES.md](FUTURE_FEATURES.md) for unimplemented ideas.

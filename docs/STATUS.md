@@ -2,6 +2,8 @@
 
 Reconciled on 2026-09-22 against the current working tree, including uncommitted implementation changes. Code is the source of truth. This file summarizes that code; it does not supersede it.
 
+Addendum on 2026-09-23: entry-URL routing and the shortcut card changed after the 2026-09-22 reconciliation. Only the affected bullets below were updated; the rest of this file still describes the 2026-09-22 tree, and the Windows verification pass was not re-run for the addendum.
+
 ## Implemented
 
 - Tauri v2/React desktop shell with resizable panes, session controls, command bar, workflow builder, task workspace, and approvals.
@@ -11,6 +13,8 @@ Reconciled on 2026-09-22 against the current working tree, including uncommitted
 - Task state/checkpoint persistence, script-planned backend first runs, versioned macro recording/replay, bounded task selector repair, and interrupted-task recovery.
 - Semantic AX/Set-of-Marks execution, context-sensitive matching, ordinals, and plural command batches capped at 30.
 - SQLite playbook save/list/run, descriptions, completed command-bar run saving, run-summary journaling, and session/grounding diagnostics.
+- Direct-open entry routing with no curated route table: explicit domain → account directory (unwired) → LLM intent adapter (unwired) → grounding ladder (saved site shortcut, fenced domain grounder, structured site directory) → honest miss or grounded search fallback. The domain grounder resolves a site name to a bare domain through Groq (`CLINCH_GROUNDER_PROVIDER=groq`, key from `GROQ_API_KEY`, zeroized on drop) or local Ollama (`CLINCH_GROUNDER_PROVIDER=ollama`); unset or offline configuration declines to the next rung. Only the site slot and region hint leave the machine, and the call is time-bounded.
+- Post-landing consent-gated shortcut card: after a domain-grounded navigation succeeds, the Action Thread offers to save `site → URL`. Saving persists a SQLite site shortcut that later runs resolve with zero model calls. Nothing is written without the explicit save; declining writes nothing.
 - Backend metrics for run status, task replay share, and session outcomes.
 - macOS CI in [.github/workflows/check.yml](../.github/workflows/check.yml).
 
@@ -18,7 +22,7 @@ Reconciled on 2026-09-22 against the current working tree, including uncommitted
 
 - **Task form:** replays existing macros by name; it sends empty planning selectors. Creating a new selector recording requires a backend API/fixture caller.
 - **Command bar:** resolves a saved playbook, single intent, or plural batch. Command decomposition and dynamic-variable helpers exist but are not called by desktop dispatch.
-- **Models:** saved matching and default parsing are deterministic. Optional intent-provider parsing and task selector-repair providers can invoke models. The production route proposer has neither an account directory nor an LLM adapter wired.
+- **Models:** saved matching and default parsing are deterministic. Optional intent-provider parsing and task selector-repair providers can invoke models. The production route proposer now wires the fenced domain grounder (`LlmDomainGrounder::from_env()`, Groq or Ollama) with a declining stub fallback when unconfigured or offline; the account directory and the Tier-2 LLM intent adapter remain unwired.
 - **Intent provider limit:** unlike selector repair, this subprocess path has no enforced timeout and captures output before checking its size.
 - **Browser mode:** task macro replay is headless; current semantic/playbook execution and session setup use headed mode. A preview is not native browser embedding.
 - **Approvals:** click/fill/submit legacy actions and semantic intents gate execution; typed navigate/download_links actions do not. Task decisions use sentinel_decisions, playbook decisions use session_events text.

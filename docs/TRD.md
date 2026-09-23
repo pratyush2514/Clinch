@@ -2,6 +2,8 @@
 
 Reconciled against working-tree code on 2026-09-22. Implementation references below take precedence over this summary.
 
+Addendum on 2026-09-23: the entry-route and provider-contract paragraphs below were updated for the route-table deletion and the domain-grounder wiring; the rest still reflects the 2026-09-22 tree.
+
 ## Desktop and browser
 
 [Command registration](../apps/desktop/src-tauri/src/lib.rs) defines the IPC surface. [AppService](../apps/desktop/src-tauri/src/service.rs) wires commands to browser, storage, task, and playbook operations. Task/playbook progress uses typed Tauri Channels; screencast frames use events.
@@ -48,7 +50,7 @@ The task lane uses HealingReplay with LocalProvider. One repair attempt per fail
 
 Ephemeral command parsing separately supports `CLINCH_INTENT_PROVIDER` and `CLINCH_INTENT_PROVIDER_SCRIPT`. Input is `{"prompt":"…"}`; output contains `label_query` and optional nullable `container_query`. Unset configuration or returned invalid output uses deterministic parsing. The current implementation synchronously waits for process completion, has no enforced timeout, and checks its 4096-byte output limit after capture. Do not describe this path as bounded or guaranteed responsive.
 
-No provider executable is sandboxed by these contracts. There is no built-in cloud provider or per-run egress dashboard.
+No provider executable is sandboxed by these contracts. The domain grounder is a built-in provider path rather than a subprocess adapter: `CLINCH_GROUNDER_PROVIDER=groq` uses Groq's chat API with the key from `GROQ_API_KEY` (zeroized on drop), `=ollama` talks to the local daemon; only the site slot and region hint leave the machine, and the call is time-bounded. There is no per-run egress dashboard.
 
 ## Playbooks and semantic execution
 
@@ -58,7 +60,7 @@ No provider executable is sandboxed by these contracts. There is no built-in clo
 
 Saved playbooks and ephemeral commands use [the runner](../packages/orchestration-engine/src/runner.rs). Legacy selector failures return repair needs without invoking task HealingReplay. Semantic drift handling and signature-history helpers do not constitute a user-facing rollback feature.
 
-The plural command lane resolves at most 30 candidates, approves the batch and each click, and halts on failures. Snapshot document order is the ordering contract. Entry routes in production come from the curated route table; optional account/model route interfaces are not configured.
+The plural command lane resolves at most 30 candidates, approves the batch and each click, and halts on failures. Snapshot document order is the ordering contract. Entry routes in production come from the tiered resolver (explicit domain → account directory → LLM intent adapter → grounding ladder → search fallback). The account directory and Tier-2 LLM adapter remain unconfigured; the ladder's domain grounder is env-configured (Groq/Ollama) with a declining stub fallback, and the shortcut rung reads the user's own SQLite site shortcuts.
 
 ## Approval and persistence boundaries
 

@@ -19,7 +19,7 @@ Import cannot promise zero re-login, zero 2FA, or anti-bot acceptance. A source 
 - Workflow builder saves role/label semantic steps, previews a live match, and lists/runs saved playbooks.
 - Command bar resolves saved playbooks or ad-hoc single/batch intents. Optional intent-provider parsing is available; default parsing is deterministic.
 - Semantic matching uses labels and surrounding text, with support for contextual identifiers, ordinals, and plural targets. Execution clicks the grounded control; selecting a textbox role is not a general form-filling feature.
-- Curated entry routes support navigation before grounding. This is not unrestricted site discovery or a model-generated browsing plan.
+- Direct-open entry routing resolves `open X` without a curated table: a saved site shortcut, the fenced domain grounder, or a structured site directory — otherwise an honest miss that asks the user rather than scraping a search page. After a grounded landing, the Action Thread offers a consent-gated shortcut save; accepted shortcuts resolve with zero model calls on later runs. This is not unrestricted site discovery or a model-generated browsing plan.
 - Plural execution caps candidates at 30 and uses batch plus per-click approvals.
 - Completed command-bar runs can be saved by run ID, with an optional description. Playbooks persist in SQLite and replay from the workflow list.
 
