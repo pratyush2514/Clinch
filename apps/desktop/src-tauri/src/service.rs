@@ -293,6 +293,12 @@ struct ProposedEntry {
     /// shortcut, no typed domain, no directory hit. Dispatch turns this
     /// into ask-and-learn guidance instead of the generic "not runnable".
     direct_open_miss: bool,
+    /// Whether the fenced domain grounder was env-configured when this
+    /// proposal was built. Carried so a direct-open miss can say *why* the
+    /// ladder could not ground the name: an unconfigured grounder is a
+    /// setup problem, a configured one that declined is a genuine miss.
+    /// Defaults to false; only the miss path reads it.
+    grounder_configured: bool,
     /// A domain-grounder hit worth remembering: the site slot the prompt
     /// named and the URL the grounder resolved it to. Carried on the
     /// proposal — never journaled there — so dispatch can offer it as a
@@ -1986,12 +1992,17 @@ impl AppService {
     }
 
     /// Fail a direct-open miss with ask-and-learn guidance. `Some(err)`
-    /// when the ladder ran and found nothing; `None` otherwise.
+    /// when the ladder ran and found nothing; `None` otherwise. When the
+    /// grounder was never configured, the guidance says so — the fix is
+    /// setup, not rephrasing the prompt.
     fn direct_open_miss_error(proposed: &ProposedEntry) -> Option<AppError> {
         if proposed.direct_open_miss {
-            Some(AppError::InvalidInput(
-                "I couldn't find a destination for that. Try the full domain (for example 'open amazon.in'), or save a site shortcut and try again.",
-            ))
+            let message = if proposed.grounder_configured {
+                "I couldn't find a destination for that. Try the full domain (for example 'open amazon.in'), or save a site shortcut and try again."
+            } else {
+                "I couldn't find a destination for that. The site-name grounder isn't configured — set CLINCH_GROUNDER_PROVIDER to groq or ollama and try again, or use the full domain (for example 'open amazon.in') or a saved site shortcut."
+            };
+            Some(AppError::InvalidInput(message))
         } else {
             None
         }
@@ -2034,6 +2045,11 @@ impl AppService {
         let live_grounder = orchestration_engine::LlmDomainGrounder::from_env();
         let stub_grounder = orchestration_engine::StubDomainGrounder;
         let region_hint = orchestration_engine::system_region_hint();
+        // Captured before the blocking-thread move below: the miss line
+        // names which ladder rungs were even live, so an unconfigured
+        // grounder reads as a setup hint rather than a dead end.
+        let grounder_configured = live_grounder.is_some();
+        let site_search_configured = site_search.is_some();
         // The directory rung is synchronous network I/O (bounded at ten
         // seconds by the agent config). It runs on a blocking thread so it
         // can never stall the async runtime's workers; everything the
@@ -2132,15 +2148,28 @@ impl AppService {
                 log: Some(line),
                 source: Some(route.source),
                 direct_open_miss: false,
+                grounder_configured,
                 grounder_hit,
             }
         } else {
             let line = if direct_open {
-                // Ask-and-learn: the miss names the way out. No shortcut,
-                // no typed domain, no directory — the next move is the
-                // user's, not a search scrape.
+                // Ask-and-learn: the miss names the way out — and which
+                // rungs were even live. An unconfigured grounder is a setup
+                // problem ("set CLINCH_GROUNDER_PROVIDER"); a configured
+                // one that declined is a genuine miss. Without this, both
+                // look identical and the failure is undebuggable.
+                let grounder_state = if grounder_configured {
+                    "grounder attempted, no domain returned"
+                } else {
+                    "grounder unconfigured (set CLINCH_GROUNDER_PROVIDER=groq or =ollama)"
+                };
+                let directory_state = if site_search_configured {
+                    "directory attempted, no match"
+                } else {
+                    "directory unconfigured"
+                };
                 format!(
-                    "route_resolution_miss: prompt='{prompt}' · no shortcut, domain, or directory matched — try the full domain (open amazon.in) or save a site shortcut"
+                    "route_resolution_miss: prompt='{prompt}' · {grounder_state} · {directory_state} — try the full domain (open amazon.in) or save a site shortcut"
                 )
             } else {
                 format!("route_resolution_miss: prompt='{prompt}'")
@@ -2150,6 +2179,7 @@ impl AppService {
                 log: Some(line),
                 source: None,
                 direct_open_miss: direct_open,
+                grounder_configured,
                 ..ProposedEntry::default()
             }
         }
@@ -2340,6 +2370,33 @@ impl AppService {
             .await?;
         let telemetry_log = self.reanchor_to_entry(&browser, &playbook.steps).await;
         let telemetry_log = Self::with_shortcut_offer(shortcut_offer, telemetry_log);
+        // A pure direct open ends at the landing: the navigation IS the
+        // task. Running the semantic step afterward would fail on zero
+        // candidates — there is nothing to click on a bare "open X" — so
+        // complete here with no steps. (Reaching this line means the
+        // pre-navigation `?` above succeeded, so the landing is confirmed.)
+        // Completed pure opens are deliberately not remembered: the
+        // consent-gated shortcut card, not a playbook, is the persistence
+        // mechanism for direct opens.
+        if orchestration_engine::is_direct_open(
+            &prompt,
+            &orchestration_engine::parse_grammar(&prompt, Some(&portal)),
+        ) {
+            return Ok(DispatchOutcome {
+                kind: "ephemeral",
+                name,
+                result: orchestration_engine::SequenceOutcome {
+                    completed_steps: 0,
+                    total_steps: 0,
+                    status: orchestration_engine::SequenceStatus::Completed,
+                    stopped_at: None,
+                },
+                steps: Vec::new(),
+                run_id: None,
+                route_log,
+                telemetry_log,
+            });
+        }
         self.verify_bridge_auth(&portal).await?;
         let (result, journal_id) = self
             .run_steps(
@@ -4017,6 +4074,82 @@ pub(crate) mod tests {
             "guidance names the way out: {message}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_open_miss_names_why_the_ladder_missed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The miss journal line must say which rungs were even live: an
+        // unconfigured grounder is a setup problem, a configured one that
+        // declined is a genuine miss. Same harness as the guidance test —
+        // the assertions stay consistent with the flag rather than assuming
+        // the ambient environment.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let prompt = "open amazon for me";
+        let origin = url::Url::parse("https://www.google.com/").ok();
+        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
+            orchestration_engine::resolve_command(prompt, origin.as_ref(), &[])
+        else {
+            panic!("ad-hoc prompt resolves ephemeral");
+        };
+        let proposed = service.propose_entry_url(prompt, &mut intent, None).await;
+        assert!(proposed.direct_open_miss, "ladder miss flagged");
+        let line = proposed.log.clone().unwrap_or_default();
+        if proposed.grounder_configured {
+            assert!(
+                line.contains("grounder attempted"),
+                "configured grounder that declined says so: {line}"
+            );
+        } else {
+            assert!(
+                line.contains("grounder unconfigured"),
+                "unconfigured grounder named as the cause: {line}"
+            );
+            assert!(
+                line.contains("CLINCH_GROUNDER_PROVIDER"),
+                "miss names the setup fix: {line}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_open_miss_error_distinguishes_setup_from_miss() {
+        // Pure unit coverage for the guidance split: the unconfigured case
+        // points at setup, the configured case keeps the generic guidance,
+        // and a non-miss proposes no error at all.
+        let unconfigured = ProposedEntry {
+            direct_open_miss: true,
+            grounder_configured: false,
+            ..ProposedEntry::default()
+        };
+        let message = match AppService::direct_open_miss_error(&unconfigured) {
+            Some(AppError::InvalidInput(message)) => message,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        assert!(
+            message.contains("isn't configured") && message.contains("CLINCH_GROUNDER_PROVIDER"),
+            "setup hint: {message}"
+        );
+        let declined = ProposedEntry {
+            direct_open_miss: true,
+            grounder_configured: true,
+            ..ProposedEntry::default()
+        };
+        let message = match AppService::direct_open_miss_error(&declined) {
+            Some(AppError::InvalidInput(message)) => message,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        assert!(
+            !message.contains("isn't configured"),
+            "genuine miss keeps generic guidance: {message}"
+        );
+        assert!(
+            AppService::direct_open_miss_error(&ProposedEntry::default()).is_none(),
+            "non-miss proposes no error"
+        );
     }
 
     #[tokio::test]
