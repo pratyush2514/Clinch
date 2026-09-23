@@ -284,7 +284,7 @@ async fn headless_replay(
         .restart(
             Path::new(executable),
             &root.join("profile"),
-            browser_driver::LaunchOptions { headless: true },
+            browser_driver::LaunchOptions::replay(),
         )
         .await?;
     assert!(browser.is_headless());

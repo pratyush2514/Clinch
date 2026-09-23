@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 use crate::auth::{AuthPanel, ReauthReason, reason_for_signal};
-use browser_driver::{Action, LaunchOptions, ManagedBrowser};
+use browser_driver::{Action, LaunchOptions, ManagedBrowser, WindowMode};
 use futures::StreamExt;
 use orchestration_engine::{Engine, EngineError, Task, TaskEvent, TaskId, TaskRequest};
 use serde::Serialize;
@@ -115,23 +115,31 @@ pub const SCREENCAST_EVENT: &str = "browser-screencast-frame";
 /// window" is checkable by reading the argument instead of tracing a boolean.
 ///
 /// * [`Self::Background`] — dispatch lanes, playbook runs, task replay, and
-///   screencast acquisition. Always `--headless=new`.
+///   screencast acquisition. Launches `--headless=new`, and reuses whatever
+///   is attached as-is: after an L1 escalation the session may be
+///   off-screen headed, which still shows no visible window.
 /// * [`Self::Interactive`] — only actions the user asked for by name:
 ///   manual login, in-app re-authentication, source-profile and bridge sync
 ///   (each may need a visible login/2FA page), and Take Control.
+/// * [`Self::ChallengeEscalation`] — automatic L1 bot-challenge escalation:
+///   restarts the session as off-screen headed (a real compositor for
+///   Cloudflare's probes, hidden via OS APIs). Never interactive: the
+///   window is hidden, not handed to the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowserIntent {
     Background,
     Interactive,
+    ChallengeEscalation,
 }
 
 impl BrowserIntent {
-    /// Launch options for a fresh process. Background is headless by
+    /// Launch options for a fresh process. Background launches headless by
     /// construction: no code path can launch it any other way.
     fn launch_options(self) -> LaunchOptions {
         match self {
             Self::Background => LaunchOptions::replay(),
             Self::Interactive => LaunchOptions::interactive(),
+            Self::ChallengeEscalation => LaunchOptions::offscreen_headed(),
         }
     }
 }
@@ -150,18 +158,26 @@ enum AcquireAction {
 }
 
 /// Decide how to satisfy `intent` given the attached session's window mode
-/// (`attached_headless`; `None` when dormant).
+/// (`None` when dormant).
 ///
 /// Background never restarts: it reuses whatever is attached, so a run can
 /// neither open a window nor close one the user opened. Interactive restarts
-/// only when the live session is headless.
-fn acquire_action(intent: BrowserIntent, attached_headless: Option<bool>) -> AcquireAction {
-    match (intent, attached_headless) {
+/// only when the live session shows no visible window. [`BrowserIntent::ChallengeEscalation`]
+/// restarts a headless session into off-screen headed (cookies carried in
+/// memory by the restart path) and reuses a session that is already headed
+/// or off-screen.
+fn acquire_action(intent: BrowserIntent, attached: Option<WindowMode>) -> AcquireAction {
+    match (intent, attached) {
         (_, None) => AcquireAction::Launch,
-        (BrowserIntent::Background, Some(_)) | (BrowserIntent::Interactive, Some(false)) => {
+        (BrowserIntent::Background, Some(_))
+        | (BrowserIntent::Interactive, Some(WindowMode::Headed))
+        | (BrowserIntent::ChallengeEscalation, Some(WindowMode::Headed | WindowMode::Offscreen)) => {
             AcquireAction::Reuse
         }
-        (BrowserIntent::Interactive, Some(true)) => AcquireAction::Restart,
+        (BrowserIntent::Interactive, Some(_))
+        | (BrowserIntent::ChallengeEscalation, Some(WindowMode::Headless)) => {
+            AcquireAction::Restart
+        }
     }
 }
 
@@ -732,11 +748,12 @@ impl AppService {
     /// exactly as-is instead of restarting. Reuse-as-is matters in both
     /// directions — a background run can neither promote a headless context
     /// into a visible window nor demote a window the user opened with Take
-    /// Control. Only [`BrowserIntent::Interactive`] may restart a headless
-    /// session into a visible one.
+    /// Control. Only [`BrowserIntent::Interactive`] may restart a session
+    /// into a visible window, and only [`BrowserIntent::ChallengeEscalation`]
+    /// may restart one into off-screen headed.
     async fn browser(&self, intent: BrowserIntent) -> Result<Arc<ManagedBrowser>, AppError> {
         let existing = self.browser.lock().map_err(|_| AppError::Internal)?.clone();
-        match acquire_action(intent, existing.as_ref().map(|live| live.is_headless())) {
+        match acquire_action(intent, existing.as_ref().map(|live| live.window_mode())) {
             AcquireAction::Reuse => return existing.ok_or(AppError::BrowserUnavailable),
             AcquireAction::Restart => {
                 let live = existing.ok_or(AppError::BrowserUnavailable)?;
@@ -1821,12 +1838,54 @@ impl AppService {
         // launch placeholder instead of showing the destination.
         outcome.final_frame = self.capture_final_frame().await;
         // A completed run that landed on a human-verification gate is not
-        // a silent success: surface the challenge URL so the thread can
-        // route the check to the user (headed takeover, solved once, the
-        // profile keeps the clearance) instead of completing on a CAPTCHA
-        // page.
-        if outcome.result.status == orchestration_engine::SequenceStatus::Completed {
-            outcome.challenge = self.detect_challenge().await;
+        // a silent success. L1: try the automatic off-screen headed
+        // escalation first (zero clicks); only a persistent challenge keeps
+        // the L2 Take Control card, routing the check to the user.
+        if outcome.result.status == orchestration_engine::SequenceStatus::Completed
+            && let Some(challenge_url) = self.detect_challenge().await
+        {
+            let host = url::Url::parse(&challenge_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| challenge_url.clone());
+            // Every escalation outcome is journaled — cleared, persistent,
+            // or failed — so the thread explains why the card did or did
+            // not appear. Persistent and failed escalations both keep the
+            // L2 Take Control card.
+            match self.auto_escalate_challenge(&challenge_url).await {
+                Ok(true) => {
+                    let line = self
+                        .journal_line(format!("challenge_auto_escalated: {host} · cleared"))
+                        .await;
+                    outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
+                        Some(existing) => format!("{line}\n{existing}"),
+                        None => line,
+                    });
+                    // The pre-escalation frame shows the interstitial; show
+                    // the cleared page instead.
+                    outcome.final_frame = self.capture_final_frame().await;
+                }
+                Ok(false) => {
+                    self.journal_line(format!("challenge_auto_escalated: {host} · persistent"))
+                        .await;
+                    outcome.challenge = Some(challenge_url);
+                }
+                Err(err) => {
+                    // Static labels only: AppError's Debug could carry a
+                    // payload, and nothing here is worth leaking to a log.
+                    let detail = match err {
+                        AppError::BrowserUnavailable => "browser unavailable",
+                        AppError::Busy => "busy",
+                        AppError::Internal => "internal",
+                        _ => "unexpected",
+                    };
+                    self.journal_line(format!(
+                        "challenge_auto_escalated: {host} · failed ({detail})"
+                    ))
+                    .await;
+                    outcome.challenge = Some(challenge_url);
+                }
+            }
         }
         Ok(outcome)
     }
@@ -3187,6 +3246,59 @@ impl AppService {
         browser.challenge_detected().await
     }
 
+    /// L1 challenge escalation: restart the attached session as off-screen
+    /// headed (same app-owned profile, cookies carried in memory by the
+    /// restart path) and re-probe the challenged URL. Returns `true` when
+    /// the interstitial cleared with no human input.
+    ///
+    /// Bounded: ~30s of polling, then `false` — a real human checkbox never
+    /// clears on its own, and the L2 Take Control card is the honest
+    /// fallback for exactly that case. Clearance additionally requires the
+    /// page to be live on the challenged host: the detector fails closed,
+    /// so a `None` from a dead target or a still-loading page never reads
+    /// as "cleared". Never launches when nothing is
+    /// attached: the caller only escalates a detected challenge, so the
+    /// session always exists here.
+    async fn auto_escalate_challenge(&self, challenge_url: &str) -> Result<bool, AppError> {
+        let parsed = url::Url::parse(challenge_url)
+            .map_err(|_| AppError::InvalidInput("Challenge escalation needs a valid page URL."))?;
+        if parsed.scheme() != "https" {
+            return Err(AppError::InvalidInput(
+                "Challenge escalation needs an HTTPS page URL.",
+            ));
+        }
+        // The restart carries cookies in memory and swaps the attached
+        // session: the run continues in the headed browser afterwards —
+        // no cookie handoff back to a headless instance mid-run.
+        let browser = self.browser(BrowserIntent::ChallengeEscalation).await?;
+        browser
+            .navigate(&parsed)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        let expected_host = parsed.host_str().map(str::to_owned);
+        // Cloudflare's automatic verification resolves on its own in a
+        // headed browser; poll the detector rather than sleeping blind.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Clearance needs a live page on the intended host: the
+            // detector fails closed, so a `None` from a dead CDP target
+            // or a still-loading page must never read as "cleared".
+            let live_host = browser
+                .current_url()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|url| url.host_str().map(str::to_owned));
+            if live_host == expected_host && browser.challenge_detected().await.is_none() {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Lazily attach the app-owned background Chromium (headless: no OS
     /// window, dedicated Clinch profile) and stream its viewport into
     /// `emit` until released, retaken, or re-acquired. Reuses the live
@@ -3542,36 +3654,80 @@ pub(crate) mod tests {
     #[test]
     fn background_acquisition_never_requests_a_window() {
         // The window-visibility contract, provable without Chromium.
-        // 1. Background launches headless; only interactive launches headed.
-        assert!(BrowserIntent::Background.launch_options().headless);
-        assert!(!BrowserIntent::Interactive.launch_options().headless);
-        // 2. Dormant: both intents launch, each under its own mode.
+        // 1. Background launches headless; interactive launches headed;
+        //    escalation launches off-screen headed (hidden, never handed
+        //    to the user).
         assert_eq!(
-            acquire_action(BrowserIntent::Background, None),
-            AcquireAction::Launch
+            BrowserIntent::Background.launch_options().mode,
+            WindowMode::Headless
         );
         assert_eq!(
-            acquire_action(BrowserIntent::Interactive, None),
-            AcquireAction::Launch
+            BrowserIntent::Interactive.launch_options().mode,
+            WindowMode::Headed
         );
+        assert_eq!(
+            BrowserIntent::ChallengeEscalation.launch_options().mode,
+            WindowMode::Offscreen
+        );
+        // 2. Dormant: every intent launches, each under its own mode.
+        for intent in [
+            BrowserIntent::Background,
+            BrowserIntent::Interactive,
+            BrowserIntent::ChallengeEscalation,
+        ] {
+            assert_eq!(
+                acquire_action(intent, None),
+                AcquireAction::Launch,
+                "{intent:?} must launch when dormant"
+            );
+        }
         // 3. Background NEVER restarts, in either direction: it cannot
         //    promote a headless context into a window, and it cannot demote
         //    a window the user opened with Take Control.
-        for attached in [true, false] {
+        for attached in [
+            WindowMode::Headless,
+            WindowMode::Headed,
+            WindowMode::Offscreen,
+        ] {
             assert_eq!(
                 acquire_action(BrowserIntent::Background, Some(attached)),
                 AcquireAction::Reuse,
-                "background must reuse an attached session (headless={attached})"
+                "background must reuse an attached session ({attached:?})"
             );
         }
-        // 4. Interactive restarts only when the live session has no window,
-        //    and reuses an already-visible one.
+        // 4. Interactive restarts only when the live session shows no
+        //    visible window, and reuses an already-visible one.
         assert_eq!(
-            acquire_action(BrowserIntent::Interactive, Some(true)),
+            acquire_action(BrowserIntent::Interactive, Some(WindowMode::Headless)),
             AcquireAction::Restart
         );
         assert_eq!(
-            acquire_action(BrowserIntent::Interactive, Some(false)),
+            acquire_action(BrowserIntent::Interactive, Some(WindowMode::Offscreen)),
+            AcquireAction::Restart
+        );
+        assert_eq!(
+            acquire_action(BrowserIntent::Interactive, Some(WindowMode::Headed)),
+            AcquireAction::Reuse
+        );
+        // 5. Escalation restarts a headless session into off-screen headed,
+        //    and reuses a session that already has (hidden or visible)
+        //    windows instead of relaunching it.
+        assert_eq!(
+            acquire_action(
+                BrowserIntent::ChallengeEscalation,
+                Some(WindowMode::Headless)
+            ),
+            AcquireAction::Restart
+        );
+        assert_eq!(
+            acquire_action(
+                BrowserIntent::ChallengeEscalation,
+                Some(WindowMode::Offscreen)
+            ),
+            AcquireAction::Reuse
+        );
+        assert_eq!(
+            acquire_action(BrowserIntent::ChallengeEscalation, Some(WindowMode::Headed)),
             AcquireAction::Reuse
         );
     }

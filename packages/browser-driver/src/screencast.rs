@@ -108,7 +108,7 @@ impl ManagedBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LaunchOptions;
+    use crate::{LaunchOptions, WindowMode};
 
     /// Hermetic lifecycle proof for on-demand background contexts: dormant
     /// by default, background-first, fail-closed without Chromium, and the
@@ -119,8 +119,8 @@ mod tests {
     async fn test_lazy_context_acquisition_and_release() -> Result<(), Box<dyn std::error::Error>> {
         // Dormant by default: background acquisition is headless by
         // construction, so no OS window can ever spawn on this path.
-        assert!(LaunchOptions::replay().headless);
-        assert!(!LaunchOptions::interactive().headless);
+        assert_eq!(LaunchOptions::replay().mode, WindowMode::Headless);
+        assert_eq!(LaunchOptions::interactive().mode, WindowMode::Headed);
         // Failed acquisition leaves nothing behind: a missing executable
         // fails fast at spawn with no child process and no retained state
         // to release — repeatable without side effects.

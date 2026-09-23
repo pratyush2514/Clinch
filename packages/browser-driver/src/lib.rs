@@ -2,6 +2,8 @@
 //! One managed, isolated Chromium child; native CDP only.
 pub mod a11y;
 mod actions;
+#[cfg(windows)]
+mod offscreen;
 mod picker;
 mod preview;
 mod screencast;
@@ -75,9 +77,24 @@ pub enum BrowserError {
     Picker,
 }
 
+/// Window visibility for a managed Chromium launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowMode {
+    /// Visible headed window (interactive use).
+    #[default]
+    Headed,
+    /// `--headless=new`: no OS window at all.
+    Headless,
+    /// Headed Chromium positioned off-screen and hidden via OS APIs: a
+    /// real compositor/GPU for bot-mitigation probes, no visible window.
+    /// The OS hide is Windows-only; elsewhere the window sits off-monitor
+    /// but keeps its taskbar entry.
+    Offscreen,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LaunchOptions {
-    pub headless: bool,
+    pub mode: WindowMode,
 }
 
 impl LaunchOptions {
@@ -85,7 +102,9 @@ impl LaunchOptions {
     /// The window is app-owned; it never touches the user's daily profile.
     #[must_use]
     pub fn interactive() -> Self {
-        Self { headless: false }
+        Self {
+            mode: WindowMode::Headed,
+        }
     }
 
     /// Background macro replay. No OS window may spawn on this path —
@@ -93,7 +112,42 @@ impl LaunchOptions {
     /// the `headless_replay_*` integration tests.
     #[must_use]
     pub fn replay() -> Self {
-        Self { headless: true }
+        Self {
+            mode: WindowMode::Headless,
+        }
+    }
+
+    /// Automatic bot-challenge escalation: headed for Cloudflare's probes,
+    /// off-screen and OS-hidden so no window appears. Never interactive —
+    /// the window is hidden, not handed to the user.
+    #[must_use]
+    pub fn offscreen_headed() -> Self {
+        Self {
+            mode: WindowMode::Offscreen,
+        }
+    }
+}
+
+/// CLI flags for the window mode, beyond the shared base set. Pure so the
+/// off-screen contract (position, size, occlusion flags — and crucially no
+/// `--headless`) is hermetically testable.
+fn window_mode_args(mode: WindowMode) -> &'static [&'static str] {
+    match mode {
+        WindowMode::Headless => &["--headless=new"],
+        WindowMode::Headed => &[],
+        WindowMode::Offscreen => &[
+            // Far-positive: off every monitor, including negative-offset
+            // multi-monitor layouts. Real HWND + compositor for
+            // bot-mitigation probes; the OS hide (below) removes the
+            // taskbar button on Windows.
+            "--window-position=10000,10000",
+            "--window-size=1920,1080",
+            // An occluded window would otherwise get throttled timers and
+            // frozen frames — both detectable, both fatal to a challenge
+            // that auto-resolves.
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ],
     }
 }
 
@@ -174,7 +228,7 @@ pub fn browser_ready_url() -> Option<Url> {
 
 // No Debug: CDP objects may contain session data.
 pub struct ManagedBrowser {
-    headless: bool,
+    mode: WindowMode,
     child: Mutex<Option<Child>>,
     browser: Browser,
     page: Page,
@@ -231,13 +285,22 @@ impl ManagedBrowser {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if options.headless {
-            command.arg("--headless=new");
+        for arg in window_mode_args(options.mode) {
+            command.arg(arg);
         }
         // Hide the helper console, but keep the requested interactive browser window.
         #[cfg(target_os = "windows")]
         command.creation_flags(0x0800_0000);
         let child = command.spawn().map_err(|_| BrowserError::Launch)?;
+        // Off-screen headed owns real windows: hide them best-effort so no
+        // taskbar button or Alt+Tab entry appears. A brief flicker before
+        // the hide lands is accepted and documented; failure just leaves
+        // the off-screen window in place.
+        #[cfg(windows)]
+        if options.mode == WindowMode::Offscreen {
+            let pid = child.id();
+            let _ = tokio::task::spawn_blocking(move || offscreen::hide_process_windows(pid)).await;
+        }
         let endpoint = tokio::time::timeout(IO_TIMEOUT, async {
             loop {
                 if let Ok(contents) = tokio::fs::read_to_string(&endpoint_file).await {
@@ -275,7 +338,7 @@ impl ManagedBrowser {
         // Register in the main world before any portal scripts can run. Keep the
         // managed owner alive during setup so failures clean up the child/task.
         let managed = Self {
-            headless: options.headless,
+            mode: options.mode,
             child: Mutex::new(Some(child)),
             browser,
             page,
@@ -301,8 +364,18 @@ impl ManagedBrowser {
         Ok(managed)
     }
 
+    /// The launch window mode.
+    pub fn window_mode(&self) -> WindowMode {
+        self.mode
+    }
+
+    /// Whether the session shows no *visible* window. Off-screen headed
+    /// counts: it owns real windows, but they are positioned off-monitor
+    /// and OS-hidden, so every no-visible-window contract holds for it —
+    /// replay gating (`HeadlessRequired`), the picker refusal (an
+    /// invisible overlay can never be clicked), and status reporting.
     pub fn is_headless(&self) -> bool {
-        self.headless
+        !matches!(self.mode, WindowMode::Headed)
     }
 
     /// Restart the same app-owned profile, carrying session cookies only in memory.
@@ -559,9 +632,32 @@ mod tests {
     #[test]
     fn launch_options_separate_replay_from_interactive() {
         // Phase B headless-first contract: replays never spawn an OS window.
-        assert!(LaunchOptions::replay().headless);
-        assert!(!LaunchOptions::interactive().headless);
-        assert!(!LaunchOptions::default().headless);
+        assert_eq!(LaunchOptions::replay().mode, WindowMode::Headless);
+        assert_eq!(LaunchOptions::interactive().mode, WindowMode::Headed);
+        assert_eq!(LaunchOptions::default().mode, WindowMode::Headed);
+        // The escalation rung is headed under the hood but shows no window.
+        assert_eq!(
+            LaunchOptions::offscreen_headed().mode,
+            WindowMode::Offscreen
+        );
+        assert_ne!(LaunchOptions::offscreen_headed().mode, WindowMode::Headless);
+    }
+
+    #[test]
+    fn window_mode_args_keep_offscreen_headed_not_headless() {
+        // Headless carries exactly the headless flag and nothing else.
+        assert_eq!(window_mode_args(WindowMode::Headless), &["--headless=new"]);
+        // Visible headed adds nothing: it must not inherit off-screen flags.
+        assert!(window_mode_args(WindowMode::Headed).is_empty());
+        // Off-screen headed: real window geometry, occlusion protection,
+        // and crucially no `--headless` — Cloudflare probes a headed
+        // compositor here, not a headless one.
+        let args = window_mode_args(WindowMode::Offscreen);
+        assert!(args.contains(&"--window-position=10000,10000"));
+        assert!(args.contains(&"--window-size=1920,1080"));
+        assert!(args.contains(&"--disable-backgrounding-occluded-windows"));
+        assert!(args.contains(&"--disable-renderer-backgrounding"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--headless")));
     }
 
     #[test]
@@ -751,7 +847,7 @@ mod tests {
         let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
         let profile = tempfile::tempdir()?;
         let options = LaunchOptions::replay();
-        assert!(options.headless);
+        assert_eq!(options.mode, WindowMode::Headless);
         let browser =
             ManagedBrowser::launch_with_options(Path::new(&executable), profile.path(), options)
                 .await?;
