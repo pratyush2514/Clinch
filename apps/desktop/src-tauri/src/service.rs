@@ -1658,16 +1658,25 @@ impl AppService {
                     let orchestration_engine::CommandMatch::Ephemeral { intent } = matched else {
                         return Err(AppError::Internal);
                     };
-                    self.dispatch_single_ephemeral(portal, prompt, intent, emit)
-                        .await
+                    let mut outcome = self
+                        .dispatch_single_ephemeral(portal, prompt, intent, emit)
+                        .await?;
+                    // The connected lane used to return the inner outcome
+                    // unsettled — no final frame, no L1 challenge handling.
+                    // Every ephemeral lane settles the same way.
+                    self.settle_ephemeral_outcome(&mut outcome).await;
+                    Ok(outcome)
                 }
                 DispatchLane::Batch => {
                     let portal = connected.ok_or(AppError::SessionRequired)?;
                     let orchestration_engine::CommandMatch::Ephemeral { intent } = matched else {
                         return Err(AppError::Internal);
                     };
-                    self.dispatch_plural_batch(portal, prompt, intent, emit)
-                        .await
+                    let mut outcome = self
+                        .dispatch_plural_batch(portal, prompt, intent, emit)
+                        .await?;
+                    self.settle_ephemeral_outcome(&mut outcome).await;
+                    Ok(outcome)
                 }
             },
             None if connected.is_none() => {
@@ -1851,12 +1860,25 @@ impl AppService {
                 None => line,
             });
         }
+        self.settle_ephemeral_outcome(&mut outcome).await;
+        Ok(outcome)
+    }
+
+    /// Post-delegation settle shared by the ad-hoc auto-acquire lane and
+    /// the connected-portal lane: capture the final-frame evidence, then
+    /// run L1 challenge detection/escalation. Every ephemeral lane ends
+    /// here — a run that lands on a human-verification gate is never a
+    /// silent success, and a settled card never lacks its viewport without
+    /// a journaled label saying why. (The connected lane used to skip this
+    /// entirely: every run after the first landed with no preview and no
+    /// challenge handling, because only the ad-hoc lane settled.)
+    async fn settle_ephemeral_outcome(&self, outcome: &mut DispatchOutcome) {
         // Settle evidence: one-shot viewport of the live target, captured
         // after the landing. The streaming screencast is armed on the
         // pre-navigation session and does not survive cross-origin
         // navigation, so without this the settled card freezes on the
         // launch placeholder instead of showing the destination.
-        self.attach_final_frame(&mut outcome).await;
+        self.attach_final_frame(outcome).await;
         // A completed run that landed on a human-verification gate is not
         // a silent success. L1: try the automatic off-screen headed
         // escalation first (zero clicks); only a persistent challenge keeps
@@ -1883,7 +1905,7 @@ impl AppService {
                     });
                     // The pre-escalation frame shows the interstitial; show
                     // the cleared page instead.
-                    self.attach_final_frame(&mut outcome).await;
+                    self.attach_final_frame(outcome).await;
                     // The headed session's job is done: shut it down
                     // gracefully so no phantom window lingers. Clearance
                     // persists in the app profile on disk, so the next
@@ -1912,7 +1934,6 @@ impl AppService {
                 }
             }
         }
-        Ok(outcome)
     }
 
     /// Stage 2 of search-and-follow: from a settled search landing, click the
@@ -2528,10 +2549,11 @@ impl AppService {
                 run_id: None,
                 route_log,
                 telemetry_log,
-                // The ad-hoc auto-acquire lane captures the final frame
-                // after delegation returns; this inner outcome carries none.
-                // Inner outcome: the ad-hoc lane detects challenges after
-                // delegation returns.
+                // Settle (final frame + L1 challenge handling) runs in
+                // settle_ephemeral_outcome after this returns; the inner
+                // outcome carries none itself.
+                // Inner outcome: settle_ephemeral_outcome detects challenges
+                // after delegation returns.
                 final_frame: None,
                 challenge: None,
             });
@@ -2567,10 +2589,11 @@ impl AppService {
             // has no journal access — but the re-anchor line (if the anchor
             // changed) still surfaces above the outcome.
             telemetry_log,
-            // The ad-hoc auto-acquire lane captures the final frame after
-            // delegation returns; this inner outcome carries none itself.
-            // Inner outcome: the ad-hoc lane detects challenges after
-            // delegation returns.
+            // Settle (final frame + L1 challenge handling) runs in
+            // settle_ephemeral_outcome after this returns; the inner outcome
+            // carries none itself.
+            // Inner outcome: settle_ephemeral_outcome detects challenges
+            // after delegation returns.
             final_frame: None,
             challenge: None,
         })
@@ -3081,10 +3104,9 @@ impl AppService {
                 .then(|| journal_id.to_owned()),
             route_log,
             telemetry_log,
-            // Batch outcomes settle through the ad-hoc lane, which captures
-            // the final frame once after delegation.
-            // Batch outcomes settle through the ad-hoc lane, which detects
-            // challenges once after delegation.
+            // Settle (final frame + L1 challenge handling) runs in
+            // settle_ephemeral_outcome after this returns; the batch outcome
+            // carries neither itself.
             final_frame: None,
             challenge: None,
         }
