@@ -182,6 +182,9 @@ export function useThread(
           // screencast frame: the stream is armed pre-navigation and can
           // freeze on the launch placeholder for direct opens.
           finalFrame: outcome.finalFrame ?? null,
+          // Human-verification gate instead of the destination: the card
+          // offers headed takeover so the user solves it once.
+          challenge: outcome.challenge ?? null,
         });
       } catch (error) {
         fail(id, error);

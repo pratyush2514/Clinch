@@ -33,7 +33,7 @@ export default function ActionThread({
   onRename: (entryId: string, saveName: string) => void;
   onSave: (entryId: string) => void;
   onFile: (entryId: string, chip: OutputChip, reveal: boolean) => void;
-  onTakeControl: () => void;
+  onTakeControl: (url?: string) => void;
   onRelease: () => void;
   onConnect: () => void;
   onSaveShortcut: (entryId: string) => void;

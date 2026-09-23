@@ -133,7 +133,7 @@ export default function App() {
         onRename={thread.rename}
         onSave={id => void thread.save(id)}
         onFile={(id, chip, reveal) => void thread.openFile(id, chip, reveal)}
-        onTakeControl={() => void screencast.takeControl()}
+        onTakeControl={url => void screencast.takeControl(url)}
         onRelease={() => void screencast.release()}
         onConnect={() => setSessionOpen(true)}
         onSaveShortcut={id => void thread.saveShortcut(id)}
@@ -179,7 +179,7 @@ export default function App() {
         onReauthenticate={() => void reauthenticate()}
         onReplayPlaybook={playbook => void thread.replayPlaybook(playbook)}
         onReplayMacro={workflow => void thread.replayMacro(workflow, portal)}
-        onTakeControl={() => void screencast.takeControl()}
+        onTakeControl={url => void screencast.takeControl(url)}
         onRelease={() => void screencast.release()}
         onCloseBrowser={() => void closeBrowser()}
       />

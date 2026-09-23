@@ -48,7 +48,7 @@ export default function CommandPalette({
   onReauthenticate: () => void;
   onReplayPlaybook: (playbook: PlaybookSummary) => void;
   onReplayMacro: (workflow: string) => void;
-  onTakeControl: () => void;
+  onTakeControl: (url?: string) => void;
   onRelease: () => void;
   onCloseBrowser: () => void;
 }) {

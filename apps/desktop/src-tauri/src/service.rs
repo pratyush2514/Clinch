@@ -408,6 +408,14 @@ pub struct DispatchOutcome {
     /// capture fails — the run outcome is unaffected. Additive: older
     /// clients ignore unknown keys.
     final_frame: Option<String>,
+    /// The page URL when the settled run landed on a bot-mitigation
+    /// interstitial (Cloudflare / Turnstile / reCAPTCHA human-verification
+    /// gate) instead of the destination. `Some` only for completed runs;
+    /// the thread routes the human check to the user via headed takeover
+    /// rather than silently completing on a CAPTCHA page. `None` means no
+    /// challenge markers were found (or no browser was attached). Additive:
+    /// older clients ignore unknown keys.
+    challenge: Option<String>,
 }
 
 /// POC health metrics for local testing: playbook runs, macro-replay share
@@ -1688,7 +1696,9 @@ impl AppService {
                     route_log: None,
                     telemetry_log: Some(line.to_owned()),
                     // Lifecycle commands show no page: no final frame.
+                    // Lifecycle commands show no page: no challenge to detect.
                     final_frame: None,
+                    challenge: None,
                 })
             }
         }
@@ -1810,6 +1820,14 @@ impl AppService {
         // navigation, so without this the settled card freezes on the
         // launch placeholder instead of showing the destination.
         outcome.final_frame = self.capture_final_frame().await;
+        // A completed run that landed on a human-verification gate is not
+        // a silent success: surface the challenge URL so the thread can
+        // route the check to the user (headed takeover, solved once, the
+        // profile keeps the clearance) instead of completing on a CAPTCHA
+        // page.
+        if outcome.result.status == orchestration_engine::SequenceStatus::Completed {
+            outcome.challenge = self.detect_challenge().await;
+        }
         Ok(outcome)
     }
 
@@ -1939,7 +1957,10 @@ impl AppService {
             telemetry_log: None,
             // Saved replays render the live screencast while running; the
             // settled card keeps the last live frame.
+            // Saved replays report the live page as-is; challenge
+            // detection is an ad-hoc-lane concern.
             final_frame: None,
+            challenge: None,
         })
     }
 
@@ -2423,7 +2444,10 @@ impl AppService {
                 telemetry_log,
                 // The ad-hoc auto-acquire lane captures the final frame
                 // after delegation returns; this inner outcome carries none.
+                // Inner outcome: the ad-hoc lane detects challenges after
+                // delegation returns.
                 final_frame: None,
+                challenge: None,
             });
         }
         self.verify_bridge_auth(&portal).await?;
@@ -2459,7 +2483,10 @@ impl AppService {
             telemetry_log,
             // The ad-hoc auto-acquire lane captures the final frame after
             // delegation returns; this inner outcome carries none itself.
+            // Inner outcome: the ad-hoc lane detects challenges after
+            // delegation returns.
             final_frame: None,
+            challenge: None,
         })
     }
 
@@ -2970,7 +2997,10 @@ impl AppService {
             telemetry_log,
             // Batch outcomes settle through the ad-hoc lane, which captures
             // the final frame once after delegation.
+            // Batch outcomes settle through the ad-hoc lane, which detects
+            // challenges once after delegation.
             final_frame: None,
+            challenge: None,
         }
     }
 
@@ -3143,6 +3173,20 @@ impl AppService {
         browser.viewport().await.ok().map(|viewport| viewport.data)
     }
 
+    /// Best-effort bot-challenge verdict on the attached browser's live
+    /// page: `Some(url)` when the page looks like a human-verification
+    /// interstitial rather than the destination. Peeks at the live session
+    /// without launching; `None` when no browser is attached or detection
+    /// fails — never a false challenge.
+    async fn detect_challenge(&self) -> Option<String> {
+        let browser = self
+            .browser
+            .lock()
+            .ok()
+            .and_then(|guard| (*guard).clone())?;
+        browser.challenge_detected().await
+    }
+
     /// Lazily attach the app-owned background Chromium (headless: no OS
     /// window, dedicated Clinch profile) and stream its viewport into
     /// `emit` until released, retaken, or re-acquired. Reuses the live
@@ -3211,10 +3255,30 @@ impl AppService {
     /// Hand the managed browser to the user: switch to a headed window on
     /// the same profile (cookies preserved by the restart path) so it is
     /// directly interactive. Streaming, if active, keeps running for the
-    /// preview card.
-    pub async fn take_control(&self) -> Result<ContextStatus, AppError> {
+    /// preview card. When `url` is given it must be an absolute HTTPS URL
+    /// without credentials; the headed window opens directly on it. This is
+    /// the challenge-takeover path: the user solves a human-verification
+    /// gate once in a real window, and the shared profile keeps the
+    /// clearance for later headless runs.
+    pub async fn take_control(&self, url: Option<String>) -> Result<ContextStatus, AppError> {
         // The one and only path that may put a window on screen.
         let browser = self.browser(BrowserIntent::Interactive).await?;
+        if let Some(url) = url {
+            if !orchestration_engine::entry_url_valid(
+                Some(orchestration_engine::RouteSource::ExplicitDomain),
+                &url,
+            ) {
+                return Err(AppError::InvalidInput(
+                    "Takeover needs an absolute HTTPS page URL without credentials.",
+                ));
+            }
+            let parsed = url::Url::parse(&url)
+                .map_err(|_| AppError::InvalidInput("Takeover needs a valid page URL."))?;
+            browser
+                .navigate(&parsed)
+                .await
+                .map_err(|_| AppError::BrowserUnavailable)?;
+        }
         Ok(ContextStatus {
             attached: true,
             headless: browser.is_headless(),

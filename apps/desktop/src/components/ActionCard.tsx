@@ -1,3 +1,4 @@
+import ChallengeCard from "./ChallengeCard";
 import OutcomeCard from "./OutcomeCard";
 import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
@@ -44,7 +45,7 @@ export default function ActionCard({
   onRename: (saveName: string) => void;
   onSave: () => void;
   onFile: (chip: OutputChip, reveal: boolean) => void;
-  onTakeControl: () => void;
+  onTakeControl: (url?: string) => void;
   onRelease: () => void;
   onConnect: () => void;
   onSaveShortcut: () => void;
@@ -88,6 +89,13 @@ export default function ActionCard({
         </ol>
       )}
       {entry.gate && <SentinelGate gate={entry.gate} onDecide={onDecide} />}
+      {entry.challenge && (
+        <ChallengeCard
+          url={entry.challenge}
+          busy={browserBusy}
+          onTakeControl={url => onTakeControl(url)}
+        />
+      )}
       {entry.shortcutOffer && !entry.shortcutDismissed && (
         entry.shortcutSaved ? (
           <p className="target">

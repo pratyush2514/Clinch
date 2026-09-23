@@ -75,8 +75,11 @@ async fn release_browser_context(state: tauri::State<'_, AppService>) -> Result<
     state.release_context().await
 }
 #[tauri::command]
-async fn take_control(state: tauri::State<'_, AppService>) -> Result<ContextStatus, AppError> {
-    state.take_control().await
+async fn take_control(
+    state: tauri::State<'_, AppService>,
+    url: Option<String>,
+) -> Result<ContextStatus, AppError> {
+    state.take_control(url).await
 }
 // Tauri's CommandArg contract requires the State wrapper by value.
 #[allow(clippy::needless_pass_by_value)]

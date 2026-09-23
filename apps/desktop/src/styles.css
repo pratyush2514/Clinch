@@ -109,6 +109,11 @@ li small { display: block; color: #737a66; margin-top: 3px; }
 .shortcut-offer { margin-top: 18px; border-top: 1px solid #e0e1d7; padding-top: 18px; }
 .shortcut-offer p { font-size: 12px; margin: 0 0 10px; }
 .shortcut-offer code { font-size: 10px; overflow-wrap: anywhere; }
+/* Human-verification handoff: same cadence as the shortcut offer, but the
+   ask is a headed takeover, not persistence — nothing is saved here. */
+.challenge-offer { margin-top: 18px; border-top: 1px solid #e0e1d7; padding-top: 18px; }
+.challenge-offer p { font-size: 12px; margin: 0 0 10px; }
+.challenge-offer code { font-size: 10px; overflow-wrap: anywhere; }
 
 /* ── Composer ──────────────────────────────────────────────────────────── */
 .composer { margin: 0; padding: 14px 36px 22px; }

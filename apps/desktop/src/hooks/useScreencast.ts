@@ -22,7 +22,7 @@ export type Screencast = {
   busy: boolean;
   /** Attach the background context if it is not already live. Throws on failure. */
   ensure: () => Promise<void>;
-  takeControl: () => Promise<void>;
+  takeControl: (url?: string) => Promise<void>;
   release: () => Promise<void>;
 };
 
@@ -77,17 +77,24 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
     setStatus(next);
   }, []);
 
-  const takeControl = useCallback(async () => {
-    setBusy(true);
-    try {
-      setStatus(await invoke<ContextStatus>("take_control"));
-      report("Managed Chromium is now headful — interact with its window directly.");
-    } catch (error) {
-      report(message(error));
-    } finally {
-      setBusy(false);
-    }
-  }, [report]);
+  const takeControl = useCallback(
+    async (url?: string) => {
+      setBusy(true);
+      try {
+        setStatus(await invoke<ContextStatus>("take_control", { url: url ?? null }));
+        report(
+          url
+            ? "Managed Chromium is now headful on the challenged page — solve the check in its window directly."
+            : "Managed Chromium is now headful — interact with its window directly.",
+        );
+      } catch (error) {
+        report(message(error));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [report],
+  );
 
   const release = useCallback(async () => {
     setBusy(true);

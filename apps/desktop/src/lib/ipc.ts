@@ -103,6 +103,8 @@ export type DispatchOutcome = {
   telemetryLog?: string | null;
   /** One-shot JPEG viewport (base64) captured when the run settled. */
   finalFrame?: string | null;
+  /** Page URL when the run settled on a bot-mitigation interstitial. */
+  challenge?: string | null;
 };
 
 export type PlaybookSummary = {

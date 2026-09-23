@@ -4,6 +4,8 @@ Reconciled on 2026-09-22 against the current working tree, including uncommitted
 
 Addendum on 2026-09-23: entry-URL routing and the shortcut card changed after the 2026-09-22 reconciliation. Only the affected bullets below were updated; the rest of this file still describes the 2026-09-22 tree, and the Windows verification pass was not re-run for the addendum.
 
+Addendum on 2026-09-23 (challenge handoff): completed direct opens that land on a bot-mitigation interstitial (Cloudflare / Turnstile / reCAPTCHA human-verification gate) now surface a challenge card instead of silently completing on the CAPTCHA page. The backend detects challenge markers (title, challenge-platform URL, visible text) after the ad-hoc lane settles and carries the challenge URL on the outcome; the card offers headed takeover on the same profile, already on the challenged page, so the user solves the check once and the profile keeps the clearance. `take_control` accepts an optional HTTPS page URL for this path. No additional stealth flags were added: the launch already masks `navigator.webdriver` and disables `AutomationControlled`, and a headless CDP-driven Chromium remains distinguishable to Cloudflare — the human check is routed to the human by design.
+
 ## Implemented
 
 - Tauri v2/React desktop shell with resizable panes, session controls, command bar, workflow builder, task workspace, and approvals.

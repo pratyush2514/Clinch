@@ -98,6 +98,42 @@ pub fn detect_auth_signal(current: &Url, portal: &Url) -> AuthSignal {
     }
 }
 
+/// Whether the live page is a bot-mitigation interstitial rather than the
+/// destination: a human-verification gate (Cloudflare "Just a moment" /
+/// Turnstile, reCAPTCHA "I'm not a robot"). Pure so it stays hermetically
+/// testable; the async [`ManagedBrowser::challenge_detected`] feeds it the
+/// live title, URL, and visible text. Matching is case-insensitive and
+/// deliberately narrow — a login form is *not* a challenge.
+const CHALLENGE_TITLE_MARKERS: [&str; 4] = [
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "security verification",
+];
+const CHALLENGE_BODY_MARKERS: [&str; 5] = [
+    "verifying you are human",
+    "verify you are human",
+    "i'm not a robot",
+    "confirm you are human",
+    "complete the security check",
+];
+
+fn is_challenge_page(title: &str, url: &Url, body_text: &str) -> bool {
+    // Cloudflare's challenge-platform path is a strong signal on its own:
+    // the destination has not rendered yet.
+    if url.path().contains("/cdn-cgi/challenge-platform") {
+        return true;
+    }
+    let title = title.to_lowercase();
+    let body = body_text.to_lowercase();
+    CHALLENGE_TITLE_MARKERS
+        .iter()
+        .any(|marker| title.contains(marker))
+        || CHALLENGE_BODY_MARKERS
+            .iter()
+            .any(|marker| body.contains(marker))
+}
+
 impl ManagedBrowser {
     /// Re-read the live URL and classify it (cheap reauth poll for the panel).
     ///
@@ -112,6 +148,37 @@ impl ManagedBrowser {
             .ok_or(BrowserError::WrongOrigin)?;
         let current = Url::parse(&current).map_err(|_| BrowserError::WrongOrigin)?;
         Ok(detect_auth_signal(&current, portal))
+    }
+
+    /// Detect a bot-mitigation interstitial on the live page: returns the
+    /// page URL when the title, URL, or visible text says this is a
+    /// human-verification gate (Cloudflare "Just a moment" / Turnstile,
+    /// reCAPTCHA "I'm not a robot") rather than the destination itself.
+    /// The thread uses this to route the human check to the user — a headed
+    /// takeover where they solve it once — instead of silently completing
+    /// on a CAPTCHA page.
+    ///
+    /// Fail-closed: any CDP, timeout, or parse failure yields `None`, never
+    /// a false challenge. No flags are toggled here: the launch already
+    /// masks `navigator.webdriver` and disables `AutomationControlled`, and
+    /// Cloudflare still challenges headless CDP-driven Chromium on its
+    /// remaining signals — an arms race no launch flag wins.
+    pub async fn challenge_detected(&self) -> Option<String> {
+        let url = self.current_url().await.ok()??;
+        let pair = tokio::time::timeout(IO_TIMEOUT, async {
+            self.page
+                .evaluate(
+                    "([document.title, document.body ? document.body.innerText.slice(0, 4000) : ''])",
+                )
+                .await
+                .map_err(|_| BrowserError::Connection)?
+                .into_value::<[String; 2]>()
+                .map_err(|_| BrowserError::Connection)
+        })
+        .await
+        .ok()?
+        .ok()?;
+        is_challenge_page(&pair[0], &url, &pair[1]).then(|| url.to_string())
     }
 
     /// Resolve a backend node id to its viewport rectangle via
@@ -376,6 +443,52 @@ mod tests {
                 "{path} must stay authenticated"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_markers_match_bot_interstitials() -> Result<(), Box<dyn std::error::Error>> {
+        // Cloudflare "Just a moment" title.
+        assert!(is_challenge_page(
+            "Just a moment...",
+            &url("https://claude.ai/")?,
+            "Verifying you are human. This may take a few seconds.",
+        ));
+        // Turnstile body copy without a telling title.
+        assert!(is_challenge_page(
+            "claude.ai",
+            &url("https://claude.ai/")?,
+            "Please verify you are human to continue.",
+        ));
+        // reCAPTCHA wording.
+        assert!(is_challenge_page(
+            "Login",
+            &url("https://example.com/login")?,
+            "Please prove you're not a robot: I'm not a robot",
+        ));
+        // Cloudflare challenge-platform path alone is decisive.
+        assert!(is_challenge_page(
+            "example",
+            &url("https://example.com/cdn-cgi/challenge-platform/h/b")?,
+            "ordinary copy",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_markers_ignore_plain_pages_and_logins() -> Result<(), Box<dyn std::error::Error>> {
+        // A real destination page: no markers anywhere.
+        assert!(!is_challenge_page(
+            "Claude",
+            &url("https://claude.ai/login")?,
+            "Your thinking partner for big ambitions",
+        ));
+        // A login form is not a bot challenge.
+        assert!(!is_challenge_page(
+            "Sign in",
+            &url("https://example.com/signin")?,
+            "Enter your email to sign in",
+        ));
         Ok(())
     }
 

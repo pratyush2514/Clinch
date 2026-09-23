@@ -96,6 +96,12 @@ export type ThreadEntry = {
   notes: string[];
   /** Last screencast frame this entry saw, frozen once it settles. */
   frame: string | null;
+  /**
+   * Page URL when the run settled on a bot-mitigation interstitial
+   * (human-verification gate) instead of the destination. The thread
+   * offers headed takeover so the user solves the check once.
+   */
+  challenge: string | null;
   elapsedMs: number | null;
   result: EntryResult | null;
   saveName: string;
@@ -117,7 +123,7 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "rename"; id: string; saveName: string }
   | { type: "saved"; id: string; savedId: string }
@@ -159,6 +165,7 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           gate: null,
           notes: [],
           frame: null,
+          challenge: null,
           elapsedMs: null,
           result: null,
           saveName: "",
@@ -227,6 +234,9 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         // saw; without it the card would keep the last live frame, which
         // for direct opens is the launch placeholder.
         frame: action.finalFrame ?? entry.frame,
+        // A completed run that landed on a human-verification gate keeps
+        // the challenge URL so the thread can offer headed takeover.
+        challenge: action.challenge ?? null,
       }));
     case "failed":
       return patch(entries, action.id, entry => ({

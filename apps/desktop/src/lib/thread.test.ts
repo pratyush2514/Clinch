@@ -132,6 +132,49 @@ describe("threadReducer", () => {
     expect(settled[0].frame).toBe("live");
   });
 
+  it("carries the challenge URL onto the settled entry for takeover", () => {
+    // A completed run that landed on a human-verification gate keeps the
+    // challenge URL so the card can offer headed takeover.
+    const settled = fold([
+      SUBMIT,
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+        challenge: "https://claude.ai/login",
+      },
+    ]);
+    expect(settled[0].challenge).toBe("https://claude.ai/login");
+  });
+
+  it("leaves challenge null when the run settled on the destination", () => {
+    const settled = fold([
+      SUBMIT,
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+      },
+    ]);
+    expect(settled[0].challenge).toBeNull();
+  });
+
   it("prefers a backend-reported duration over the client stopwatch", () => {
     const [entry] = fold([
       SUBMIT,
