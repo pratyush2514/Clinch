@@ -39,9 +39,11 @@ The manual `bridge_sync` path (user-named portal sync through the interactive la
 
 ## Extension bridge
 
-The [MV3 manifest](../packages/extension-bridge/manifest.json) requests cookies, storage, activeTab, scripting, alarms, and all-URL host permissions. The desktop [WebSocket server](../apps/desktop/src-tauri/src/ws_server.rs) binds loopback port 9223 at startup, with lazy startup as a backstop.
+The [MV3 manifest](../packages/extension-bridge/manifest.json) requests cookies, storage, activeTab, scripting, alarms, offscreen, and all-URL host permissions. The desktop [WebSocket server](../apps/desktop/src-tauri/src/ws_server.rs) binds loopback port 9223 at startup, with lazy startup as a backstop.
 
-Desktop-initiated SYNC_SESSION requests have single-use identities, expiration, and server-side domain filtering. The extension returns scoped cookies and a user agent. Cookie contents are passed to CDP, not to model adapters or application journal rows.
+The bridge socket lives in an offscreen document, not the MV3 service worker: the worker suspends when idle and cannot hold a long-lived connection. A watchdog alarm in the service worker recreates the offscreen document; reconnect uses bounded exponential backoff and heartbeat PING/PONG frames carry correlated nonces. Each companion identifies itself in HELLO with browser brand and an installation ID minted at extension boot. The server tracks identity per connection, serves every accepted socket in its own task, evicts the oldest connection past the connection cap, and exposes one entry per connection through `bridge_status` — one entry per live browser, never a stale reconnect.
+
+Desktop-initiated SYNC_SESSION requests have single-use identities, expiration, and server-side domain filtering. `lend_session` accepts an optional `sourceConnectionId`: a valid selected connection receives the request exclusively; a stale ID falls back to broadcast. The extension reads cookies domain-scoped — `chrome.cookies.getAll({domain})` per scope root, exact requested domain first — and the existing authoritative post-read scope filter is kept. The extension returns scoped cookies and a user agent. Cookie contents are passed to CDP, not to model adapters or application journal rows. The extension options page is a read-only diagnostics surface — socket state, browser label, installation ID, last sync, and a loopback ping test — and never sends cookies anywhere.
 
 ## Task and macro contracts
 

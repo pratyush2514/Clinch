@@ -36,7 +36,7 @@ The bundled repair script does not implement this protocol. Without an intent pr
 5. Save a completed command-bar run and replay it from the saved list. A completed-run key is session-scoped; durable playbooks survive restart.
 6. For existing task macros, inspect downloaded files with Open File/Show in Folder. Test selector repair only against a controlled fixture or known test portal.
 
-To load the optional companion, use the source browser's extension developer mode and load `packages/extension-bridge` as an unpacked extension. Keep Clinch running for its loopback listener, then choose Sync via extension. This does not use the local-profile decryption path.
+To load the optional companion, use the source browser's extension developer mode and load `packages/extension-bridge` as an unpacked extension. Keep Clinch running for its loopback listener, then choose Sync via extension. This does not use the local-profile decryption path. The extension's options page is a read-only diagnostics surface — socket state, browser label, installation ID, last sync, and a loopback ping test — for checking a silent bridge without touching any cookies.
 
 ## Download and replay boundaries
 
