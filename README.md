@@ -30,7 +30,7 @@ Cmd/Ctrl+K currently opens a single **Connect a portal** item; natural-language 
 
 ## Browser and storage
 
-Chromium is a separate process with an app-owned persistent `browser-profile`, not an embedded interactive webview. The UI has a polled JPEG mirror and an optional CDP screencast. **Spin up browser** acquires a headless context; **Take Control** switches to a visible window. Task macro replay requires headless mode; session setup and semantic playbook execution use headed mode.
+Chromium is a separate process with an app-owned persistent `browser-profile`, not an embedded interactive webview. The UI has a polled JPEG mirror and an optional CDP screencast. **Spin up browser** acquires a background context; **Take Control** switches to a visible headed window on the current page. Background work — semantic playbook execution, direct opens, challenge escalation — runs **off-screen headed** (a real headed compositor positioned off-monitor and OS-hidden, no `--headless` flag): never a visible window, never headless. Task macro replay still requires true headless mode. A detected bot-mitigation challenge auto-escalates silently first, then offers a consent-gated session sync (Clinch keeps its own persistent copy of the login), and only then hands you Take Control; "Forget this site" revokes Clinch's copy at any time.
 
 Application data contains `clinch.db` (SQLite WAL), `macros/<workflow>.json`, download directories, and the Chromium profile. Playbooks store their steps in SQLite; they do not require an attached macro file. Imported cookie values and Safe Storage keys are not written to the application database. Source cookie databases are temporarily copied for reading, and Chromium manages persistence of its own cookies and storage.
 

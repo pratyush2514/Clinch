@@ -42,7 +42,7 @@ To load the optional companion, use the source browser's extension developer mod
 
 Extensionless files are inspected with infer using at most 512 bytes and finalized on CDP completion. Known formats gain an extension; existing extensions remain. Unknown formats, including CSV without a signature, may keep GUID-only names. Destination collisions fail without overwrite; older files are not migrated.
 
-Task macro replay switches to headless mode. Session setup, manual interaction, and current semantic playbook execution use a visible browser. Browser restarts preserve cookies in memory, not tab sessionStorage. The image preview does not forward user input.
+Task macro replay switches to headless mode. Session setup, manual interaction, and current semantic playbook execution use the browser service's launch modes: background work runs off-screen headed (no visible window, no `--headless` flag), interactive work runs visibly headed. Browser restarts preserve cookies in memory, not tab sessionStorage. The image preview does not forward user input.
 
 ## Checks
 

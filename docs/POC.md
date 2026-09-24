@@ -19,9 +19,9 @@ No fixture timing is a portal SLA. Cookie counts and URL classification are not 
 
 ## Existing instrumentation and gaps
 
-Task snapshots/checkpoints record task mode, step states, and timing. The runs table records playbook/ephemeral summaries; session_events records sync outcomes and diagnostics. get_poc_metrics returns status counts and completed-task replay share.
+Task snapshots/checkpoints record task mode, step states, and timing. The runs table records playbook/ephemeral summaries; session_events records sync outcomes and diagnostics. Session lends journal `session_lent:`/`session_lend_failed:` lines with host, cookie counts, and outcome labels (`cleared`, `persistent`, `not synced`, `synced (persisted)`), so lend attempts and challenge-escalation outcomes are countable. get_poc_metrics returns status counts and completed-task replay share.
 
-These do not measure time-to-first-success, human correction rate, authenticated sync success, voluntary reuse, account health, or two-month time savings. Playbook approvals are text journal events rather than the task lane's dedicated decision rows. Capture pilot evidence separately and do not infer missing metrics from counters.
+These do not measure time-to-first-success, human correction rate, voluntary reuse, account health, or two-month time savings. Playbook approvals are text journal events rather than the task lane's dedicated decision rows. Capture pilot evidence separately and do not infer missing metrics from counters.
 
 ## Possible later product pilot
 

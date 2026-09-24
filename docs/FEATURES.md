@@ -8,7 +8,10 @@ This inventory follows current code. It does not imply real-portal acceptance or
 - Profile fallback, temporary cookie database/WAL copies, CBC/GCM decryption, scoped SSO cookie selection, best-effort localStorage hydration, and user-agent mirroring.
 - Companion-extension session sync over loopback.
 - Manual login in the managed Chromium window, with an in-app status/continue panel for reauthentication.
-- Polled JPEG viewport with target highlights and an optional live screencast; headless context acquisition, release, and headed takeover.
+- **Bot-mitigation handoff ladder.** A detected challenge first auto-escalates silently (L1: the session restarts off-screen headed and polls ~30s for clearance), then surfaces a consent-gated session-sync card (L1.5), and only then offers Take Control (L2) — a headed managed window already on the challenged page. A cleared L1 escalation is stood down with no visible window left behind. Interactive gates automation cannot clear skip the L1 wait and go straight to the card.
+- **Session lending.** A consent-gated one-way sync of a site's cookies from the Companion extension in the daily browser into Clinch's app-owned profile, offered from a challenge card or a signed-out landing. A tap is consent for exactly one attempt; the server's exact cookie expiry is preserved (persistent-by-default; true session cookies stay session-only); nothing is written back to the daily browser. A confirmed login shows `synced (persisted)`; a later logged-out probe brings the offer back. Journals record host and cookie counts only.
+- **"Forget this site".** Deletes the site's cookies from Clinch's profile via CDP and returns the sync card to the signed-out offer; the daily browser is untouched.
+- Polled JPEG viewport with target highlights and an optional live screencast; headless context acquisition, release, and headed takeover. **Open Preview** raises a near-fullscreen overlay dressed as a browser window (tab title, URL pill with secure icon, live/final badge): live streaming on a running entry, the frozen final frame on a settled one.
 
 Import cannot promise zero re-login, zero 2FA, or anti-bot acceptance. A source browser's unsupported encryption falls back to manual login.
 
@@ -19,7 +22,7 @@ Import cannot promise zero re-login, zero 2FA, or anti-bot acceptance. A source 
 - Workflow builder saves role/label semantic steps, previews a live match, and lists/runs saved playbooks.
 - Command bar resolves saved playbooks or ad-hoc single/batch intents. Optional intent-provider parsing is available; default parsing is deterministic.
 - Semantic matching uses labels and surrounding text, with support for contextual identifiers, ordinals, and plural targets. Execution clicks the grounded control; selecting a textbox role is not a general form-filling feature.
-- Direct-open entry routing resolves `open X` without a curated table: a saved site shortcut, the fenced domain grounder, or a structured site directory — otherwise an honest miss that asks the user rather than scraping a search page. After a grounded landing, the Action Thread offers a consent-gated shortcut save; accepted shortcuts resolve with zero model calls on later runs. This is not unrestricted site discovery or a model-generated browsing plan.
+- Direct-open entry routing resolves `open X` without a curated table: a saved site shortcut, a structured site directory (Brave API when configured, keyless DuckDuckGo otherwise), or the fenced domain grounder — otherwise an honest miss that asks the user rather than scraping a search page. After a grounded landing, the Action Thread offers a consent-gated shortcut save; accepted shortcuts resolve with zero model calls on later runs. This is not unrestricted site discovery or a model-generated browsing plan.
 - Plural execution caps candidates at 30 and uses batch plus per-click approvals.
 - Completed command-bar runs can be saved by run ID, with an optional description. Playbooks persist in SQLite and replay from the workflow list.
 

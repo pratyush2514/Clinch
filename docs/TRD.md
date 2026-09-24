@@ -1,14 +1,12 @@
 # Clinch technical contracts
 
-Reconciled against working-tree code on 2026-09-22. Implementation references below take precedence over this summary.
-
-Addendum on 2026-09-23: the entry-route and provider-contract paragraphs below were updated for the route-table deletion and the domain-grounder wiring; the rest still reflects the 2026-09-22 tree.
+Reconciled against working-tree code on 2026-09-24. Implementation references below take precedence over this summary.
 
 ## Desktop and browser
 
 [Command registration](../apps/desktop/src-tauri/src/lib.rs) defines the IPC surface. [AppService](../apps/desktop/src-tauri/src/service.rs) wires commands to browser, storage, task, and playbook operations. Task/playbook progress uses typed Tauri Channels; screencast frames use events.
 
-[ManagedBrowser](../packages/browser-driver/src/lib.rs) launches an installed Chromium with an app-owned profile and loopback CDP. `LaunchOptions::interactive()` is headed and `replay()` is headless. Task replay refuses a headed browser. Playbook `run_steps` and semantic dispatch currently use headed mode. Mode changes restart the browser and transfer cookies in memory; tab sessionStorage is not transferred.
+[ManagedBrowser](../packages/browser-driver/src/lib.rs) launches an installed Chromium with an app-owned profile and loopback CDP. `LaunchOptions::interactive()` is visibly headed (manual login, Take Control, user-named session sync); `LaunchOptions::replay()` is true headless for task macro replay, which refuses a headed browser. Everything the desktop service runs in the background — playbook `run_steps`, semantic dispatch, direct opens, challenge escalation — uses off-screen headed (`LaunchOptions::offscreen_headed()`): a real headed compositor positioned off-monitor and OS-hidden, never a visible window. Mode changes restart the browser and transfer cookies in memory; tab sessionStorage is not transferred.
 
 The UI uses Tauri's native webview for React and JPEG images for the browser mirror. Neither native Chromium embedding nor input forwarding through the image is implemented. Bundling is disabled in the Tauri configuration.
 
@@ -24,7 +22,20 @@ The service bounds key access to 120 seconds and profile reads to 15 seconds. A 
 
 Best-effort localStorage extraction seeds missing keys, and source user-agent lookup can mirror browser identity. Imported secrets are not stored in `clinch.db`; Chromium owns persistence within its profile. Prompts and grounding diagnostics may appear in local session logs or saved intents, so the database is not restricted to counts-only metadata.
 
-[Auth classification](../packages/browser-driver/src/session.rs) checks URL origin and login path segments, distinguishing known SSO from unknown foreign origins. It does not inspect authenticated account state. Manual-login readiness requires the user to finish signing in. The bridge auth probe rejects explicit NoCookies replies but otherwise permits continuation, including when no extension is connected.
+[Auth classification](../packages/browser-driver/src/session.rs) checks URL origin and login path segments, distinguishing known SSO from unknown foreign origins; known SSO is still pending auth until returning to the portal. The URL classifier is a heuristic, not proof of account access. Separately, the settle-time [auth-state probe](../packages/browser-driver/src/session.rs) (`auth_state()`) DOES inspect the landed page for authenticated state: it reads the URL, title, and up to 4,000 characters of visible text, fails open to `Unknown` on any probe failure, always runs after (and is outranked by) challenge detection, requires at least two distinct guest markers for a logged-out verdict, and lets authenticated copy (e.g. `log out`/`sign out`) win over guest markers. Cookie presence alone never proves authentication.
+
+## Session-lending and revocation contracts
+
+Session lending is the consent-gated, one-way (daily browser → Clinch managed profile, never write-back) transfer of a site's cookies from the Clinch Companion extension. Contract terms, all enforced in `AppService`/`BridgeServer`:
+
+- **Consent and scope:** a sync-card tap is consent for exactly one lend attempt per run; repeat taps replay the stored `LendOutcome`. Desktop-initiated SYNC_SESSION requests carry single-use identities, expiration, and a server-side domain filter matched against the run's settled URL. Cookie values are passed to CDP, never to model adapters or application journal rows.
+- **Persistence:** injection preserves the server's exact cookie expiry (persistent-by-default); Chromium owns persistence in the app profile's cookie database. Cookies without an expiry remain true session cookies. No artificial lifetime is invented.
+- **Origin-aware verification:** `SessionLendOrigin::{Challenge, GuestLanding}` tags the lend. A challenge lend re-probes the gate after re-navigation (cleared → challenge done, else `persistent`); a guest-landing lend re-probes auth state (`synced (persisted)` on `AuthState::Authenticated`, else `not synced`). A later run whose probe sees a logged-out landing brings the sync offer back — self-healing.
+- **Identity:** the managed browser mirrors the source user-agent before injection; a mismatched UA aborts the lend.
+- **Failure semantics:** every exit journals exactly one `session_lent:`/`session_lend_failed:` line with host and cookie counts only. Zero cookies from the companion keeps the card with a "no usable cookies" reason (it does not prove the daily browser is logged out). Failure reasons map to static user-facing labels: extension not connected, extension timed out, no cookies for the portal, injection failure, re-navigation failure.
+- **Revocation:** `forget_site_session` deletes the host's cookies from Clinch's app-owned profile through CDP, journaling host and cookie count, and returns the card to the signed-out offer. It never touches the daily browser.
+
+The manual `bridge_sync` path (user-named portal sync through the interactive lane) keeps its own contract: request first (a missing companion fails fast without opening a window), visible headed browser because the landing may need the user to finish a login or challenge, UA mirroring before injection.
 
 ## Extension bridge
 

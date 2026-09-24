@@ -1,8 +1,6 @@
 # Clinch product scope
 
-Owner: Pratyush. Reconciled 2026-09-22 against current code.
-
-Addendum on 2026-09-23: the direct-open journey and routing contract below were added for the domain grounder and shortcut card; the rest still reflects the 2026-09-22 tree.
+Owner: Pratyush. Reconciled 2026-09-24 against current code.
 
 ## Product purpose
 
@@ -16,13 +14,17 @@ Clinch provides a local desktop workspace for repeatable browser actions, visibl
 4. Replay an existing selector macro by workflow name in the task workspace. Review step state, repair failures, and downloaded-file results.
 5. Observe browser frames and switch a headless context to a visible managed window for manual interaction.
 6. Open a site directly from the command bar (`open amazon for me`): the resolver grounds the site name to a domain without showing search results. After a successful first landing, optionally save it as a site shortcut so later prompts open it with no model call.
+7. Land on a bot-mitigation challenge (`open claude for me` hitting Turnstile): the run auto-escalates silently first (off-screen headed, ~30s), then offers a consent-gated session sync from the Companion extension in your daily browser, then hands you a headed managed window to solve it once (Take Control). Only the human fallback is ever visible.
+8. Land signed out on a site you normally use (`open reddit for me` while logged out in Clinch): instead of a bare "completed", the card offers a one-tap sync of your login from the daily browser. Sync once and Clinch keeps its own persistent copy in its profile — signing out in the daily browser does not sign Clinch out. "Forget this site" revokes Clinch's copy at any time.
+9. Enlarge any settled run's final frame with Open Preview: a near-fullscreen browser-chrome view (tab title, URL pill, live/final badge) for reading what the run saw.
 
 The task form no longer collects first-run selectors. Backend script planning remains available, but a new workflow name in that form is not enough to record a macro.
 
 ## Implemented product contracts
 
 - Session import requires explicit consent; manual login remains available when import cannot proceed.
-- Browser execution happens locally in a separate managed Chromium process. The preview is an image surface, not an interactive embedded browser.
+- Session lending (challenge card or auth-sync card) is one-way, domain-scoped, and consent-gated: a tap syncs the site's cookies from the daily browser's Companion extension into Clinch's app-owned profile, preserving the server's exact expiry; the daily browser profile is never attached, copied, or written back. "Forget this site" deletes Clinch's copy of the site's cookies.
+- Browser execution happens locally in a separate managed Chromium process. The preview is an image surface, not an interactive embedded browser. Background work runs off-screen headed with no visible window; the human fallback (Take Control) is the only path that puts a window on screen.
 - Saved macro replay avoids planning calls when selectors resolve. Optional intent parsing and task selector repair may invoke configured adapters. Direct-open routing may invoke the fenced domain grounder (Groq/Ollama, env-configured); it returns only a bare domain, validated in Rust before navigation, and declines cleanly when unconfigured or offline.
 - Legacy click/fill/submit actions and semantic intents require approvals. There is no universal risk-classification engine.
 - Tasks persist checkpoints and stop on uncertainty; interrupted tasks are not automatically resumed.
