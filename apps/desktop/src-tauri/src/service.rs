@@ -1321,17 +1321,33 @@ impl AppService {
                         "not synced",
                         Some("A human check appeared after syncing.".to_owned()),
                     )
-                } else if browser.auth_state().await == AuthState::Authenticated {
-                    (true, "synced (persisted)", None)
                 } else {
-                    (
-                        false,
-                        "not synced",
-                        Some(
-                            "Still logged out after syncing — the companion may not hold a session for this site."
-                                .to_owned(),
+                    // Three-way reading, not two: Authenticated confirms the
+                    // session took; LoggedOut means the guest prompts are
+                    // still there, so the transferred cookies were not a
+                    // session; Unknown means the guest prompts vanished but
+                    // no signed-in marker is visible — the page moved in the
+                    // login direction, so report it as unconfirmed rather
+                    // than as "still logged out". (Sites that keep "Log out"
+                    // behind an avatar menu never read as Authenticated.)
+                    match browser.auth_state().await {
+                        AuthState::Authenticated => (true, "synced (persisted)", None),
+                        AuthState::LoggedOut => (
+                            false,
+                            "not synced",
+                            Some(
+                                "Still logged out after syncing — the companion may not hold a session for this site."
+                                    .to_owned(),
+                            ),
                         ),
-                    )
+                        AuthState::Unknown => (
+                            false,
+                            "unconfirmed",
+                            Some(format!(
+                                "Synced {count} cookies and the page no longer shows logged-out prompts, but no signed-in state is visible — the session may have applied. Re-run the open to confirm."
+                            )),
+                        ),
+                    }
                 }
             }
         };
