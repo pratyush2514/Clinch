@@ -26,6 +26,7 @@
  * - STATUS_PING_QUERY {nonce}                 -> this document (status page)
  * - STATUS_PING_PONG {nonce, ok, rttMs}       -> status page (from here)
  *
+ */
 
 const SOCKET_URL = "ws://127.0.0.1:9223";
 const RECONNECT_CAP_MS = 30_000;
