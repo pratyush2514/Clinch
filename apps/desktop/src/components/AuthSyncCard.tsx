@@ -19,7 +19,7 @@ import ForgetSiteButton from "./ForgetSiteButton";
  */
 export default function AuthSyncCard({
   url,
-  runId,
+  lendId,
   busy,
   auth,
   onTakeControl,
@@ -27,7 +27,7 @@ export default function AuthSyncCard({
   onForgetSession,
 }: {
   url: string;
-  runId: string | null;
+  lendId: string | null;
   busy: boolean;
   auth: AuthUiState | null;
   onTakeControl: (url: string) => void;
@@ -74,8 +74,8 @@ export default function AuthSyncCard({
         <button
           className="primary"
           type="button"
-          disabled={working || !runId}
-          onClick={() => runId && onSyncSession(runId)}
+          disabled={working || !lendId}
+          onClick={() => lendId && onSyncSession(lendId)}
         >
           {auth?.status === "busy" ? "Syncing…" : `Sync my ${host} session`}
         </button>

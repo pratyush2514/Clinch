@@ -102,7 +102,7 @@ export default function ActionCard({
       {entry.challenge && (
         <ChallengeCard
           url={entry.challenge}
-          runId={entry.runId}
+          lendId={entry.lendId}
           busy={browserBusy}
           lend={entry.lend}
           onTakeControl={url => onTakeControl(url)}
@@ -113,7 +113,7 @@ export default function ActionCard({
       {!entry.challenge && entry.authUrl && (
         <AuthSyncCard
           url={entry.authUrl}
-          runId={entry.runId}
+          lendId={entry.lendId}
           busy={browserBusy}
           auth={entry.auth}
           onTakeControl={url => onTakeControl(url)}

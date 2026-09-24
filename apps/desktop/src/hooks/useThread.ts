@@ -206,8 +206,11 @@ export function useThread(
           // Clean signed-out guest landing: the thread renders the
           // auth-sync card.
           authUrl: outcome.authUrl ?? null,
-          // Backend run id so the challenge card can lend a session.
+          // Backend run id so remembered runs can be saved as workflows.
           runId: outcome.runId ?? null,
+          // Session-lending registry key for the challenge and auth-sync
+          // card taps; decoupled from runId on purpose.
+          lendId: outcome.lendId ?? null,
           // Settle-time page description for the preview overlay chrome.
           finalUrl: outcome.finalUrl ?? null,
           pageTitle: outcome.pageTitle ?? null,

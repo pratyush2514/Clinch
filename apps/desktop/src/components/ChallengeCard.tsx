@@ -20,7 +20,7 @@ import ForgetSiteButton from "./ForgetSiteButton";
  */
 export default function ChallengeCard({
   url,
-  runId,
+  lendId,
   busy,
   lend,
   onTakeControl,
@@ -28,7 +28,7 @@ export default function ChallengeCard({
   onForgetSession,
 }: {
   url: string;
-  runId: string | null;
+  lendId: string | null;
   busy: boolean;
   lend: LendUiState | null;
   onTakeControl: (url: string) => void;
@@ -76,8 +76,8 @@ export default function ChallengeCard({
         <button
           className="primary"
           type="button"
-          disabled={working || !runId}
-          onClick={() => runId && onLendSession(runId)}
+          disabled={working || !lendId}
+          onClick={() => lendId && onLendSession(lendId)}
         >
           {lend?.status === "busy" ? "Syncing…" : `Sync my ${host} session`}
         </button>

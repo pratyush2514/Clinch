@@ -107,8 +107,12 @@ export type ThreadEntry = {
    * same lend registry the challenge card uses. Absent means the page
    * read as authenticated or unclassifiable. */
   authUrl: string | null;
-  /** Backend run id for challenged runs, so the card can lend a session. */
+  /** Backend run id for save-as-workflow on remembered runs. */
   runId: string | null;
+  /** Session-lending registry key for this entry's challenge or auth-sync
+   * card tap. Decoupled from `runId`: pure direct opens are deliberately
+   * not remembered, but their card tap still carries a key. */
+  lendId: string | null;
   /** L1.5 session-lend state for this entry's challenge card. */
   lend: LendUiState | null;
   /** Synced-session state for this entry's auth-sync card. */
@@ -160,7 +164,7 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; authUrl?: string | null; runId?: string | null; finalUrl?: string | null; pageTitle?: string | null }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; authUrl?: string | null; runId?: string | null; lendId?: string | null; finalUrl?: string | null; pageTitle?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "lendState"; id: string; lend: LendUiState }
   | { type: "authState"; id: string; auth: AuthUiState | null }
@@ -207,6 +211,7 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           challenge: null,
           authUrl: null,
           runId: null,
+          lendId: null,
           lend: null,
           auth: null,
           /** Settle-time page URL/title for the preview overlay chrome. */
@@ -286,9 +291,12 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         // A completed run that landed on a clean signed-out guest landing
         // keeps the auth URL so the thread can render the auth-sync card.
         authUrl: action.authUrl ?? null,
-        // Backend run id travels so the challenge card can lend a session;
-        // a fresh settle resets any previous lend state.
+        // Backend run id travels so remembered runs can be saved as
+        // workflows; the lend id travels so the challenge and auth-sync
+        // cards can lend a session. A fresh settle resets any previous
+        // lend state.
         runId: action.runId ?? null,
+        lendId: action.lendId ?? null,
         lend: null,
         auth: null,
         // Settle-time page description for the preview overlay's browser

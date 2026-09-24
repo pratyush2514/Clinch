@@ -99,6 +99,10 @@ export type DispatchOutcome = {
   steps: unknown[];
   /** Registry key for `save_run_as_workflow`; absent unless remembered. */
   runId?: string | null;
+  /** Registry key for `lend_session` consent taps (challenge and auth-sync
+   * cards). Decoupled from `runId`: pure direct opens are deliberately not
+   * remembered for save-as-workflow, but their card tap still carries a key. */
+  lendId?: string | null;
   routeLog?: string | null;
   telemetryLog?: string | null;
   /** One-shot JPEG viewport (base64) captured when the run settled. */

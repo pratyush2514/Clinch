@@ -408,6 +408,14 @@ pub struct DispatchOutcome {
     /// replays and non-completed ephemerals. Additive to the IPC shape:
     /// older clients ignore unknown keys.
     run_id: Option<String>,
+    /// Session-lending registry key for `lend_session`: `Some` whenever
+    /// settle registered this run's page URL for a consent tap — a
+    /// challenge card or an auth-sync card. Deliberately decoupled from
+    /// `run_id`: pure direct opens are not remembered for save-as-workflow
+    /// (that would persist an empty graph), but their card tap still needs
+    /// a registry key, so settle synthesizes one when `run_id` is `None`.
+    /// Additive: older clients ignore unknown keys.
+    lend_id: Option<String>,
     /// Route telemetry for the Session Activity UI: the exact
     /// `route_proposed:…` / `route_resolution_miss:…` line recorded to
     /// `session_events`, so the command bar can render it immediately
@@ -506,6 +514,10 @@ pub struct AppService {
     /// Session memory only, capped like `completed_runs`.
     session_lends: Mutex<VecDeque<(String, SessionLendState)>>,
     next_playbook_run: AtomicU64,
+    /// Monotonic counter backing synthesized session-lending registry keys
+    /// (`lend-<n>`) for runs whose `run_id` is `None` — pure direct opens
+    /// are deliberately not remembered for save-as-workflow.
+    next_lend_id: AtomicU64,
     /// Fenced structured-intent parser consulted only when the deterministic
     /// grammar parse is not confident, and only for slots — never for URLs,
     /// selectors, or code.
@@ -598,6 +610,7 @@ impl AppService {
             completed_runs: Mutex::new(VecDeque::new()),
             session_lends: Mutex::new(VecDeque::new()),
             next_playbook_run: AtomicU64::new(1),
+            next_lend_id: AtomicU64::new(1),
             intent_parser: Arc::new(orchestration_engine::StubIntentParser),
         }
     }
@@ -2026,6 +2039,7 @@ impl AppService {
                     },
                     steps: Vec::new(),
                     run_id: None,
+                    lend_id: None,
                     route_log: None,
                     telemetry_log: Some(line.to_owned()),
                     // Lifecycle commands show no page: no final frame.
@@ -2181,19 +2195,24 @@ impl AppService {
                 .unwrap_or_else(|| challenge_url.clone());
             // Register the run for a possible consent tap before branching:
             // the lend command resolves the page URL from this registry,
-            // never from a frontend-supplied host string.
-            if let Some(run_id) = outcome.run_id.clone() {
-                self.remember_session_lend(
-                    run_id,
-                    challenge_url.clone(),
-                    SessionLendOrigin::Challenge,
-                );
-            }
+            // never from a frontend-supplied host string. The key is
+            // decoupled from the save-workflow run_id — pure direct opens
+            // are deliberately not remembered, so settle synthesizes a key
+            // for them.
+            let lend_id = outcome.run_id.clone().unwrap_or_else(|| {
+                format!("lend-{}", self.next_lend_id.fetch_add(1, Ordering::Relaxed))
+            });
+            self.remember_session_lend(
+                lend_id.clone(),
+                challenge_url.clone(),
+                SessionLendOrigin::Challenge,
+            );
             if kind == ChallengeKind::InteractiveGate {
                 self.journal_line(format!(
                     "challenge_detected: {host} · interactive gate (L1 skipped)"
                 ))
                 .await;
+                outcome.lend_id = Some(lend_id);
                 outcome.challenge = Some(challenge_url);
                 return;
             }
@@ -2222,6 +2241,7 @@ impl AppService {
                 Ok(false) => {
                     self.journal_line(format!("challenge_auto_escalated: {host} · persistent"))
                         .await;
+                    outcome.lend_id = Some(lend_id.clone());
                     outcome.challenge = Some(challenge_url);
                 }
                 Err(err) => {
@@ -2237,6 +2257,7 @@ impl AppService {
                         "challenge_auto_escalated: {host} · failed ({detail})"
                     ))
                     .await;
+                    outcome.lend_id = Some(lend_id);
                     outcome.challenge = Some(challenge_url);
                 }
             }
@@ -2265,16 +2286,21 @@ impl AppService {
                             .ok()
                             .and_then(|url| url.host_str().map(str::to_owned))
                             .unwrap_or_else(|| page_url.clone());
-                        // Only offer the card when the tap can actually run: the
-                        // lend command resolves the page URL from this registry.
-                        if let Some(run_id) = outcome.run_id.clone() {
-                            self.remember_session_lend(
-                                run_id,
-                                page_url.clone(),
-                                SessionLendOrigin::GuestLanding,
-                            );
-                            outcome.auth_url = Some(page_url);
-                        }
+                        // The lend command resolves the page URL from this registry,
+                        // never from a frontend-supplied host string. The key is
+                        // decoupled from the save-workflow run_id — pure direct
+                        // opens are deliberately not remembered, so settle
+                        // synthesizes a key for them.
+                        let lend_id = outcome.run_id.clone().unwrap_or_else(|| {
+                            format!("lend-{}", self.next_lend_id.fetch_add(1, Ordering::Relaxed))
+                        });
+                        self.remember_session_lend(
+                            lend_id.clone(),
+                            page_url.clone(),
+                            SessionLendOrigin::GuestLanding,
+                        );
+                        outcome.lend_id = Some(lend_id);
+                        outcome.auth_url = Some(page_url);
                         format!("auth_state_detected: {host} · logged out")
                     } else {
                         "auth_state_detected: logged out · no final url".to_string()
@@ -2415,6 +2441,7 @@ impl AppService {
             steps: playbook.steps.clone(),
             // Saved replays are already durable: nothing to remember.
             run_id: None,
+            lend_id: None,
             route_log: None,
             telemetry_log: None,
             // Saved replays render the live screencast while running; the
@@ -2907,6 +2934,7 @@ impl AppService {
                 },
                 steps: Vec::new(),
                 run_id: None,
+                lend_id: None,
                 route_log,
                 telemetry_log,
                 // Settle (final frame + L1 challenge handling) runs in
@@ -2947,6 +2975,7 @@ impl AppService {
             result,
             steps: playbook.steps.clone(),
             run_id,
+            lend_id: None,
             route_log,
             // Per-snapshot lines live inside the macro engine here, which
             // has no journal access — but the re-anchor line (if the anchor
@@ -3468,6 +3497,7 @@ impl AppService {
             // terminal state carries no key, so the UI offers no save.
             run_id: (status == orchestration_engine::SequenceStatus::Completed)
                 .then(|| journal_id.to_owned()),
+            lend_id: None,
             route_log,
             telemetry_log,
             // Settle (final frame + L1 challenge handling) runs in
