@@ -98,19 +98,27 @@ pub enum RouteSource {
 const SEARCH_BASE: &str = "https://www.google.com/search";
 
 /// Strip conversational filler from an ad-hoc prompt before it becomes a
-/// search query: `"open amazon for me."` → `"open amazon"`.
+/// search query: `"open amazon for me."` → `"amazon"`.
 ///
 /// Reuses the resolver's existing stopword vocabulary
 /// ([`crate::intent_resolver::content_tokens`]) instead of introducing a
 /// second filler list, so the words dropped here are exactly the words that
-/// already never identify a target anywhere else in the pipeline.
+/// already never identify a target anywhere else in the pipeline. Action
+/// verbs (`open`, `show`, `find`) are dropped too: the grounder fence
+/// already refuses to ground them, so `q='open profile reddit'` could never
+/// have answered anything — the query keeps only the words that can
+/// identify a destination.
 /// Tokenization splits on non-alphanumerics, so trailing punctuation never
 /// reaches the query either. Falls back to the trimmed prompt when filtering
 /// would leave nothing, keeping the tier total on non-empty input.
 #[must_use]
 pub fn sanitize_search_query(prompt: &str) -> String {
     let trimmed = prompt.trim();
-    let sanitized = crate::intent_resolver::content_tokens(trimmed).join(" ");
+    let sanitized = crate::intent_resolver::content_tokens(trimmed)
+        .into_iter()
+        .filter(|token| !crate::intent_resolver::is_action_verb(token))
+        .collect::<Vec<_>>()
+        .join(" ");
     if sanitized.is_empty() {
         trimmed.to_owned()
     } else {
@@ -129,7 +137,7 @@ pub fn search_fallback_url(prompt: &str) -> Option<String> {
         return None;
     }
     // `form_urlencoded` byte-serializes spaces as `+`, matching the
-    // `?q=open+amazon` contract.
+    // `?q=amazon` contract.
     let query: String = url::form_urlencoded::byte_serialize(sanitized.as_bytes()).collect();
     if query.is_empty() {
         return None;
@@ -791,9 +799,13 @@ pub fn resolve_slots(
 /// 3. Direct-open grounding ladder — saved shortcut, then fenced domain
 ///    grounder, then structured directory. An ungrounded site returns `None`
 ///    so the caller can ask the user instead of scraping a search page.
-/// 4. Grounded search fallback for prompts that are not direct opens, so
-///    `None` otherwise still means only an empty prompt or fail-closed
-///    validation.
+///    Prompts naming a site plus an artifact noun ("open my profile on the
+///    reddit") ground the site alone through the same ladder; the artifact
+///    is pursued on the live page, never searched. A site no rung knows
+///    falls through to Tier 4 below.
+/// 4. Grounded search fallback for prompts that are neither direct opens
+///    nor grounded site+artifact goals, so `None` otherwise still means
+///    only an empty prompt or fail-closed validation.
 #[must_use]
 pub fn resolve_entry_url(
     prompt: &str,
@@ -882,6 +894,52 @@ pub fn resolve_entry_url(
         // "try a full domain or save a site shortcut" — asking once beats
         // a scraped SERP that may be a challenge page or an ad.
         return None;
+    }
+    // Tier 3b: in-page goal — the prompt names a site and carries an
+    // artifact noun ("open my profile on the reddit"), so it is not a
+    // direct open and must never become a search query when the site
+    // grounds. Ground ONLY the site through the ladder; the artifact is
+    // pursued on the live page by the dispatcher, never searched. When no
+    // rung knows the site, fall through to Tier 4: with nothing to
+    // navigate to, the grounded search template is the designed last
+    // resort (and in production the directory rung below is always live,
+    // so this corner is theoretical).
+    //
+    // Coordinator veto mirrors `is_direct_open`: "open my profile on
+    // reddit and twitter" is a multi-target prompt and must not silently
+    // pursue one of its targets.
+    let coordinator = crate::intent_resolver::tokens(prompt)
+        .iter()
+        .any(|token| matches!(token.as_str(), "and" | "or"));
+    if !coordinator
+        && let (Some(site), Some(_artifact)) = (
+            grammar.site_context.as_deref(),
+            grammar.artifact_noun.as_deref(),
+        )
+    {
+        // 3a. User-saved site shortcut.
+        if let Some(store) = ctx.shortcuts
+            && let Some(url) = store.shortcut_url(site)
+            && let Some(route) = accept_user_directed(&url, RouteSource::Shortcut)
+        {
+            return Some(route);
+        }
+        // 3b. Structured site directory (Brave API / keyless DDG).
+        if let Some(client) = ctx.site_search
+            && let Some(url) = client.search_site(site)
+            && let Some(route) = accept_user_directed(&url, RouteSource::SiteSearch)
+        {
+            return Some(route);
+        }
+        // 3c. Fenced domain grounder.
+        if let Some(grounder) = ctx.domain_grounder
+            && let Some(domain) = grounder.ground_domain(site, ctx.region_hint)
+            && let Some(url) = validate_grounded_domain(&domain)
+            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
+        {
+            return Some(route);
+        }
+        // 3d. Site ungrounded: fall through to the Tier 4 search template.
     }
     // Tier 4: grounded search fallback — fixed template, no TLD guessing.
     // Only runs when no stronger tier proposed anything and the prompt is
@@ -1006,9 +1064,11 @@ mod tests {
         };
         assert_eq!(resolved.source, RouteSource::SearchFallback);
         // Search template helper is pure and total on non-empty prompts.
+        // Action verbs never reach the query: only words that can identify
+        // a destination do.
         assert_eq!(
             search_fallback_url("open amazon for me").as_deref(),
-            Some("https://www.google.com/search?q=open+amazon")
+            Some("https://www.google.com/search?q=amazon")
         );
         assert_eq!(search_fallback_url("   "), None);
         assert_eq!(search_fallback_url(""), None);
@@ -1019,21 +1079,19 @@ mod tests {
     #[test]
     fn search_query_sanitization_strips_filler_and_punctuation() {
         // The reported formatting bug: conversational filler and trailing
-        // punctuation must never reach `?q=`.
-        assert_eq!(sanitize_search_query("open amazon for me."), "open amazon");
-        assert_eq!(
-            sanitize_search_query("  please open amazon!  "),
-            "open amazon"
-        );
+        // punctuation must never reach `?q=`. Action verbs (`open`, `show`)
+        // are dropped too: they never identify a destination.
+        assert_eq!(sanitize_search_query("open amazon for me."), "amazon");
+        assert_eq!(sanitize_search_query("  please open amazon!  "), "amazon");
         // Only conversational filler goes (`my`). Prepositions that read
         // naturally in a query (`from`) are left alone: this strips noise,
         // it does not rewrite the user's search.
         assert_eq!(
             sanitize_search_query("download my invoices from github"),
-            "download invoices from github"
+            "invoices from github"
         );
         // Casing normalizes; multi-space collapses.
-        assert_eq!(sanitize_search_query("Open   AMAZON"), "open amazon");
+        assert_eq!(sanitize_search_query("Open   AMAZON"), "amazon");
         // A prompt made only of filler still searches something rather than
         // producing an empty query (keeps the tier total on non-empty input).
         assert_eq!(sanitize_search_query("please the"), "please the");
@@ -1041,8 +1099,80 @@ mod tests {
         // And the URL built from it carries the sanitized form verbatim.
         assert_eq!(
             search_fallback_url("open amazon for me.").as_deref(),
-            Some("https://www.google.com/search?q=open+amazon")
+            Some("https://www.google.com/search?q=amazon")
         );
+    }
+
+    struct StubSiteSearch {
+        answer: Option<String>,
+    }
+
+    impl SiteSearchClient for StubSiteSearch {
+        fn search_site(&self, _site_name: &str) -> Option<String> {
+            self.answer.clone()
+        }
+    }
+
+    fn in_page_ctx(search: &StubSiteSearch) -> ResolutionContext<'_> {
+        ResolutionContext {
+            account_dir: None,
+            llm: None,
+            parser: None,
+            shortcuts: None,
+            site_search: Some(search),
+            domain_grounder: None,
+            region_hint: "",
+        }
+    }
+
+    #[test]
+    fn in_page_goal_grounds_site_never_searches() {
+        // "open my profile on the reddit" names a site and carries an
+        // artifact noun: the ladder grounds the SITE, and the prompt must
+        // never become a search query. The artifact noun is the
+        // dispatcher's business, not the URL's.
+        let search = StubSiteSearch {
+            answer: Some("https://www.reddit.com/".to_owned()),
+        };
+        let Some(resolved) =
+            resolve_entry_url("open my profile on the reddit", None, &in_page_ctx(&search))
+        else {
+            panic!("in-page goal grounds the site");
+        };
+        assert_eq!(resolved.source, RouteSource::SiteSearch);
+        assert_eq!(resolved.url.as_str(), "https://www.reddit.com/");
+    }
+
+    #[test]
+    fn in_page_goal_with_ungrounded_site_keeps_search_fallback() {
+        // No rung knows the site and there is nowhere to navigate: the
+        // prompt keeps the grounded search template, the designed last
+        // resort. (In production the directory rung is always live via the
+        // keyless DDG fallback, so this corner is theoretical.)
+        let search = StubSiteSearch { answer: None };
+        let Some(resolved) =
+            resolve_entry_url("open my profile on the reddit", None, &in_page_ctx(&search))
+        else {
+            panic!("ungrounded site keeps search fallback");
+        };
+        assert_eq!(resolved.source, RouteSource::SearchFallback);
+    }
+
+    #[test]
+    fn in_page_goal_vetoes_coordinated_prompts() {
+        // "open my profile on reddit and twitter" is multi-target: it must
+        // not silently pursue one of its targets in-page.
+        let search = StubSiteSearch {
+            answer: Some("https://www.reddit.com/".to_owned()),
+        };
+        let Some(resolved) = resolve_entry_url(
+            "open my profile on reddit and twitter",
+            None,
+            &in_page_ctx(&search),
+        ) else {
+            panic!("coordinated prompt keeps a route");
+        };
+        assert_eq!(resolved.source, RouteSource::SearchFallback);
     }
 
     #[test]

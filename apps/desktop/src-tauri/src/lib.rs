@@ -452,7 +452,7 @@ mod tests {
             .map_err(|_| "events")?;
         assert!(
             events.iter().any(|outcome| outcome
-                == "route_fallback: search q='download all invoices from github' · url=https://www.google.com/search?q=download+all+invoices+from+github"),
+                == "route_fallback: search q='all invoices from github' · url=https://www.google.com/search?q=all+invoices+from+github"),
             "grounded search proposal logged, got {events:?}"
         );
         // No fabricated deep link reaches the journal: the destination is

@@ -172,9 +172,11 @@ async fn search_and_follow_survives_for_non_direct_opens() -> Result<(), Box<dyn
         return Err("grounded search resolves".into());
     };
     assert_eq!(route.source, RouteSource::SearchFallback);
+    // Action verbs never reach the query: only the words that can
+    // identify a destination do.
     assert_eq!(
         route.url.as_str(),
-        "https://www.google.com/search?q=find+amazon"
+        "https://www.google.com/search?q=amazon"
     );
     for guess in ["amazon.com", "amazon.in"] {
         assert!(!route.url.as_str().contains(guess), "no TLD guessing");

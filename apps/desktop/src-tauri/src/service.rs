@@ -2113,6 +2113,29 @@ impl AppService {
     /// observed from a real click on a real link rendered by the search
     /// engine, so there is no proposed host to validate. Confinement moves to
     /// that observed origin rather than trusting a predicted one.
+    /// Cold-start in-page goal for the ad-hoc lane: the prompt names a site
+    /// and carries an artifact noun, and the resolver grounded the site
+    /// itself rather than a search page. Returns the artifact noun to
+    /// pursue on the live page. A search-fallback (or missing) proposal is
+    /// never an in-page goal — searching the web is not navigating a site.
+    /// Plural prompts are excluded by the caller: batching owns those.
+    fn cold_in_page_goal(
+        prompt: &str,
+        source: Option<orchestration_engine::RouteSource>,
+    ) -> Option<String> {
+        if matches!(
+            source,
+            None | Some(orchestration_engine::RouteSource::SearchFallback)
+        ) {
+            return None;
+        }
+        let grammar = orchestration_engine::parse_grammar(prompt, None);
+        match (grammar.site_context, grammar.artifact_noun) {
+            (Some(_), Some(artifact)) => Some(artifact),
+            _ => None,
+        }
+    }
+
     async fn dispatch_adhoc_auto_acquire(
         &self,
         prompt: String,
@@ -2132,6 +2155,70 @@ impl AppService {
         // or, worse, a scraped search page.
         if let Some(err) = Self::direct_open_miss_error(&proposed) {
             return Err(err);
+        }
+        // Cold-start in-page goal: the prompt names a site and carries an
+        // artifact noun ("open my profile on the reddit"), and the ladder
+        // grounded the site itself — never a search page. Land the site,
+        // then pursue the noun on the live page: the navigated URL is
+        // observed from real controls, never predicted from the prompt.
+        // Verbs decide nothing here; only the (site, artifact) noun pair
+        // does, so "open/show/take me to my profile" all take this path.
+        if !intent.is_plural
+            && let Some(noun) = Self::cold_in_page_goal(&prompt, proposed.source)
+        {
+            let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
+                "The derived intent is not runnable.",
+            ))?;
+            let site_url = url::Url::parse(&entry)
+                .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+            // Strict validation before any navigation or session write —
+            // the same provenance-aware bar as the normal path. The site
+            // was named by the user, so structural validation suffices.
+            let valid =
+                orchestration_engine::entry_url_valid(proposed.source, site_url.as_str());
+            if !valid {
+                return Err(AppError::InvalidInput(
+                    "The derived intent is not runnable.",
+                ));
+            }
+            // The entry origin becomes the run portal, recorded as the
+            // session origin so the run machinery's origin check passes.
+            let mut portal = site_url.clone();
+            portal.set_path("/");
+            portal.set_query(None);
+            portal.set_fragment(None);
+            *self
+                .session_origin
+                .lock()
+                .map_err(|_| AppError::Internal)? = Some(portal.clone());
+            let browser = self.browser(BrowserIntent::Background).await?;
+            // Land the site before acting: the pursuit snapshots the live
+            // page, so acting must start from the destination, not
+            // about:blank.
+            macro_engine::ensure_at_entry_url(&browser, &site_url)
+                .await
+                .map_err(|_| AppError::BrowserUnavailable)?;
+            let _ = self
+                .record(&format!(
+                    "in_page_goal_cold: '{noun}' → {}",
+                    portal.host_str().unwrap_or("?")
+                ))
+                .await;
+            let mut outcome = self
+                .dispatch_in_page_goal(portal, prompt, noun, emit)
+                .await?;
+            // Keep the site route line above the goal line so Session
+            // Activity reads proposal → goal in order.
+            if let Some(site_line) = route_log {
+                outcome.route_log = Some(match outcome.route_log.take() {
+                    Some(goal_line) => format!("{site_line}\n{goal_line}"),
+                    None => site_line,
+                });
+            }
+            // Settle (final frame + challenge/auth branching) runs here,
+            // exactly like the normal path.
+            self.settle_ephemeral_outcome(&mut outcome).await;
+            return Ok(outcome);
         }
         let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
             "The derived intent is not runnable.",
@@ -2682,7 +2769,7 @@ impl AppService {
             // grounds the top result link from the live AX tree.
             if route.source == orchestration_engine::RouteSource::SearchFallback {
                 // The decoded `q` value, not the raw query string: the line
-                // reads `q='open amazon'`, never `q='q=open+amazon'`.
+                // reads `q='amazon'`, never `q='q=amazon'`.
                 let query = route
                     .url
                     .query_pairs()
@@ -2717,8 +2804,13 @@ impl AppService {
             // dispatch lane can reach it without re-parsing the prompt.
             let grounder_hit = if route.source == orchestration_engine::RouteSource::DomainGrounded
             {
-                let site = orchestration_engine::parse_grammar(prompt, connected_origin)
+                // In-page-goal prompts carry the site in `site_context`
+                // while `target_noun` is empty there; either way the
+                // grounded name feeds the consent-gated shortcut offer.
+                let grammar = orchestration_engine::parse_grammar(prompt, connected_origin);
+                let site = grammar
                     .target_noun
+                    .or(grammar.site_context)
                     .unwrap_or_default();
                 (!site.is_empty()).then(|| GrounderHit {
                     site,
@@ -5148,7 +5240,7 @@ pub(crate) mod tests {
             .await;
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=download+all+invoices+from+github")
+            Some("https://www.google.com/search?q=all+invoices+from+github")
         );
         assert!(proposed.needs_search_follow());
         // No deep link is ever fabricated for the portal named in the prompt.
@@ -5168,10 +5260,11 @@ pub(crate) mod tests {
         let proposed = service
             .propose_entry_url("find the dashboard", &mut other, None)
             .await;
-        // Filler (`the`) is stripped from the query by sanitization.
+        // Filler (`the`) and action verbs (`find`) are stripped from the
+        // query by sanitization.
         assert_eq!(
             other.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=find+dashboard")
+            Some("https://www.google.com/search?q=dashboard")
         );
         // A search entry still owes a Stage-2 follow before it can run.
         assert!(proposed.needs_search_follow());
@@ -5346,7 +5439,7 @@ pub(crate) mod tests {
         // and step 1 of the ephemeral task. With no static route table the
         // proposal is the grounded search template; Stage 2 rewrites
         // `entry_url` to the landed destination before the batch runs.
-        let expected = "https://www.google.com/search?q=download+all+invoices+from+github";
+        let expected = "https://www.google.com/search?q=all+invoices+from+github";
         assert_eq!(intent.entry_url.as_deref(), Some(expected));
         let steps = [playbook_store::Step::Semantic {
             intent: intent.clone(),
@@ -5415,7 +5508,7 @@ pub(crate) mod tests {
         // destination cue and is not the batch anchor.
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=download+all+invoices+from+github")
+            Some("https://www.google.com/search?q=all+invoices+from+github")
         );
         assert!(intent.is_plural);
         assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
@@ -5487,7 +5580,7 @@ pub(crate) mod tests {
         assert!(proposed.needs_search_follow(), "search tier answered");
         let search_entry = intent.entry_url.clone().ok_or("search entry")?;
         assert_eq!(
-            search_entry, "https://www.google.com/search?q=find+amazon",
+            search_entry, "https://www.google.com/search?q=amazon",
             "sanitized query, fixed host"
         );
         for guess in ["amazon.com", "amazon.in"] {
@@ -5585,7 +5678,7 @@ pub(crate) mod tests {
         assert_eq!(playbook.origin, portal);
         assert_eq!(
             saved.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=download+all+invoices+from+github")
+            Some("https://www.google.com/search?q=all+invoices+from+github")
         );
         assert!(saved.is_plural);
         assert_eq!(saved.primary_target_noun.as_deref(), Some("invoice"));
@@ -6093,14 +6186,14 @@ pub(crate) mod tests {
         // Sanitized query with no guessed amazon TLD.
         assert_eq!(
             intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=find+amazon")
+            Some("https://www.google.com/search?q=amazon")
         );
         assert!(proposed.needs_search_follow());
         let line = proposed.log.ok_or("route line")?;
         assert!(line.starts_with("route_fallback: search"), "got {line:?}");
         // The decoded query reads cleanly — never a doubled `q=q=`.
         assert!(
-            line.contains("q='find amazon'"),
+            line.contains("q='amazon'"),
             "decoded query journaled, got {line:?}"
         );
         assert!(!line.contains("q='q="), "no doubled prefix, got {line:?}");
@@ -6149,7 +6242,7 @@ pub(crate) mod tests {
         let events = service.test_session_events().await.map_err(|_| "events")?;
         assert!(
             events.iter().any(|outcome| outcome
-                == "route_fallback: search q='find amazon' · url=https://www.google.com/search?q=find+amazon"),
+                == "route_fallback: search q='amazon' · url=https://www.google.com/search?q=amazon"),
             "sanitized search fallback journaled, got {events:?}"
         );
         // Stage 2 never ran here (the browser could not launch), so no
