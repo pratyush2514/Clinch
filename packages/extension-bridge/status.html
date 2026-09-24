@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Clinch Companion — Bridge Status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 32px auto; padding: 0 16px; }
+  h1 { font-size: 20px; }
+  .row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #8883; }
+  .row .k { opacity: 0.7; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+  .ok { background: #22c55e; } .warn { background: #f59e0b; } .bad { background: #ef4444; }
+  button { margin-top: 16px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  #pingResult { margin-top: 12px; min-height: 20px; }
+  .hint { opacity: 0.7; font-size: 13px; margin-top: 24px; }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Clinch Companion</h1>
+<div class="row"><span class="k">Extension version</span><span id="extVersion">…</span></div>
+<div class="row"><span class="k">Browser</span><span id="browser">…</span></div>
+<div class="row"><span class="k">Install ID</span><span><code id="installId">…</code></span></div>
+<div class="row"><span class="k">Bridge socket</span><span><span class="dot warn" id="socketDot"></span><span id="socketState">…</span></span></div>
+<div class="row"><span class="k">Last sync</span><span id="lastSync">never</span></div>
+<button id="pingBtn">Ping the Clinch desktop app</button>
+<div id="pingResult"></div>
+<p class="hint">The bridge listens on ws://127.0.0.1:9223 (this machine only). Clinch
+asks for one domain's cookies only when you tap <em>Sync</em> — the tap is the
+consent. Nothing is sent otherwise.</p>
+<script src="status.js"></script>
+</body>
+</html>

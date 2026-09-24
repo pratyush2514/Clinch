@@ -37,8 +37,8 @@ export default function ActionThread({
   onSave: (entryId: string) => void;
   onFile: (entryId: string, chip: OutputChip, reveal: boolean) => void;
   onTakeControl: (url?: string) => void;
-  onLendSession: (entryId: string, runId: string) => void;
-  onSyncAuthSession: (entryId: string, runId: string) => void;
+  onLendSession: (entryId: string, runId: string, sourceConnectionId?: number | null) => void;
+  onSyncAuthSession: (entryId: string, runId: string, sourceConnectionId?: number | null) => void;
   onForgetSession: (entryId: string, host: string) => void;
   onRelease: () => void;
   onConnect: () => void;
@@ -92,8 +92,8 @@ export default function ActionThread({
               onSave={() => onSave(entry.id)}
               onFile={(chip, reveal) => onFile(entry.id, chip, reveal)}
               onTakeControl={onTakeControl}
-              onLendSession={(runId) => onLendSession(entry.id, runId)}
-              onSyncAuthSession={(runId) => onSyncAuthSession(entry.id, runId)}
+              onLendSession={(runId, sourceConnectionId) => onLendSession(entry.id, runId, sourceConnectionId)}
+              onSyncAuthSession={(runId, sourceConnectionId) => onSyncAuthSession(entry.id, runId, sourceConnectionId)}
               onForgetSession={(host) => onForgetSession(entry.id, host)}
               onRelease={onRelease}
               onConnect={onConnect}

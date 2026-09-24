@@ -1,4 +1,7 @@
+import { useState } from "react";
 import type { LendUiState } from "../lib/thread";
+import { useBridgeStatus } from "../hooks/useBridgeStatus";
+import BridgeStatusLine from "./BridgeStatusLine";
 import ForgetSiteButton from "./ForgetSiteButton";
 
 /**
@@ -32,7 +35,7 @@ export default function ChallengeCard({
   busy: boolean;
   lend: LendUiState | null;
   onTakeControl: (url: string) => void;
-  onLendSession: (runId: string) => void;
+  onLendSession: (runId: string, sourceConnectionId?: number | null) => void;
   onForgetSession: (host: string) => void;
 }) {
   let host = url;
@@ -43,6 +46,15 @@ export default function ChallengeCard({
     // re-validates before any navigation.
   }
   const working = busy || lend?.status === "busy";
+  // Live bridge view: same contract as the auth-sync card — honest waiting
+  // state until a companion attaches, source picker for multi-browser.
+  const bridge = useBridgeStatus(true);
+  const connections = bridge?.connections ?? [];
+  const [sourceId, setSourceId] = useState<number | null>(null);
+  const effectiveSourceId = connections.some((c) => c.id === sourceId)
+    ? sourceId
+    : (connections[0]?.id ?? null);
+  const bridgeReady = connections.length > 0;
   if (lend?.status === "cleared") {
     return (
       <div className="challenge-offer" aria-label="Session synced">
@@ -76,15 +88,24 @@ export default function ChallengeCard({
         <button
           className="primary"
           type="button"
-          disabled={working || !lendId}
-          onClick={() => lendId && onLendSession(lendId)}
+          disabled={working || !lendId || !bridgeReady}
+          onClick={() => lendId && onLendSession(lendId, effectiveSourceId)}
         >
-          {lend?.status === "busy" ? "Syncing…" : `Sync my ${host} session`}
+          {lend?.status === "busy"
+            ? "Syncing…"
+            : bridgeReady
+              ? `Sync my ${host} session`
+              : "Waiting for companion…"}
         </button>
         <button type="button" disabled={working} onClick={() => onTakeControl(url)}>
           Take control
         </button>
       </div>
+      <BridgeStatusLine
+        connections={connections}
+        sourceId={effectiveSourceId}
+        onSelectSource={setSourceId}
+      />
       {lend?.status === "persistent" && lend.reason && (
         <p className="notice">{lend.reason}</p>
       )}

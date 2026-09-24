@@ -50,8 +50,8 @@ export default function ActionCard({
   onSave: () => void;
   onFile: (chip: OutputChip, reveal: boolean) => void;
   onTakeControl: (url?: string) => void;
-  onLendSession: (runId: string) => void;
-  onSyncAuthSession: (runId: string) => void;
+  onLendSession: (runId: string, sourceConnectionId?: number | null) => void;
+  onSyncAuthSession: (runId: string, sourceConnectionId?: number | null) => void;
   onForgetSession: (host: string) => void;
   onRelease: () => void;
   onConnect: () => void;

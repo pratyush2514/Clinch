@@ -84,6 +84,10 @@ pub struct BridgeStatus {
     running: bool,
     port: u16,
     extensions: usize,
+    /// One entry per connected companion (browser label + install id),
+    /// oldest first. Drives the card's bridge-status line and the
+    /// multi-browser source picker.
+    connections: Vec<crate::ws_server::BridgeConnectionInfo>,
 }
 
 #[derive(Serialize)]
@@ -569,6 +573,18 @@ enum SessionLendOrigin {
 /// origin) or an authenticated page (guest-landing origin) after lending;
 /// otherwise `reason` carries the static user-facing string and Take
 /// Control stays the fallback.
+/// One consent tap on a challenge or auth-sync card. `lend_id` is the
+/// registry key for the pending lend; `source_connection_id` optionally
+/// picks one connected companion (the card's source picker) — `None`
+/// broadcasts to every connected companion.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LendRequest {
+    lend_id: String,
+    #[serde(default)]
+    source_connection_id: Option<u64>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LendOutcome {
@@ -1061,11 +1077,13 @@ impl AppService {
                 running: server.is_alive(),
                 port: server.local_port().unwrap_or(crate::ws_server::BRIDGE_PORT),
                 extensions: server.connection_count(),
+                connections: server.connection_infos(),
             },
             None => BridgeStatus {
                 running: false,
                 port: crate::ws_server::BRIDGE_PORT,
                 extensions: 0,
+                connections: Vec::new(),
             },
         })
     }
@@ -1076,14 +1094,17 @@ impl AppService {
     /// action — the tap is the consent event — never from detection alone.
     /// Bridge failures map to static user-facing strings; raw payloads are
     /// never surfaced. Long-polls up to the bridge response timeout.
+    /// `source` selects one companion (the card's source picker); `None`
+    /// broadcasts.
     async fn request_bridge_session(
         &self,
         portal: &url::Url,
+        source: Option<u64>,
     ) -> Result<crate::ws_server::BridgeSession, AppError> {
         use crate::ws_server::BridgeError;
         self.bridge_server()
             .await?
-            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT)
+            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT, source)
             .await
             .map_err(|error| match error {
                 BridgeError::NoExtension => AppError::InvalidInput(
@@ -1109,7 +1130,7 @@ impl AppService {
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
         self.database().await?;
         // Request first: a missing companion fails fast without opening a window.
-        let session = self.request_bridge_session(&portal).await?;
+        let session = self.request_bridge_session(&portal, None).await?;
         // Interactive: same reason as local-profile sync — the landing may
         // be a challenge page the user must finish.
         let browser = self.browser(BrowserIntent::Interactive).await?;
@@ -1171,8 +1192,10 @@ impl AppService {
         }
     }
 
-    pub async fn lend_session(&self, run_id: String) -> Result<LendOutcome, AppError> {
+    pub async fn lend_session(&self, request: LendRequest) -> Result<LendOutcome, AppError> {
         let _permit = self.operation.try_acquire().map_err(|_| AppError::Busy)?;
+        let run_id = request.lend_id;
+        let source = request.source_connection_id;
         let (page_url, origin) =
             {
                 let mut lends = self.session_lends.lock().map_err(|_| AppError::Internal)?;
@@ -1192,7 +1215,9 @@ impl AppService {
         // The tap is consent: journal before any bridge I/O.
         self.journal_line(format!("session_lend_requested: {host}"))
             .await;
-        let outcome = self.lend_session_inner(&page_url, &host, origin).await;
+        let outcome = self
+            .lend_session_inner(&page_url, &host, origin, source)
+            .await;
         if let Ok(mut lends) = self.session_lends.lock()
             && let Some((_, state)) = lends.iter_mut().find(|(id, _)| *id == run_id)
         {
@@ -1210,6 +1235,7 @@ impl AppService {
         page_url: &str,
         host: &str,
         origin: SessionLendOrigin,
+        source: Option<u64>,
     ) -> LendOutcome {
         let failed = |label: &str| LendOutcome {
             cleared: false,
@@ -1225,7 +1251,7 @@ impl AppService {
                 return failed("The synced page URL is not usable.");
             }
         };
-        let session = match self.request_bridge_session(&portal).await {
+        let session = match self.request_bridge_session(&portal, source).await {
             Ok(session) => session,
             Err(AppError::InvalidInput(reason)) => {
                 self.journal_line(format!("session_lend_failed: {host} · bridge: {reason}"))
@@ -2872,7 +2898,7 @@ impl AppService {
             return Ok(());
         }
         match server
-            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT)
+            .request_sync(portal, crate::ws_server::RESPONSE_TIMEOUT, None)
             .await
         {
             Err(crate::ws_server::BridgeError::NoCookies) => {
@@ -4156,7 +4182,12 @@ pub(crate) mod tests {
         // before any consent journaling or bridge I/O.
         let service = AppService::new(PathBuf::new(), PathBuf::new());
         assert!(matches!(
-            service.lend_session("ghost".to_owned()).await,
+            service
+                .lend_session(LendRequest {
+                    lend_id: "ghost".to_owned(),
+                    source_connection_id: None,
+                })
+                .await,
             Err(AppError::InvalidInput(_))
         ));
     }
@@ -4186,7 +4217,10 @@ pub(crate) mod tests {
                 },
             ));
         let replayed = service
-            .lend_session("run-1".to_owned())
+            .lend_session(LendRequest {
+                lend_id: "run-1".to_owned(),
+                source_connection_id: None,
+            })
             .await
             .map_err(|_| "recorded lend outcome")?;
         assert!(replayed.cleared);

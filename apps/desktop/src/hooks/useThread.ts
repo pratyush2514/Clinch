@@ -61,13 +61,13 @@ export type ThreadApi = {
    * site's cookies from the companion extension into the managed browser
    * and re-probes the gate. One attempt per run.
    */
-  lendSession: (entryId: string, runId: string) => Promise<void>;
+  lendSession: (entryId: string, runId: string, sourceConnectionId?: number | null) => Promise<void>;
   /**
    * Auth sync: the auth-sync-card consent tap. Same lend path, but the
    * session lands on the auth-sync card with its persisted badge; the
    * cookies persist to Clinch's app profile.
    */
-  syncAuthSession: (entryId: string, runId: string) => Promise<void>;
+  syncAuthSession: (entryId: string, runId: string, sourceConnectionId?: number | null) => Promise<void>;
   /**
    * Forget a synced session: delete the site's cookies from Clinch's own
    * profile. The daily browser is untouched.
@@ -406,14 +406,16 @@ export function useThread(
   }, []);
 
   const lendSession = useCallback(
-    async (entryId: string, runId: string) => {
+    async (entryId: string, runId: string, sourceConnectionId?: number | null) => {
       dispatch({
         type: "lendState",
         id: entryId,
         lend: { status: "busy", reason: null, frame: null, forgetting: "idle" },
       });
       try {
-        const outcome = await invoke<LendOutcome>("lend_session", { runId });
+        const outcome = await invoke<LendOutcome>("lend_session", {
+          request: { lendId: runId, sourceConnectionId: sourceConnectionId ?? null },
+        });
         dispatch({
           type: "lendState",
           id: entryId,
@@ -444,14 +446,16 @@ export function useThread(
    * the auth-sync card with its persisted badge and "Forget this site"
    * control. `host` is derived from the card's backend-supplied URL. */
   const syncAuthSession = useCallback(
-    async (entryId: string, runId: string) => {
+    async (entryId: string, runId: string, sourceConnectionId?: number | null) => {
       dispatch({
         type: "authState",
         id: entryId,
         auth: { status: "busy", reason: null, frame: null, forgetting: "idle" },
       });
       try {
-        const outcome = await invoke<LendOutcome>("lend_session", { runId });
+        const outcome = await invoke<LendOutcome>("lend_session", {
+          request: { lendId: runId, sourceConnectionId: sourceConnectionId ?? null },
+        });
         dispatch({
           type: "authState",
           id: entryId,

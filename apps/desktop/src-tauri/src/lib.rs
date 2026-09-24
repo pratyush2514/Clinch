@@ -5,7 +5,8 @@ mod ws_server;
 use auth::AuthPanel;
 use service::{
     AppError, AppService, ApprovalPreview, BridgeStatus, ContextStatus, DispatchOutcome,
-    IntentPreview, LendOutcome, PickerStatus, PocMetrics, SessionStatus, StorageStatus,
+    IntentPreview, LendOutcome, LendRequest, PickerStatus, PocMetrics, SessionStatus,
+    StorageStatus,
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
@@ -127,10 +128,10 @@ async fn bridge_sync_session(
 /// logged in"); the daily browser is never written to.
 #[tauri::command]
 async fn lend_session(
-    run_id: String,
+    request: LendRequest,
     state: tauri::State<'_, AppService>,
 ) -> Result<LendOutcome, AppError> {
-    state.lend_session(run_id).await
+    state.lend_session(request).await
 }
 /// Revoke a persisted session: delete every cookie the app profile holds
 /// for `host`. The "Forget this site" control behind a synced badge.

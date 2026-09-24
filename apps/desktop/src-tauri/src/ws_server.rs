@@ -14,6 +14,15 @@
 //!   (in-memory). They are never written to `SQLite`, logs, or IPC responses.
 //! - Bounded everything: connection cap with oldest-eviction, per-message and
 //!   per-field size caps, response timeout.
+//!
+//! Companion identity: the extension's offscreen document sends HELLO with
+//! its install id and browser brand on socket open (length-capped,
+//! informational only — the bridge trusts loopback, not the payload).
+//! `bridge_status` reports one entry per connection so the UI can show
+//! bridge state and offer a source picker; sync requests can target one
+//! connection id, with a broadcast fallback for stale ids. PING carries a
+//! nonce and gets a same-nonce PONG: the companion's real heartbeat and the
+//! status page's ping test.
 
 use std::{
     collections::HashMap,
@@ -149,6 +158,23 @@ struct SyncErrorReport {
     reason: String,
 }
 
+/// Identity envelope the companion sends on socket open. Informational
+/// only — the bridge trusts loopback, not this payload — but length-capped
+/// before it is stored or re-serialized.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HelloMessage {
+    #[serde(default)]
+    install_id: String,
+    #[serde(default)]
+    browser: String,
+}
+
+/// Caps for HELLO/PING metadata; identity is informational, never a secret.
+const MAX_INSTALL_ID_LEN: usize = 128;
+const MAX_BROWSER_LEN: usize = 64;
+const MAX_NONCE_LEN: usize = 128;
+
 /// Validated bridge session: in-scope cookies plus the source UA, ready for
 /// CDP injection. Contains live secrets — never logged or serialized.
 pub struct BridgeSession {
@@ -249,6 +275,22 @@ struct Pending {
 struct Connection {
     created: Instant,
     outbox: mpsc::Sender<String>,
+    /// Identity from the companion's HELLO (empty until it arrives).
+    install_id: String,
+    browser: String,
+    connected_at_secs: u64,
+}
+
+/// One connected companion, as reported by `bridge_status` so the UI can
+/// show bridge state and offer a source picker when several browsers are
+/// attached. `id` is the server-side connection key for targeted sends.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConnectionInfo {
+    pub id: u64,
+    pub browser: String,
+    pub install_id: String,
+    pub connected_at_secs: u64,
 }
 
 pub struct BridgeServer {
@@ -312,8 +354,36 @@ impl BridgeServer {
         self.connections.lock().map_or(0, |guard| guard.len())
     }
 
+    /// Identity of every connected companion, oldest first. Drives the
+    /// card's bridge-status line and the multi-browser source picker.
+    #[must_use]
+    pub fn connection_infos(&self) -> Vec<BridgeConnectionInfo> {
+        self.connections.lock().map_or_else(
+            |_| Vec::new(),
+            |guard| {
+                let mut infos: Vec<BridgeConnectionInfo> = guard
+                    .iter()
+                    .map(|(id, connection)| BridgeConnectionInfo {
+                        id: *id,
+                        browser: connection.browser.clone(),
+                        install_id: connection.install_id.clone(),
+                        connected_at_secs: connection.connected_at_secs,
+                    })
+                    .collect();
+                infos.sort_by_key(|info| info.id);
+                infos
+            },
+        )
+    }
+
     /// Ask the connected extension for `portal`'s session. Fails fast with
     /// [`BridgeError::NoExtension`] when no companion is connected.
+    ///
+    /// `target` selects one companion by its [`BridgeConnectionInfo::id`]
+    /// (the card's source picker); `None` broadcasts to all connected
+    /// companions and the first valid answer wins. A stale id falls back
+    /// to broadcast: the chosen companion probably reconnected with a new
+    /// id rather than vanishing.
     ///
     /// # Errors
     /// Returns `NoExtension`, `Timeout`, or the validated extension-side
@@ -322,6 +392,7 @@ impl BridgeServer {
         &self,
         portal: &url::Url,
         timeout: Duration,
+        target: Option<u64>,
     ) -> Result<BridgeSession, BridgeError> {
         let host = portal.host_str().ok_or(BridgeError::Invalid)?.to_owned();
         let id = format!(
@@ -361,7 +432,7 @@ impl BridgeServer {
             domain: host,
         })
         .map_err(|_| BridgeError::Unavailable)?;
-        self.broadcast(&message);
+        self.send_to(target, &message);
         match tokio::time::timeout(timeout, receive).await {
             Err(_) => {
                 self.pending.lock().map(|mut guard| guard.remove(&id)).ok();
@@ -372,24 +443,45 @@ impl BridgeServer {
         }
     }
 
-    fn broadcast(&self, message: &str) {
-        let targets: Vec<mpsc::Sender<String>> = self
+    /// Deliver `message` to one companion (`Some(id)`) or all of them
+    /// (`None`). A stale targeted id falls back to broadcast — see
+    /// [`BridgeServer::request_sync`].
+    fn send_to(&self, target: Option<u64>, message: &str) {
+        let targeted: Vec<mpsc::Sender<String>> = self
             .connections
             .lock()
-            .map(|guard| {
-                guard
+            .map(|guard| match target {
+                Some(id) => guard
+                    .get(&id)
+                    .map(|connection| vec![connection.outbox.clone()])
+                    .unwrap_or_default(),
+                None => guard
                     .values()
                     .map(|connection| connection.outbox.clone())
-                    .collect()
+                    .collect(),
             })
             .unwrap_or_default();
+        let targets = if target.is_some() && targeted.is_empty() {
+            // Stale id: broadcast rather than fail a tap the user already made.
+            self.connections
+                .lock()
+                .map(|guard| {
+                    guard
+                        .values()
+                        .map(|connection| connection.outbox.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            targeted
+        };
         for outbox in targets {
             // Bounded outbox: a wedged companion is skipped, never blocks sync.
             let _ = outbox.try_send(message.to_owned());
         }
     }
 
-    fn handle_text(self: &Arc<Self>, text: &str) {
+    fn handle_text(self: &Arc<Self>, connection_id: u64, text: &str) {
         if text.len() > MAX_FRAME_BYTES {
             return;
         }
@@ -397,6 +489,45 @@ impl BridgeServer {
             return;
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("HELLO") => {
+                let hello: HelloMessage = serde_json::from_value(value).unwrap_or(HelloMessage {
+                    install_id: String::new(),
+                    browser: String::new(),
+                });
+                // Identity is informational (loopback trust); still cap it.
+                let mut install_id = hello.install_id;
+                install_id.truncate(MAX_INSTALL_ID_LEN);
+                let mut browser = hello.browser;
+                browser.truncate(MAX_BROWSER_LEN);
+                self.connections
+                    .lock()
+                    .map(|mut guard| {
+                        if let Some(connection) = guard.get_mut(&connection_id) {
+                            connection.install_id = install_id;
+                            connection.browser = browser;
+                        }
+                    })
+                    .ok();
+            }
+            Some("PING") => {
+                // Real echo for the companion's heartbeat and the status
+                // page's ping test; answered to the sender only.
+                let nonce = value
+                    .get("nonce")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let mut nonce = nonce.to_owned();
+                nonce.truncate(MAX_NONCE_LEN);
+                let reply = serde_json::json!({"type": "PONG", "nonce": nonce}).to_string();
+                self.connections
+                    .lock()
+                    .map(|guard| {
+                        if let Some(connection) = guard.get(&connection_id) {
+                            let _ = connection.outbox.try_send(reply.clone());
+                        }
+                    })
+                    .ok();
+            }
             Some("SYNC_SESSION_RESPONSE") => {
                 let Ok(response) = serde_json::from_value::<SyncResponse>(value) else {
                     return;
@@ -470,7 +601,9 @@ async fn accept_loop(server: Arc<BridgeServer>, listener: TcpListener) {
         let Ok(ws) = async_tungstenite::tokio::accept_async(stream).await else {
             continue;
         };
-        serve_connection(server.clone(), ws).await;
+        // Every socket gets its own task: a live companion must never block
+        // the listener from accepting the next browser.
+        tokio::spawn(serve_connection(server.clone(), ws));
     }
 }
 
@@ -505,6 +638,11 @@ where
             Connection {
                 created: Instant::now(),
                 outbox,
+                install_id: String::new(),
+                browser: String::new(),
+                connected_at_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs()),
             },
         );
     }
@@ -514,7 +652,7 @@ where
                 let Some(message) = incoming else { break };
                 let Ok(message) = message else { break };
                 match message {
-                    Message::Text(text) => server.handle_text(&text),
+                    Message::Text(text) => server.handle_text(id, &text),
                     Message::Close(_) => break,
                     _ => {}
                 }
@@ -692,7 +830,7 @@ mod tests {
         });
 
         let session = server
-            .request_sync(&portal, Duration::from_secs(10))
+            .request_sync(&portal, Duration::from_secs(10), None)
             .await
             .map_err(|error| format!("request failed: {error}"))?;
         assert_eq!(session.cookies.len(), 2);
@@ -702,6 +840,103 @@ mod tests {
             .await
             .map_err(|_| "responder panicked")?
             .map_err(|reason| format!("responder: {reason}"))?;
+        Ok(())
+    }
+
+    fn fake_connection(
+        server: &BridgeServer,
+        id: u64,
+    ) -> Result<mpsc::Receiver<String>, Box<dyn std::error::Error>> {
+        let (tx, rx) = mpsc::channel(8);
+        server
+            .connections
+            .lock()
+            .map_err(|_| "connections lock")?
+            .insert(
+                id,
+                Connection {
+                    created: Instant::now(),
+                    outbox: tx,
+                    install_id: String::new(),
+                    browser: String::new(),
+                    connected_at_secs: 1_700_000_000,
+                },
+            );
+        Ok(rx)
+    }
+
+    #[test]
+    fn hello_registers_connection_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let server = Arc::new(BridgeServer::new());
+        let _rx = fake_connection(&server, 7)?;
+        server.handle_text(
+            7,
+            r#"{"type":"HELLO","name":"clinch-companion","version":1,"installId":"abc-123","browser":"Brave"}"#,
+        );
+        let infos = server.connection_infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, 7);
+        assert_eq!(infos[0].install_id, "abc-123");
+        assert_eq!(infos[0].browser, "Brave");
+        // Unknown connection ids are ignored, never created.
+        server.handle_text(99, r#"{"type":"HELLO","installId":"x","browser":"Y"}"#);
+        assert_eq!(server.connection_infos().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn hello_identity_is_length_capped() -> Result<(), Box<dyn std::error::Error>> {
+        let server = Arc::new(BridgeServer::new());
+        let _rx = fake_connection(&server, 3)?;
+        let long = "z".repeat(10_000);
+        server.handle_text(
+            3,
+            &format!("{{\"type\":\"HELLO\",\"installId\":\"{long}\",\"browser\":\"{long}\"}}"),
+        );
+        let infos = server.connection_infos();
+        assert!(infos[0].install_id.len() <= MAX_INSTALL_ID_LEN);
+        assert!(infos[0].browser.len() <= MAX_BROWSER_LEN);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_send_reaches_only_the_chosen_connection() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let server = BridgeServer::new();
+        let mut rx1 = fake_connection(&server, 1)?;
+        let mut rx2 = fake_connection(&server, 2)?;
+        server.send_to(Some(2), "for-two");
+        assert!(
+            rx1.try_recv().is_err(),
+            "untargeted connection got the message"
+        );
+        assert_eq!(rx2.try_recv().map_err(|_| "target got nothing")?, "for-two");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_target_falls_back_to_broadcast() -> Result<(), Box<dyn std::error::Error>> {
+        let server = BridgeServer::new();
+        let mut rx1 = fake_connection(&server, 1)?;
+        // The chosen companion reconnected with a new id: the tap still works.
+        server.send_to(Some(999), "for-all");
+        assert_eq!(
+            rx1.try_recv()
+                .map_err(|_| "broadcast fallback got nothing")?,
+            "for-all"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ping_gets_a_nonce_echo_pong() -> Result<(), Box<dyn std::error::Error>> {
+        let server = Arc::new(BridgeServer::new());
+        let mut rx = fake_connection(&server, 5)?;
+        server.handle_text(5, r#"{"type":"PING","nonce":"n-42"}"#);
+        let reply = rx.try_recv().map_err(|_| "no PONG")?;
+        let value: serde_json::Value = serde_json::from_str(&reply).map_err(|_| "PONG is JSON")?;
+        assert_eq!(value.get("type").and_then(|t| t.as_str()), Some("PONG"));
+        assert_eq!(value.get("nonce").and_then(|t| t.as_str()), Some("n-42"));
         Ok(())
     }
 }

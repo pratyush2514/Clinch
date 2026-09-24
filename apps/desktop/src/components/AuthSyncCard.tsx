@@ -1,4 +1,7 @@
+import { useState } from "react";
 import type { AuthUiState } from "../lib/thread";
+import { useBridgeStatus } from "../hooks/useBridgeStatus";
+import BridgeStatusLine from "./BridgeStatusLine";
 import ForgetSiteButton from "./ForgetSiteButton";
 
 /**
@@ -31,7 +34,7 @@ export default function AuthSyncCard({
   busy: boolean;
   auth: AuthUiState | null;
   onTakeControl: (url: string) => void;
-  onSyncSession: (runId: string) => void;
+  onSyncSession: (runId: string, sourceConnectionId?: number | null) => void;
   onForgetSession: (host: string) => void;
 }) {
   let host = url;
@@ -42,6 +45,17 @@ export default function AuthSyncCard({
     // page URL from its run registry, never from client input.
   }
   const working = busy || auth?.status === "busy";
+  // Live bridge view: the Sync button stays in an honest waiting state
+  // until a companion is attached, and offers a source picker when several
+  // browsers are connected. The selection is derived (never stale): an id
+  // that disappeared falls back to the first live connection.
+  const bridge = useBridgeStatus(true);
+  const connections = bridge?.connections ?? [];
+  const [sourceId, setSourceId] = useState<number | null>(null);
+  const effectiveSourceId = connections.some((c) => c.id === sourceId)
+    ? sourceId
+    : (connections[0]?.id ?? null);
+  const bridgeReady = connections.length > 0;
   if (auth?.status === "synced") {
     return (
       <div className="auth-offer" aria-label="Session synced">
@@ -74,15 +88,24 @@ export default function AuthSyncCard({
         <button
           className="primary"
           type="button"
-          disabled={working || !lendId}
-          onClick={() => lendId && onSyncSession(lendId)}
+          disabled={working || !lendId || !bridgeReady}
+          onClick={() => lendId && onSyncSession(lendId, effectiveSourceId)}
         >
-          {auth?.status === "busy" ? "Syncing…" : `Sync my ${host} session`}
+          {auth?.status === "busy"
+            ? "Syncing…"
+            : bridgeReady
+              ? `Sync my ${host} session`
+              : "Waiting for companion…"}
         </button>
         <button type="button" disabled={working} onClick={() => onTakeControl(url)}>
           Take Control to log in
         </button>
       </div>
+      <BridgeStatusLine
+        connections={connections}
+        sourceId={effectiveSourceId}
+        onSelectSource={setSourceId}
+      />
       {auth?.status === "failed" && auth.reason && (
         <p className="notice">{auth.reason}</p>
       )}

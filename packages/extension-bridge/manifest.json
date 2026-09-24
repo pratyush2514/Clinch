@@ -1,12 +1,22 @@
 {
-  "manifest_version": 3,
-  "name": "Clinch Companion",
-  "version": "0.1.0",
-  "description": "Scoped session bridge for the local Clinch desktop app. Reads cookies only when Clinch requests a domain, sends them over loopback only.",
-  "minimum_chrome_version": "116",
-  "permissions": ["cookies", "storage", "activeTab", "scripting", "alarms"],
-  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
-  }
+  },
+  "description": "Scoped session bridge for the local Clinch desktop app. Reads cookies only when Clinch requests a domain, sends them over loopback only.",
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "Clinch Companion",
+  "options_page": "status.html",
+  "permissions": [
+    "cookies",
+    "storage",
+    "activeTab",
+    "scripting",
+    "alarms",
+    "offscreen"
+  ],
+  "version": "0.2.0"
 }

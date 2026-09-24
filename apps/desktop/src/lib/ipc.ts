@@ -129,6 +129,27 @@ export type LendOutcome = {
   finalFrame: string | null;
 };
 
+/** One connected Companion, as reported by `bridge_status`. `id` is the
+ * server-side connection key the card's source picker passes back as
+ * `sourceConnectionId`. */
+export type BridgeConnectionInfo = {
+  id: number;
+  /** Browser brand from the companion's HELLO ("Brave", "Chrome", …);
+   * empty when the companion predates identity. */
+  browser: string;
+  /** Companion install id; empty when unknown. Display truncated. */
+  installId: string;
+  connectedAtSecs: number;
+};
+
+/** `bridge_status`: the loopback bridge plus every attached companion. */
+export type BridgeStatus = {
+  running: boolean;
+  port: number;
+  extensions: number;
+  connections: BridgeConnectionInfo[];
+};
+
 export type PlaybookSummary = {
   id: string;
   name: string;

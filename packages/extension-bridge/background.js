@@ -1,33 +1,41 @@
 /* Clinch Companion (MV3) — scoped loopback session bridge.
  *
  * Load unpacked at chrome://extensions (Developer mode) while the Clinch
- * desktop app runs. The worker dials ws://127.0.0.1:9223 and answers exactly
- * one message kind: SYNC_SESSION { requestId, domain }. Cookies for anything
- * outside that domain's scope are never read off the wire format, never
- * stored, and never sent. Raw values live only in this response message.
+ * desktop app runs. Two parts:
  *
- * Two deliberate notes:
- * - "alarms" exists because MV3 suspends idle service workers (~30 s),
- *   which would silently kill the "persistent" socket otherwise.
- * - KNOWN_SSO_SECONDARIES mirrors apps/desktop/src-tauri/src/ws_server.rs.
- *   The desktop re-validates every cookie; this client filter only shrinks
- *   the payload. Keep both tables in sync when adding providers.
+ * - offscreen.js (offscreen document): owns the ws://127.0.0.1:9223 socket
+ *   so it survives service-worker suspension. It never touches cookies.
+ * - This worker: answers cookie reads on demand and runs a watchdog alarm
+ *   that recreates the offscreen document if Chrome reclaims it.
+ *
+ * Privacy posture, unchanged: cookies are read only when Clinch requests a
+ * domain (the tap is the consent event), only in-scope cookies are ever
+ * collected, and raw values live only in the single response message.
+ *
+ * KNOWN_SSO_SECONDARIES mirrors apps/desktop/src-tauri/src/ws_server.rs.
+ * The desktop re-validates every cookie; the scoped queries below only
+ * shrink what is read. Keep both tables in sync when adding providers.
  */
 
-const SOCKET_URL = "ws://127.0.0.1:9223";
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
+// MV3 offers no dedicated offscreen reason for a persistent local socket;
+// this document's sole job is owning the loopback WebSocket (data shuttling
+// between the extension and the desktop app), which BLOBS covers least
+// badly. If Chrome adds a socket-specific reason, switch to it.
+const OFFSCREEN_CREATE_REASONS = ["BLOBS"];
+const OFFSCREEN_JUSTIFICATION =
+  "Own the loopback WebSocket to the Clinch desktop app so session sync " +
+  "stays reachable while the service worker sleeps (MV3).";
+const WATCHDOG_ALARM = "clinch-watchdog";
+const WATCHDOG_MINUTES = 0.5;
 const MAX_COOKIES = 500;
 const MAX_VALUE_LENGTH = 16 * 1024;
-const RECONNECT_CAP_MS = 30_000;
 
 // Cross-root SSO secondaries the suffix rule cannot derive
 // (chatgpt.com shares no suffix with openai.com).
 const KNOWN_SSO_SECONDARIES = {
   "chatgpt.com": ["openai.com", "auth.openai.com"],
 };
-
-let socket = null;
-let reconnectDelayMs = 1000;
-let alarmInstalled = false;
 
 function scopeRoots(host) {
   const h = host.toLowerCase();
@@ -52,68 +60,61 @@ function inScope(cookieDomain, host) {
   return scopeRoots(h).some((root) => d === root || d.endsWith(`.${root}`));
 }
 
-function scheduleReconnect() {
-  const delay = reconnectDelayMs;
-  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_CAP_MS);
-  setTimeout(connect, delay);
-}
-
-function connect() {
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-  let ws;
+async function ensureOffscreenDocument() {
   try {
-    ws = new WebSocket(SOCKET_URL);
+    if (await chrome.offscreen.hasDocument()) return;
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: OFFSCREEN_CREATE_REASONS,
+      justification: OFFSCREEN_JUSTIFICATION,
+    });
   } catch {
-    scheduleReconnect();
-    return;
+    // Creation races (two watchdogs, startup overlap) land here; the next
+    // watchdog tick retries.
   }
-  socket = ws;
+}
 
-  ws.onopen = () => {
-    reconnectDelayMs = 1000;
-    if (!alarmInstalled) {
-      chrome.alarms.create("clinch-keepalive", { periodInMinutes: 0.5 });
-      alarmInstalled = true;
-    }
-    send({ type: "HELLO", name: "clinch-companion", version: 1 });
-  };
-  ws.onmessage = (event) => {
-    let message;
-    try {
-      message = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-    if (!message || typeof message.type !== "string") return;
-    if (message.type === "SYNC_SESSION") {
-      void handleSync(message);
-    } else if (message.type === "PING") {
-      send({ type: "PONG" });
-    }
-    // Unknown types are ignored for forward compatibility.
-  };
-  const drop = () => {
-    if (socket === ws) {
-      socket = null;
-      scheduleReconnect();
-    }
-  };
-  ws.onclose = drop;
-  ws.onerror = () => {
-    try {
-      ws.close();
-    } catch {
-      // Close is best-effort; onclose drives the reconnect.
-    }
+function toWireCookie(cookie) {
+  return {
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain,
+    path: cookie.path,
+    secure: cookie.secure,
+    httpOnly: cookie.httpOnly,
+    sameSite: cookie.sameSite,
+    expirationDate: cookie.expirationDate,
   };
 }
 
-function send(message) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
+/** Scoped read: one cookie-store query per scope root instead of the whole
+ * jar. `domain` filters match the domain and its subdomains, so the
+ * inScope check below is belt-and-braces against store quirks. */
+async function readScopedCookies(domain) {
+  // Include the exact requested domain first: for a two-label host like
+  // "x.com", scopeRoots alone can return nothing to query.
+  const roots = [...new Set([domain, ...scopeRoots(domain)])];
+  const seen = new Set();
+  const cookies = [];
+  for (const root of roots) {
+    let batch;
+    try {
+      batch = await chrome.cookies.getAll({ domain: root });
+    } catch {
+      continue;
+    }
+    for (const cookie of batch) {
+      if (cookies.length >= MAX_COOKIES) break;
+      const key = `${cookie.domain}\n${cookie.path}\n${cookie.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!inScope(cookie.domain, domain)) continue;
+      if (typeof cookie.value !== "string" || cookie.value.length > MAX_VALUE_LENGTH) continue;
+      cookies.push(toWireCookie(cookie));
+    }
+    if (cookies.length >= MAX_COOKIES) break;
   }
+  return cookies;
 }
 
 async function readTabUserAgent() {
@@ -134,51 +135,47 @@ async function readTabUserAgent() {
   return navigator.userAgent;
 }
 
-async function handleSync(message) {
-  const { requestId, domain } = message;
-  const fail = (reason) => send({ type: "SYNC_SESSION_ERROR", requestId, reason });
-  if (typeof requestId !== "string" || !requestId || typeof domain !== "string" || !domain) {
-    return;
-  }
+/** Answer one sync request from the offscreen document. Never throws: the
+ * caller always gets a shaped reply. */
+async function handleSyncRequest(domain) {
   try {
-    const all = await chrome.cookies.getAll({});
-    const cookies = [];
-    for (const cookie of all) {
-      if (cookies.length >= MAX_COOKIES) break;
-      if (!inScope(cookie.domain, domain)) continue;
-      if (typeof cookie.value !== "string" || cookie.value.length > MAX_VALUE_LENGTH) continue;
-      cookies.push({
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path,
-        secure: cookie.secure,
-        httpOnly: cookie.httpOnly,
-        sameSite: cookie.sameSite,
-        expirationDate: cookie.expirationDate,
-      });
-    }
+    const cookies = await readScopedCookies(domain);
     if (cookies.length === 0) {
-      fail("no_cookies");
-      return;
+      return { ok: false, reason: "no_cookies" };
     }
     const userAgent = await readTabUserAgent();
-    send({ type: "SYNC_SESSION_RESPONSE", requestId, domain, cookies, userAgent });
     await chrome.storage.session.set({ lastSyncAt: Date.now(), lastDomain: domain });
+    return { ok: true, cookies, userAgent };
   } catch {
-    fail("internal");
+    return { ok: false, reason: "internal" };
   }
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== "clinch-keepalive") return;
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    connect();
-  } else {
-    send({ type: "PING" });
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (!message || message.type !== "WORKER_SYNC_REQUEST") return false;
+  const { requestId, domain } = message;
+  if (typeof requestId !== "string" || !requestId || typeof domain !== "string" || !domain) {
+    sendResponse({ ok: false, reason: "internal" });
+    return false;
   }
+  handleSyncRequest(domain).then(sendResponse);
+  return true; // async reply
 });
 
-chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
-connect();
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== WATCHDOG_ALARM) return;
+  void ensureOffscreenDocument();
+});
+
+async function boot() {
+  await ensureOffscreenDocument();
+  try {
+    await chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: WATCHDOG_MINUTES });
+  } catch {
+    // Alarm setup is best-effort; startup already ensured the document.
+  }
+}
+
+chrome.runtime.onStartup.addListener(boot);
+chrome.runtime.onInstalled.addListener(boot);
+void boot();

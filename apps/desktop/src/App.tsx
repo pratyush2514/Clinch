@@ -134,8 +134,8 @@ export default function App() {
         onSave={id => void thread.save(id)}
         onFile={(id, chip, reveal) => void thread.openFile(id, chip, reveal)}
         onTakeControl={url => void screencast.takeControl(url)}
-        onLendSession={(entryId, runId) => void thread.lendSession(entryId, runId)}
-        onSyncAuthSession={(entryId, runId) => void thread.syncAuthSession(entryId, runId)}
+        onLendSession={(entryId, runId, sourceConnectionId) => void thread.lendSession(entryId, runId, sourceConnectionId)}
+        onSyncAuthSession={(entryId, runId, sourceConnectionId) => void thread.syncAuthSession(entryId, runId, sourceConnectionId)}
         onForgetSession={(entryId, host) => void thread.forgetSiteSession(entryId, host)}
         onRelease={() => void screencast.release()}
         onConnect={() => setSessionOpen(true)}
