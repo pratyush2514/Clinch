@@ -4,6 +4,7 @@ mod domain_grounder;
 mod entity_resolver;
 mod intent_parser;
 mod intent_resolver;
+mod page_navigator;
 mod route_proposer;
 mod runner;
 mod store;
@@ -11,6 +12,7 @@ mod task;
 mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
+pub use page_navigator::{LlmPageNavigator, NavigatorEnv};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
 pub use intent_parser::{
     IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,

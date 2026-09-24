@@ -941,11 +941,17 @@ pub async fn follow_search_result(
 pub enum PageGoalOutcome {
     /// A click navigated somewhere new: the clicked label plus the URL.
     Navigated { label: String, landed: url::Url },
+    /// The goal was already achieved on the current page; nothing to click.
+    AlreadyThere { landed: url::Url },
 }
 
 /// In-page follow-up budget: observe-act steps before the pursuit gives up
 /// and reports [`IntentError::NoMatch`] with the evidence.
 const PAGE_GOAL_MAX_STEPS: usize = 3;
+
+/// Model-guided phase budget: the navigator gets fewer steps than the
+/// deterministic phase because each one costs a model call.
+const MODEL_GOAL_MAX_STEPS: usize = 5;
 
 /// Actionable roles a follow-up can meaningfully click: links plus the
 /// controls menus are made of. Wider than [`select_search_result`]'s
@@ -955,30 +961,54 @@ const PAGE_GOAL_ROLES: &[&str] = &["link", "button", "menuitem", "menuitemlink"]
 
 /// Pursue `noun` on the already-loaded portal page: the Muse-style
 /// follow-up. No new browser, no entry-URL resolution, no navigation
-/// before acting. Bounded observe-act loop:
+/// before acting. Two phases:
 ///
-/// 1. Snapshot; click the first actionable control mentioning `noun`. A
-///    URL change ends the pursuit as navigated.
-/// 2. No direct hit: click one unopened header menu/disclosure button to
-///    reveal more controls, then re-snapshot.
-/// 3. Neither: [`IntentError::NoMatch`] with the rendered evidence.
+/// 1. **Deterministic** (free, instant): click the first actionable control
+///    mentioning `noun`; unfold one header menu when it isn't directly
+///    visible. A URL change ends the pursuit as navigated.
+/// 2. **Model-guided** (only when `navigator` is `Some`): the navigator
+///    picks the next click from the live snapshot, up to
+///    [`MODEL_GOAL_MAX_STEPS`] steps. Every picked element id is validated
+///    against the snapshot before clicking.
 ///
-/// Deterministic and evidence-only: every click targets a control the live
-/// AX tree actually offered. Already-clicked nodes are never re-clicked,
-/// so menus cannot be toggled shut by the loop itself.
+/// [`IntentError::NoMatch`] with the rendered evidence when both phases
+/// fail; [`IntentError::Browser`] on CDP failure.
 ///
 /// # Errors
-/// Returns [`IntentError::NoMatch`] when the noun never appears and no
-/// header menu remains, and [`IntentError::Browser`] on CDP failure.
+/// Returns [`IntentError::NoMatch`] when the goal is not reached, and
+/// [`IntentError::Browser`] on CDP failure.
 pub async fn pursue_page_goal(
     browser: &ManagedBrowser,
     origin: &url::Url,
     noun: &str,
+    navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
 ) -> Result<PageGoalOutcome, IntentError> {
     let noun = noun.trim();
     if noun.is_empty() {
         return Err(IntentError::NoMatch("empty in-page goal".to_string()));
     }
+    let deterministic_miss = match pursue_deterministic(browser, origin, noun).await {
+        Ok(outcome) => return Ok(outcome),
+        // Browser errors fail fast: retrying them through the model would
+        // just burn model calls on a dead CDP session.
+        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+    };
+    let Some(navigator) = navigator else {
+        return Err(IntentError::NoMatch(deterministic_miss));
+    };
+    pursue_with_model(browser, origin, noun, navigator, deterministic_miss).await
+}
+
+/// Phase 1: deterministic observe-act loop. Evidence-only: every click
+/// targets a control the live AX tree actually offered. Already-clicked
+/// nodes are never re-clicked, so menus cannot be toggled shut by the loop
+/// itself.
+async fn pursue_deterministic(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    noun: &str,
+) -> Result<PageGoalOutcome, IntentError> {
     let mut clicked: Vec<i64> = Vec::new();
     for _ in 0..PAGE_GOAL_MAX_STEPS {
         let (elements, _, _) = browser.ax_snapshot(origin).await;
@@ -986,20 +1016,9 @@ pub async fn pursue_page_goal(
         if let Some(target) = select_page_control(&elements, noun, &clicked) {
             let label = target.name.clone();
             let node_id = target.backend_node_id;
-            let from = browser
-                .current_url()
-                .await?
-                .ok_or(browser_driver::BrowserError::WrongOrigin)?;
             click_element(browser, target).await?;
             clicked.push(node_id);
-            if let Some(landed) = wait_for_navigation_with(
-                || async { browser.current_url().await.ok().flatten() },
-                &from,
-                std::time::Duration::from_millis(FOLLOW_POLL_MS),
-                std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),
-            )
-            .await
-            {
+            if let Some(landed) = wait_for_url_change(browser).await {
                 return Ok(PageGoalOutcome::Navigated { label, landed });
             }
             // No navigation: a menu or popover may have opened. Loop and
@@ -1018,6 +1037,85 @@ pub async fn pursue_page_goal(
     Err(IntentError::NoMatch(format!(
         "In-page goal '{noun}' not reached after {PAGE_GOAL_MAX_STEPS} steps."
     )))
+}
+
+/// Phase 2: model-guided observe-act loop. The navigator sees the goal plus
+/// the snapshot's actionable elements and picks one [`PageAction`]; the
+/// pick is validated against the snapshot before anything clicks.
+async fn pursue_with_model(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    goal: &str,
+    navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    deterministic_miss: String,
+) -> Result<PageGoalOutcome, IntentError> {
+    use crate::navigator::PageAction;
+    for _ in 0..MODEL_GOAL_MAX_STEPS {
+        let (elements, _, _) = browser.ax_snapshot(origin).await;
+        // The navigator is synchronous (one bounded HTTP call); the async
+        // runtime never blocks on it. Everything the closure touches is
+        // owned, so the future stays `'static`.
+        let goal_owned = goal.to_owned();
+        let owned_elements = elements.clone();
+        let owned_navigator = navigator.clone();
+        let action = tokio::task::spawn_blocking(move || {
+            owned_navigator.next_action(&goal_owned, &owned_elements)
+        })
+        .await
+        .map_err(|_| {
+            IntentError::NoMatch("navigator task failed; {deterministic_miss}".to_string())
+        })?;
+        match action {
+            None => {
+                return Err(IntentError::NoMatch(format!(
+                    "navigator declined; {deterministic_miss}"
+                )));
+            }
+            Some(PageAction::GiveUp { reason }) => {
+                return Err(IntentError::NoMatch(format!(
+                    "navigator gave up ({reason}); {deterministic_miss}"
+                )));
+            }
+            Some(PageAction::Done) => {
+                let landed = browser
+                    .current_url()
+                    .await?
+                    .ok_or(browser_driver::BrowserError::WrongOrigin)?;
+                return Ok(PageGoalOutcome::AlreadyThere { landed });
+            }
+            Some(PageAction::Click { target }) => {
+                let element = elements
+                    .iter()
+                    .find(|element| element.backend_node_id == target)
+                    .ok_or_else(|| {
+                        IntentError::NoMatch(format!(
+                            "navigator picked unknown element {target}"
+                        ))
+                    })?;
+                let label = element.name.clone();
+                click_element(browser, element).await?;
+                if let Some(landed) = wait_for_url_change(browser).await {
+                    return Ok(PageGoalOutcome::Navigated { label, landed });
+                }
+            }
+        }
+    }
+    Err(IntentError::NoMatch(format!(
+        "navigator exhausted {MODEL_GOAL_MAX_STEPS} steps; {deterministic_miss}"
+    )))
+}
+
+/// Wait for the live page's URL to change from what it is now: shared by
+/// both pursuit phases after every click.
+async fn wait_for_url_change(browser: &ManagedBrowser) -> Option<url::Url> {
+    let from = browser.current_url().await.ok()??;
+    wait_for_navigation_with(
+        || async { browser.current_url().await.ok().flatten() },
+        &from,
+        std::time::Duration::from_millis(FOLLOW_POLL_MS),
+        std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),
+    )
+    .await
 }
 
 /// First actionable control mentioning `noun`, in snapshot document order,

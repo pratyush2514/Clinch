@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 //! Versioned native-CDP replay with bounded, localized selector healing.
 pub mod executor;
+pub mod navigator;
 use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
@@ -14,6 +15,7 @@ pub use executor::{
     select_menu_button, select_page_control, select_search_result, settle_probe_text,
     wait_for_settled_candidates,
 };
+pub use navigator::{PageAction, PageNavigator};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 use url::Url;

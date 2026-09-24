@@ -3158,11 +3158,36 @@ impl AppService {
         // window, never navigate before acting.
         let browser = self.browser(BrowserIntent::Background).await?;
         let name = orchestration_engine::ephemeral_name(&prompt);
-        match macro_engine::pursue_page_goal(&browser, &portal, &noun).await {
+        // The model-guided phase is opt-in: `CLINCH_NAVIGATOR_PROVIDER`
+        // names `groq` or `ollama`; unset keeps the follow-up purely
+        // deterministic. Built once per dispatch and shared across the
+        // model phase's steps.
+        let navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>> =
+            orchestration_engine::LlmPageNavigator::from_env()
+                .map(|navigator| std::sync::Arc::new(navigator) as _);
+        let _ = self
+            .record(&format!(
+                "in_page_goal_navigator: {}",
+                if navigator.is_some() {
+                    "model-guided phase armed"
+                } else {
+                    "deterministic only"
+                }
+            ))
+            .await;
+        match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: '{label}' → {}",
+                        landed.host_str().unwrap_or("?")
+                    ))
+                    .await;
+            }
+            Ok(macro_engine::PageGoalOutcome::AlreadyThere { landed }) => {
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: already at {}",
                         landed.host_str().unwrap_or("?")
                     ))
                     .await;
