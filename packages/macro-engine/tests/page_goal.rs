@@ -8,7 +8,8 @@
 
 use browser_driver::AxElement;
 use macro_engine::{
-    page_goal_diagnostic, pick_rightmost, select_menu_button, select_page_control, zone_for,
+    ClickedControl, page_goal_diagnostic, pick_rightmost, select_menu_button, select_page_control,
+    zone_for,
 };
 
 fn el(id: i64, role: &str, name: &str, landmark: Option<&str>) -> AxElement {
@@ -47,9 +48,14 @@ fn select_page_control_skips_clicked() {
         el(1, "button", "View profile", None),
         el(2, "link", "Edit profile", None),
     ];
-    let picked = select_page_control(&elements, "profile", &[1]).expect("match");
+    let clicked = vec![ClickedControl::of(&elements[0])];
+    let picked = select_page_control(&elements, "profile", &clicked).expect("match");
     assert_eq!(picked.backend_node_id, 2);
-    assert!(select_page_control(&elements, "profile", &[1, 2]).is_none());
+    let clicked_all = vec![
+        ClickedControl::of(&elements[0]),
+        ClickedControl::of(&elements[1]),
+    ];
+    assert!(select_page_control(&elements, "profile", &clicked_all).is_none());
 }
 
 #[test]
@@ -63,10 +69,15 @@ fn select_menu_button_prefers_header() {
     let picked = select_menu_button(&elements, &[]).expect("menu");
     assert_eq!(picked.backend_node_id, 2);
     // Already-clicked menus are not re-offered.
-    let picked = select_menu_button(&elements, &[2]).expect("menu");
+    let clicked = vec![ClickedControl::of(&elements[1])];
+    let picked = select_menu_button(&elements, &clicked).expect("menu");
     assert_eq!(picked.backend_node_id, 3);
     // No header button left: none.
-    assert!(select_menu_button(&elements, &[2, 3]).is_none());
+    let clicked_all = vec![
+        ClickedControl::of(&elements[1]),
+        ClickedControl::of(&elements[2]),
+    ];
+    assert!(select_menu_button(&elements, &clicked_all).is_none());
     // Buttons outside page chrome are not menus.
     assert!(select_menu_button(&[el(1, "button", "Submit", None)], &[]).is_none());
 }
@@ -103,7 +114,8 @@ fn select_menu_button_falls_back_to_account_words() {
     let picked = select_menu_button(&elements, &[]).expect("menu");
     assert_eq!(picked.backend_node_id, 2);
     // Already-clicked account buttons are not re-offered.
-    assert!(select_menu_button(&elements, &[2]).is_none());
+    let clicked = vec![ClickedControl::of(&elements[1])];
+    assert!(select_menu_button(&elements, &clicked).is_none());
 }
 
 #[test]

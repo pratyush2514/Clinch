@@ -269,7 +269,7 @@ fn revealed_element(id: i64, role: &str, name: &str, container: &[&str]) -> AxEl
 /// click budget (caught by the live-browser proof).
 #[test]
 fn revealed_profile_ignores_stale_header_buttons() {
-    use macro_engine::select_revealed_profile;
+    use macro_engine::{ClickedControl, select_revealed_profile};
     use std::collections::HashSet;
     // Document order: header buttons first, the menu link last — like a
     // real opened menu.
@@ -278,7 +278,8 @@ fn revealed_profile_ignores_stale_header_buttons() {
         revealed_element(2, "button", "kx7", &["Profile"]),
         revealed_element(3, "link", "Profile", &[]),
     ];
-    let clicked = vec![2];
+    // The kx7 button was already tried (stable identity, not node id).
+    let clicked = vec![ClickedControl::of(&elements[1])];
     // The header buttons were in the previous snapshot: only the menu
     // link is genuinely revealed.
     let seen: HashSet<i64> = [1, 2].into_iter().collect();
@@ -288,16 +289,23 @@ fn revealed_profile_ignores_stale_header_buttons() {
 
 #[test]
 fn revealed_profile_without_freshness_would_pick_stale_chrome() {
-    use macro_engine::select_revealed_profile;
+    use macro_engine::{ClickedControl, select_revealed_profile};
     use std::collections::HashSet;
     // Pins the failure mode the freshness set exists to prevent: without
-    // it, the first header button wins by document order.
+    // it, the first header button wins by document order. The tried
+    // control matches nothing on the page, so exclusion changes nothing.
     let elements = vec![
         revealed_element(1, "button", "Search", &["Profile"]),
         revealed_element(3, "link", "Profile", &[]),
     ];
+    let clicked = vec![ClickedControl::of(&revealed_element(
+        9,
+        "button",
+        "already tried elsewhere",
+        &[],
+    ))];
     let picked =
-        select_revealed_profile(&elements, &[2], &HashSet::new()).expect("something picked");
+        select_revealed_profile(&elements, &clicked, &HashSet::new()).expect("something picked");
     assert_eq!(picked.backend_node_id, 1);
 }
 
@@ -307,4 +315,26 @@ fn revealed_profile_stays_gated_on_worker_opened_something() {
     use std::collections::HashSet;
     let elements = vec![revealed_element(3, "link", "u/someone", &[])];
     assert!(select_revealed_profile(&elements, &[], &HashSet::new()).is_none());
+}
+
+/// Regression (live Reddit, 2026-09-25): the worker clicked "Open user
+/// actions" three times because retry exclusion keyed on
+/// `backend_node_id`, which churns when the page re-renders between
+/// snapshots. Exclusion is by stable role+name identity, so a
+/// re-rendered control is still recognized as already tried.
+#[test]
+fn clicked_identity_survives_node_id_churn() {
+    use macro_engine::{ClickedControl, select_menu_button};
+    let first = revealed_element(7, "button", "Open user actions", &[]);
+    // Same logical button, new backend node id after a re-render.
+    let rerendered = revealed_element(42, "button", "Open user actions", &[]);
+    let other = revealed_element(43, "button", "Search", &[]);
+    let clicked = vec![ClickedControl::of(&first)];
+    let elements = vec![rerendered, other];
+    // The re-rendered button is recognized as already tried despite its
+    // new node id, so the worker advances instead of re-clicking it.
+    // ("Search" matches no account word, so nothing is left to offer.)
+    assert!(select_menu_button(&elements, &clicked).is_none());
+    // And an untouched control is still offered.
+    assert!(select_menu_button(&elements, &[]).is_some());
 }

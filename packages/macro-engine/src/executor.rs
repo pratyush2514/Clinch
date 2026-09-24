@@ -1031,6 +1031,42 @@ pub async fn pursue_page_goal(
     pursue_with_model(browser, origin, noun, navigator, deterministic_miss).await
 }
 
+/// Stable identity for a control the worker already tried. Backend node
+/// ids churn on dynamic pages — React re-renders the header between
+/// snapshots — so retry exclusion keys on what the user perceives
+/// (role + name), never the node id. Without this the worker re-clicks
+/// the same menu button once per snapshot and never advances to the next
+/// candidate (caught on live Reddit: "Open user actions" clicked 3×).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickedControl {
+    role: String,
+    name: String,
+}
+
+impl ClickedControl {
+    /// Stable key for `element`: role plus trimmed, lowercased name.
+    #[must_use]
+    pub fn of(element: &AxElement) -> Self {
+        Self {
+            role: element.role.clone(),
+            name: element.name.trim().to_lowercase(),
+        }
+    }
+
+    /// Whether `element` is the same logical control, regardless of the
+    /// backend node id the current snapshot assigned it.
+    #[must_use]
+    pub fn matches(&self, element: &AxElement) -> bool {
+        self.role == element.role && self.name == element.name.trim().to_lowercase()
+    }
+}
+
+/// Whether `element` was already tried, by stable identity rather than
+/// the snapshot-local backend node id.
+fn already_clicked(clicked: &[ClickedControl], element: &AxElement) -> bool {
+    clicked.iter().any(|tried| tried.matches(element))
+}
+
 /// Pursue an `account_home` goal ("my profile", "my account") on the
 /// already-loaded portal page. Unlike the generic noun hunt, this worker
 /// is scoped to the header identity chrome:
@@ -1088,7 +1124,7 @@ async fn pursue_identity_chrome(
     browser: &ManagedBrowser,
     origin: &url::Url,
 ) -> Result<PageGoalOutcome, IntentError> {
-    let mut clicked: Vec<i64> = Vec::new();
+    let mut clicked: Vec<ClickedControl> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     // Node ids from the previous iteration's snapshot. A "revealed"
     // destination must be genuinely new: the container-text rollup lets an
@@ -1124,7 +1160,7 @@ async fn pursue_identity_chrome(
             }
             // No usable href: click the revealed control and watch the URL.
             click_element(browser, target).await?;
-            clicked.push(node_id);
+            clicked.push(ClickedControl::of(target));
             tried.push(tried_label(target, "clicked, watching URL"));
             if let Some(landed) = wait_for_url_change(browser).await {
                 let username = username_from_menu_text(&label);
@@ -1142,15 +1178,28 @@ async fn pursue_identity_chrome(
         };
         let name = control.name.clone();
         let role = control.role.clone();
-        let node_id = control.backend_node_id;
+        let tried_key = ClickedControl::of(control);
         click_element(browser, control).await?;
-        clicked.push(node_id);
+        clicked.push(tried_key);
         wait_for_menu(browser).await;
         let (after, _, _) = browser.ax_snapshot(origin).await;
-        let effect = if count_actionable(&after) > actionable_before {
-            "menu opened"
+        let actionable_after = count_actionable(&after);
+        // Name what actually appeared: on the next miss the journal shows
+        // whether the menu opened with unexpected roles, or at all. Node
+        // ids churn on dynamic pages, so "new" here is informational —
+        // the retry exclusion above keys on stable identity, not ids.
+        let before_ids: std::collections::HashSet<i64> =
+            elements.iter().map(|el| el.backend_node_id).collect();
+        let new_nodes: Vec<String> = after
+            .iter()
+            .filter(|el| !before_ids.contains(&el.backend_node_id))
+            .take(6)
+            .map(|el| format!("{} '{}'", el.role, el.name))
+            .collect();
+        let effect = if new_nodes.is_empty() {
+            format!("no new controls (actionable {actionable_before} → {actionable_after})")
         } else {
-            "no new controls"
+            format!("+{} new [{}]", new_nodes.len(), new_nodes.join(", "))
         };
         tried.push(format!("{role} '{name}' → {effect}"));
         previously_seen = currently_seen;
@@ -1167,8 +1216,14 @@ async fn pursue_account_home_with_model(
     navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
     deterministic_miss: String,
 ) -> Result<PageGoalOutcome, IntentError> {
-    let goal = "account home: open the account/avatar menu in the page header, then the profile control, to reach my own profile page";
-    match pursue_with_model(browser, origin, goal, navigator, deterministic_miss).await {
+    // The deterministic tried-log rides along as prompt context: without
+    // it the model re-proposes (or fails to recognize) controls the
+    // deterministic phase already evaluated — e.g. concluding "no avatar
+    // present" while staring at the "Open user actions" button it tried.
+    let goal = format!(
+        "account home: open the account/avatar menu in the page header, then the profile control, to reach my own profile page. Already tried without success: {deterministic_miss}"
+    );
+    match pursue_with_model(browser, origin, &goal, navigator, deterministic_miss).await {
         Ok(PageGoalOutcome::Navigated { label, landed }) => {
             verify_account_home(browser, origin, &label, &landed, None).await
         }
@@ -1186,11 +1241,11 @@ async fn pursue_account_home_with_model(
 async fn select_identity_control<'a>(
     browser: &ManagedBrowser,
     elements: &'a [AxElement],
-    clicked: &[i64],
+    clicked: &[ClickedControl],
 ) -> Option<&'a AxElement> {
     if let Some(control) = elements.iter().find(|element| {
         element.role == "button"
-            && !clicked.contains(&element.backend_node_id)
+            && !already_clicked(clicked, element)
             && mentions_account_word(element)
     }) {
         return Some(control);
@@ -1208,7 +1263,7 @@ async fn select_identity_control<'a>(
 #[must_use]
 pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
     elements: &'a [AxElement],
-    clicked: &[i64],
+    clicked: &[ClickedControl],
     previously_seen: &std::collections::HashSet<i64, S>,
 ) -> Option<&'a AxElement> {
     if clicked.is_empty() {
@@ -1216,7 +1271,7 @@ pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
     }
     elements.iter().find(|element| {
         PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            && !clicked.contains(&element.backend_node_id)
+            && !already_clicked(clicked, element)
             && !previously_seen.contains(&element.backend_node_id)
             && (mentions_noun(element, "profile")
                 || mentions_noun(element, "account")
@@ -1445,15 +1500,15 @@ async fn pursue_deterministic(
     origin: &url::Url,
     noun: &str,
 ) -> Result<PageGoalOutcome, IntentError> {
-    let mut clicked: Vec<i64> = Vec::new();
+    let mut clicked: Vec<ClickedControl> = Vec::new();
     for _ in 0..PAGE_GOAL_MAX_STEPS {
         let (elements, _, _) = browser.ax_snapshot(origin).await;
         // 1. Direct hit: actionable control mentioning the noun.
         if let Some(target) = select_page_control(&elements, noun, &clicked) {
             let label = target.name.clone();
-            let node_id = target.backend_node_id;
+            let tried_key = ClickedControl::of(target);
             click_element(browser, target).await?;
-            clicked.push(node_id);
+            clicked.push(tried_key);
             if let Some(landed) = wait_for_url_change(browser).await {
                 return Ok(PageGoalOutcome::Navigated { label, landed });
             }
@@ -1465,13 +1520,15 @@ async fn pursue_deterministic(
         // landmarked or account-worded first, then the rightmost header
         // button by live geometry for landmark-less headers.
         if let Some(menu) = select_menu_button(&elements, &clicked) {
-            clicked.push(menu.backend_node_id);
+            let tried_key = ClickedControl::of(menu);
             click_element(browser, menu).await?;
+            clicked.push(tried_key);
             continue;
         }
         if let Some(rightmost) = select_rightmost_button(browser, &elements, &clicked).await {
-            clicked.push(rightmost.backend_node_id);
+            let tried_key = ClickedControl::of(rightmost);
             click_element(browser, rightmost).await?;
+            clicked.push(tried_key);
             continue;
         }
         // 3. Nothing left to try.
@@ -1575,14 +1632,14 @@ async fn wait_for_url_change(browser: &ManagedBrowser) -> Option<url::Url> {
 pub fn select_page_control<'a>(
     elements: &'a [AxElement],
     noun: &str,
-    clicked: &[i64],
+    clicked: &[ClickedControl],
 ) -> Option<&'a AxElement> {
     if noun.trim().is_empty() {
         return None;
     }
     elements.iter().find(|element| {
         PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            && !clicked.contains(&element.backend_node_id)
+            && !already_clicked(clicked, element)
             && mentions_noun(element, noun)
     })
 }
@@ -1595,18 +1652,21 @@ pub fn select_page_control<'a>(
 /// the async [`select_topmost_button`] — live geometry as a last resort.
 /// Already-clicked nodes are skipped.
 #[must_use]
-pub fn select_menu_button<'a>(elements: &'a [AxElement], clicked: &[i64]) -> Option<&'a AxElement> {
+pub fn select_menu_button<'a>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+) -> Option<&'a AxElement> {
     elements
         .iter()
         .find(|element| {
             element.role == "button"
-                && !clicked.contains(&element.backend_node_id)
+                && !already_clicked(clicked, element)
                 && matches!(element.landmark.as_deref(), Some("banner" | "navigation"))
         })
         .or_else(|| {
             elements.iter().find(|element| {
                 element.role == "button"
-                    && !clicked.contains(&element.backend_node_id)
+                    && !already_clicked(clicked, element)
                     && mentions_account_word(element)
             })
         })
@@ -1659,14 +1719,14 @@ pub fn pick_rightmost(rects: &[(i64, f64, f64)], strip_bottom: f64) -> Option<i6
 async fn select_rightmost_button<'a>(
     browser: &ManagedBrowser,
     elements: &'a [AxElement],
-    clicked: &[i64],
+    clicked: &[ClickedControl],
 ) -> Option<&'a AxElement> {
     let (_, viewport_height) = browser.viewport_size().await?;
     let strip_bottom = viewport_height * HEADER_STRIP_FRACTION;
     let mut rects: Vec<(i64, f64, f64)> = Vec::new();
     for element in elements
         .iter()
-        .filter(|element| element.role == "button" && !clicked.contains(&element.backend_node_id))
+        .filter(|element| element.role == "button" && !already_clicked(clicked, element))
     {
         // `node_rect` rejects degenerate (hidden) boxes, so invisible
         // controls never become candidates.
