@@ -935,6 +935,156 @@ pub async fn follow_search_result(
     Ok(FollowedResult { label, landed })
 }
 
+/// What pursuing an in-page follow-up did. The landed URL is observed from
+/// the live page, never predicted — the same contract as [`FollowedResult`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageGoalOutcome {
+    /// A click navigated somewhere new: the clicked label plus the URL.
+    Navigated { label: String, landed: url::Url },
+}
+
+/// In-page follow-up budget: observe-act steps before the pursuit gives up
+/// and reports [`IntentError::NoMatch`] with the evidence.
+const PAGE_GOAL_MAX_STEPS: usize = 3;
+
+/// Actionable roles a follow-up can meaningfully click: links plus the
+/// controls menus are made of. Wider than [`select_search_result`]'s
+/// link-only contract on purpose — on a portal page the target often lives
+/// behind a button.
+const PAGE_GOAL_ROLES: &[&str] = &["link", "button", "menuitem", "menuitemlink"];
+
+/// Pursue `noun` on the already-loaded portal page: the Muse-style
+/// follow-up. No new browser, no entry-URL resolution, no navigation
+/// before acting. Bounded observe-act loop:
+///
+/// 1. Snapshot; click the first actionable control mentioning `noun`. A
+///    URL change ends the pursuit as navigated.
+/// 2. No direct hit: click one unopened header menu/disclosure button to
+///    reveal more controls, then re-snapshot.
+/// 3. Neither: [`IntentError::NoMatch`] with the rendered evidence.
+///
+/// Deterministic and evidence-only: every click targets a control the live
+/// AX tree actually offered. Already-clicked nodes are never re-clicked,
+/// so menus cannot be toggled shut by the loop itself.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the noun never appears and no
+/// header menu remains, and [`IntentError::Browser`] on CDP failure.
+pub async fn pursue_page_goal(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    noun: &str,
+) -> Result<PageGoalOutcome, IntentError> {
+    let noun = noun.trim();
+    if noun.is_empty() {
+        return Err(IntentError::NoMatch("empty in-page goal".to_string()));
+    }
+    let mut clicked: Vec<i64> = Vec::new();
+    for _ in 0..PAGE_GOAL_MAX_STEPS {
+        let (elements, _, _) = browser.ax_snapshot(origin).await;
+        // 1. Direct hit: actionable control mentioning the noun.
+        if let Some(target) = select_page_control(&elements, noun, &clicked) {
+            let label = target.name.clone();
+            let node_id = target.backend_node_id;
+            let from = browser
+                .current_url()
+                .await?
+                .ok_or(browser_driver::BrowserError::WrongOrigin)?;
+            click_element(browser, target).await?;
+            clicked.push(node_id);
+            if let Some(landed) = wait_for_navigation_with(
+                || async { browser.current_url().await.ok().flatten() },
+                &from,
+                std::time::Duration::from_millis(FOLLOW_POLL_MS),
+                std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),
+            )
+            .await
+            {
+                return Ok(PageGoalOutcome::Navigated { label, landed });
+            }
+            // No navigation: a menu or popover may have opened. Loop and
+            // re-snapshot against the new tree.
+            continue;
+        }
+        // 2. No direct hit: reveal more controls via one header menu.
+        if let Some(menu) = select_menu_button(&elements, &clicked) {
+            clicked.push(menu.backend_node_id);
+            click_element(browser, menu).await?;
+            continue;
+        }
+        // 3. Nothing left to try.
+        return Err(IntentError::NoMatch(page_goal_diagnostic(&elements, noun)));
+    }
+    Err(IntentError::NoMatch(format!(
+        "In-page goal '{noun}' not reached after {PAGE_GOAL_MAX_STEPS} steps."
+    )))
+}
+
+/// First actionable control mentioning `noun`, in snapshot document order,
+/// skipping nodes the loop already clicked. Page chrome is deliberately
+/// NOT excluded here (unlike search results): on a portal page the header
+/// is exactly where profile and settings live.
+#[must_use]
+pub fn select_page_control<'a>(
+    elements: &'a [AxElement],
+    noun: &str,
+    clicked: &[i64],
+) -> Option<&'a AxElement> {
+    if noun.trim().is_empty() {
+        return None;
+    }
+    elements.iter().find(|element| {
+        PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            && !clicked.contains(&element.backend_node_id)
+            && mentions_noun(element, noun)
+    })
+}
+
+/// One unopened menu/disclosure button in the page header, to reveal more
+/// controls when the noun isn't directly visible. Banner first (avatars,
+/// user menus), then navigation. Already-clicked nodes are skipped.
+#[must_use]
+pub fn select_menu_button<'a>(
+    elements: &'a [AxElement],
+    clicked: &[i64],
+) -> Option<&'a AxElement> {
+    elements.iter().find(|element| {
+        element.role == "button"
+            && !clicked.contains(&element.backend_node_id)
+            && matches!(
+                element.landmark.as_deref(),
+                Some("banner") | Some("navigation")
+            )
+    })
+}
+
+/// Diagnostic for a failed in-page pursuit: the noun plus every actionable
+/// control the page offered, so the miss reads as evidence.
+#[must_use]
+pub fn page_goal_diagnostic(elements: &[AxElement], noun: &str) -> String {
+    let mut rendered: Vec<String> = Vec::new();
+    let mut controls = 0_usize;
+    for element in elements
+        .iter()
+        .filter(|element| PAGE_GOAL_ROLES.contains(&element.role.as_str()))
+    {
+        controls += 1;
+        if rendered.len() >= MAX_DIAGNOSTIC_CANDIDATES {
+            continue;
+        }
+        let text: String = element.name.chars().take(MAX_DIAGNOSTIC_TEXT_LEN).collect();
+        rendered.push(format!("'{}' [{}]", text, element.role));
+    }
+    let hidden = controls.saturating_sub(rendered.len());
+    if hidden > 0 {
+        rendered.push(format!("… and {hidden} more"));
+    }
+    format!(
+        "In-page goal '{noun}' found no match. Evaluated {controls} controls: [{}]",
+        rendered.join(", ")
+    )
+}
+
 /// Pure route-mismatch decision for entry pre-conditions: literal URL
 /// inequality, so any drift — path, query, or trailing-slash normalization
 /// aside — navigates rather than grounding on the wrong page.

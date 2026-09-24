@@ -722,7 +722,7 @@ fn singular_stem(token: &str) -> String {
 /// (`… from github`, `… on github`, `… at github`). Closed English grammar
 /// vocabulary, never a site list: the complement itself is whatever word
 /// the user typed, and nothing here checks it against known portals.
-const PREPOSITION_CUES: &[&str] = &["from", "on", "at"];
+const PREPOSITION_CUES: &[&str] = &["from", "on", "at", "in"];
 
 /// Verbs the parser reads as the clause's verb slot rather than a noun.
 /// Their only job is telling a real prepositional complement
@@ -917,9 +917,14 @@ pub fn parse_grammar(prompt: &str, connected_origin: Option<&url::Url>) -> Parse
         if !PREPOSITION_CUES.contains(&word.as_str()) {
             continue;
         }
+        // The site is the next content-bearing token after the cue: articles
+        // and other structure words ("in the reddit", "from my github")
+        // must not block the noun behind them.
         let Some(site) = words
-            .get(position + 1)
-            .filter(|token| is_content(token.as_str()))
+            .get(position + 1..)
+            .unwrap_or_default()
+            .iter()
+            .find(|token| is_content(token.as_str()))
         else {
             continue;
         };
@@ -1137,6 +1142,37 @@ pub fn is_direct_open(prompt: &str, grammar: &ParsedGrammar) -> bool {
     content
         .first()
         .is_some_and(|verb| OPEN_VERBS.contains(&verb.as_str()))
+}
+
+/// Detect a Muse-style in-page follow-up: the prompt explicitly names the
+/// connected portal as its site and carries an artifact noun — "open my
+/// profile in reddit" while on reddit.com. Returns the artifact noun to
+/// pursue on the live page instead of resolving a new entry URL.
+///
+/// Conservative by design: only fires on an explicit site mention that
+/// matches the current portal's host. Bare "open profile" (no site) keeps
+/// the old direct-open behavior, and a different named site ("open amazon"
+/// while on reddit.com) still opens a new portal.
+#[must_use]
+pub fn detect_in_page_goal(
+    prompt: &str,
+    connected_origin: Option<&url::Url>,
+) -> Option<String> {
+    let origin = connected_origin?;
+    let grammar = parse_grammar(prompt, Some(origin));
+    if !grammar.confidence.is_high() {
+        return None;
+    }
+    let site = grammar.site_context.as_deref()?;
+    let artifact = grammar.artifact_noun.as_deref()?;
+    let host = origin.host_str()?.to_lowercase();
+    // Substring match on the host: "www.reddit.com" contains "reddit".
+    // The site token is content-bearing (never a stopword), so a spurious
+    // two-letter match cannot arise from articles.
+    if !host.contains(&site.to_lowercase()) {
+        return None;
+    }
+    Some(artifact.to_string())
 }
 
 /// Deterministic structured fallback: instant, offline, no model call.
@@ -2155,6 +2191,18 @@ mod tests {
         let parsed = parse_grammar("click on pay now", None);
         assert_eq!(parsed.site_context, None);
         assert_eq!(parsed.target_noun.as_deref(), Some("pay"));
+        // Articles between the cue and the site don't block it, and `in`
+        // reads as a site cue: "open profile for me in the reddit" names
+        // reddit, not a bare "profile" search.
+        for (prompt, artifact, site) in [
+            ("open profile for me in the reddit", "profile", "reddit"),
+            ("download invoices from the acmecorp", "invoice", "acmecorp"),
+            ("grab my statements in zzyzxbank", "statement", "zzyzxbank"),
+        ] {
+            let parsed = parse_grammar(prompt, None);
+            assert_eq!(parsed.artifact_noun.as_deref(), Some(artifact), "{prompt}");
+            assert_eq!(parsed.site_context.as_deref(), Some(site), "{prompt}");
+        }
         // A cue followed by structure rather than a place is not a complement
         // either: months, ordinals, and digits never name a destination.
         let parsed = parse_grammar("download the declined invoice from June 12", None);

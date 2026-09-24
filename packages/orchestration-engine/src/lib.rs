@@ -18,9 +18,9 @@ pub use intent_parser::{
 };
 pub use intent_resolver::{
     AppCommand, CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent,
-    VariableExtraction, VariableKind, decompose_command, ephemeral_name, extract_dynamic_variables,
-    extract_identifier, is_direct_open, parse_grammar, parse_intent_structured, prompt_key,
-    resolve_app_command, resolve_command,
+    VariableExtraction, VariableKind, decompose_command, detect_in_page_goal, ephemeral_name,
+    extract_dynamic_variables, extract_identifier, is_direct_open, parse_grammar,
+    parse_intent_structured, prompt_key, resolve_app_command, resolve_command,
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use route_proposer::{

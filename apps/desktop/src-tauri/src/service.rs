@@ -2919,6 +2919,13 @@ impl AppService {
         mut intent: macro_engine::SemanticIntent,
         emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Muse-style follow-up: the prompt explicitly names the connected
+        // portal as its site and carries an artifact noun ("open my profile
+        // in reddit" while on reddit.com). Pursue it on the live page — no
+        // new browser, no entry-URL resolution, no navigation before acting.
+        if let Some(noun) = orchestration_engine::detect_in_page_goal(&prompt, Some(&portal)) {
+            return self.dispatch_in_page_goal(portal, prompt, noun, emit).await;
+        }
         // Ephemeral entry point (command-bar Run): propose the route at the
         // top, before any macro task step exists, so `intent.entry_url` and
         // step 1 carry the same proposed route into pre-navigation. The
@@ -3028,6 +3035,73 @@ impl AppService {
             // carries none itself.
             // Inner outcome: settle_ephemeral_outcome detects challenges
             // after delegation returns.
+            final_frame: None,
+            challenge: None,
+            auth_url: None,
+            final_url: None,
+            page_title: None,
+        })
+    }
+
+    /// Execute a Muse-style in-page follow-up: pursue the artifact noun on the
+    /// live portal page without resolving a new entry URL or navigating
+    /// first. The pursuit is the macro engine's bounded observe-act loop
+    /// (click a control mentioning the noun; unfold one header menu when
+    /// the noun isn't directly visible). Settle — final frame plus
+    /// challenge handling — runs in `settle_ephemeral_outcome` after this
+    /// returns, exactly like every other ephemeral lane.
+    async fn dispatch_in_page_goal(
+        &self,
+        portal: url::Url,
+        prompt: String,
+        noun: String,
+        _emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        let goal_line = format!(
+            "in_page_goal: '{noun}' on {}",
+            portal.host_str().unwrap_or("?")
+        );
+        let _ = self.record(&goal_line).await;
+        // Background intent: reuse the attached session, never open a
+        // window, never navigate before acting.
+        let browser = self.browser(BrowserIntent::Background).await?;
+        let name = orchestration_engine::ephemeral_name(&prompt);
+        match macro_engine::pursue_page_goal(&browser, &portal, &noun).await {
+            Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: '{label}' → {}",
+                        landed.host_str().unwrap_or("?")
+                    ))
+                    .await;
+            }
+            Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
+                let _ = self
+                    .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                return Err(AppError::WorkflowFailed);
+            }
+            Err(macro_engine::IntentError::Browser(_)) => {
+                let _ = self.record("in_page_goal_miss: browser error").await;
+                return Err(AppError::BrowserUnavailable);
+            }
+        }
+        // A pure in-page goal ends at the landing like a pure direct open:
+        // the navigation IS the task, and there are no playbook steps.
+        Ok(DispatchOutcome {
+            kind: "ephemeral",
+            name,
+            result: orchestration_engine::SequenceOutcome {
+                completed_steps: 0,
+                total_steps: 0,
+                status: orchestration_engine::SequenceStatus::Completed,
+                stopped_at: None,
+            },
+            steps: Vec::new(),
+            run_id: None,
+            lend_id: None,
+            route_log: Some(goal_line),
+            telemetry_log: None,
             final_frame: None,
             challenge: None,
             auth_url: None,
