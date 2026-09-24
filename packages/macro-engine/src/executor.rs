@@ -722,14 +722,36 @@ fn is_page_chrome(element: &AxElement) -> bool {
 /// text (`Invoices`, `INV-001` carries no noun and relies on scope
 /// instead). Single-intent resolution never consults the anchor — fuzzy
 /// tolerance there is a feature, not a bug.
+///
+/// A tiny closed synonym table covers vocabulary sites use interchangeably
+/// for the same surface (`profile`/`account` name the signed-in user's
+/// page on most portals). General words only — never site procedures.
+const NOUN_SYNONYMS: &[(&str, &[&str])] = &[
+    ("profile", &["account"]),
+    ("account", &["profile"]),
+];
+
 fn mentions_noun(element: &AxElement, noun: &str) -> bool {
     let stem = noun.trim().to_lowercase();
     if stem.is_empty() {
         return true;
     }
-    normalize(&element.name).contains(&stem)
-        || normalize(&element.description).contains(&stem)
-        || joined_container(element).contains(&stem)
+    let expanded: Vec<&str> = std::iter::once(stem.as_str())
+        .chain(
+            NOUN_SYNONYMS
+                .iter()
+                .find(|(word, _)| *word == stem)
+                .map(|(_, synonyms)| synonyms.iter().copied())
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+    let name = normalize(&element.name);
+    let description = normalize(&element.description);
+    let container = joined_container(element);
+    expanded
+        .iter()
+        .any(|word| name.contains(word) || description.contains(word) || container.contains(word))
 }
 
 /// Collect every eligible data candidate in document order for plural
@@ -1025,10 +1047,18 @@ async fn pursue_deterministic(
             // re-snapshot against the new tree.
             continue;
         }
-        // 2. No direct hit: reveal more controls via one header menu.
+        // 2. No direct hit: reveal more controls via one header menu —
+        // landmarked or account-worded first, then the topmost header
+        // button by live geometry for landmark-less headers.
         if let Some(menu) = select_menu_button(&elements, &clicked) {
             clicked.push(menu.backend_node_id);
             click_element(browser, menu).await?;
+            continue;
+        }
+        if let Some(topmost) = select_topmost_button(browser, &elements, &clicked).await
+        {
+            clicked.push(topmost.backend_node_id);
+            click_element(browser, topmost).await?;
             continue;
         }
         // 3. Nothing left to try.
@@ -1055,11 +1085,19 @@ async fn pursue_with_model(
         // The navigator is synchronous (one bounded HTTP call); the async
         // runtime never blocks on it. Everything the closure touches is
         // owned, so the future stays `'static`.
+        //
+        // Zone the same head slice the navigator renders, so `zones[i]`
+        // describes rendered line `i`. Best-effort: unzoned on failure.
         let goal_owned = goal.to_owned();
-        let owned_elements = elements.clone();
+        let owned_elements: Vec<AxElement> = elements
+            .iter()
+            .take(crate::MAX_NAVIGATOR_ELEMENTS)
+            .cloned()
+            .collect();
+        let zones = position_zones(browser, &owned_elements).await;
         let owned_navigator = navigator.clone();
         let action = tokio::task::spawn_blocking(move || {
-            owned_navigator.next_action(&goal_owned, &owned_elements)
+            owned_navigator.next_action_zoned(&goal_owned, &owned_elements, &zones)
         })
         .await
         .map_err(|_| {
@@ -1139,21 +1177,157 @@ pub fn select_page_control<'a>(
 }
 
 /// One unopened menu/disclosure button in the page header, to reveal more
-/// controls when the noun isn't directly visible. Banner first (avatars,
-/// user menus), then navigation. Already-clicked nodes are skipped.
+/// controls when the noun isn't directly visible. Three passes, cheapest
+/// first: banner/navigation landmarks (avatars, user menus), then a closed
+/// class of account-menu words for headers that carry no landmark (avatar
+/// buttons named after the username, web-component headers), and — only in
+/// the async [`select_topmost_button`] — live geometry as a last resort.
+/// Already-clicked nodes are skipped.
 #[must_use]
 pub fn select_menu_button<'a>(
     elements: &'a [AxElement],
     clicked: &[i64],
 ) -> Option<&'a AxElement> {
-    elements.iter().find(|element| {
-        element.role == "button"
-            && !clicked.contains(&element.backend_node_id)
-            && matches!(
-                element.landmark.as_deref(),
-                Some("banner") | Some("navigation")
-            )
+    elements
+        .iter()
+        .find(|element| {
+            element.role == "button"
+                && !clicked.contains(&element.backend_node_id)
+                && matches!(
+                    element.landmark.as_deref(),
+                    Some("banner") | Some("navigation")
+                )
+        })
+        .or_else(|| {
+            elements.iter().find(|element| {
+                element.role == "button"
+                    && !clicked.contains(&element.backend_node_id)
+                    && mentions_account_word(element)
+            })
+        })
+}
+
+/// Closed general vocabulary for account-menu disclosure buttons: `menu`,
+/// `account`, `user`, `avatar`. Token-contains matching covers compounds
+/// (`usermenu`, `u_someuser`) without matching across token boundaries.
+/// General words, never site procedures.
+const ACCOUNT_MENU_WORDS: &[&str] = &["menu", "account", "user", "avatar"];
+
+fn mentions_account_word(element: &AxElement) -> bool {
+    [&element.name, &element.description]
+        .iter()
+        .flat_map(|text| normalize(text).split(' ').map(str::to_owned).collect::<Vec<_>>())
+        .any(|token| {
+            ACCOUNT_MENU_WORDS
+                .iter()
+                .any(|word| token.contains(word))
+        })
+}
+
+/// Header strip as a fraction of viewport height: account controls live in
+/// page headers, and headers live at the top. A button below the strip is
+/// page content, never a header menu — fail closed, never click it.
+const HEADER_STRIP_FRACTION: f64 = 0.25;
+
+/// Pure ranking for the geometry fallback: smallest `y` (topmost) wins,
+/// but only inside the header strip. Untestable CDP calls stay outside in
+/// [`select_topmost_button`]; the decision itself is unit-tested.
+#[must_use]
+pub fn pick_topmost(rects: &[(i64, f64)], strip_bottom: f64) -> Option<i64> {
+    rects
+        .iter()
+        .filter(|(_, y)| *y <= strip_bottom)
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _)| *id)
+}
+
+/// Last-resort header-menu pick for landmark-less, word-less headers
+/// (avatar buttons named after the username, web-component headers with
+/// no AX landmark). Measures every unclicked button via `DOM.getBoxModel`
+/// and takes the topmost one inside the header strip. Best-effort:
+/// unreadable geometry or an unreadable viewport fails closed to `None`.
+async fn select_topmost_button<'a>(
+    browser: &ManagedBrowser,
+    elements: &'a [AxElement],
+    clicked: &[i64],
+) -> Option<&'a AxElement> {
+    let (_, viewport_height) = browser.viewport_size().await?;
+    let strip_bottom = viewport_height * HEADER_STRIP_FRACTION;
+    let mut rects: Vec<(i64, f64)> = Vec::new();
+    for element in elements.iter().filter(|element| {
+        element.role == "button" && !clicked.contains(&element.backend_node_id)
+    }) {
+        // `node_rect` rejects degenerate (hidden) boxes, so invisible
+        // controls never become candidates.
+        if let Ok(highlight) = browser.node_rect(element.backend_node_id).await {
+            rects.push((element.backend_node_id, highlight.y));
+        }
+    }
+    let winner = pick_topmost(&rects, strip_bottom)?;
+    elements
+        .iter()
+        .find(|element| element.backend_node_id == winner)
+}
+
+/// Coarse position zones for the model phase: measure the head of the
+/// snapshot (the same slice the navigator renders), then zone each point
+/// against the measured bounding box. Best-effort and time-bounded —
+///
+/// geometry that won't resolve degrades to unzoned lines, never a stall.
+async fn position_zones(
+    browser: &ManagedBrowser,
+    elements: &[AxElement],
+) -> Vec<Option<crate::navigator::PositionZone>> {
+    use crate::navigator::zone_for;
+    const ZONE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    let head: Vec<i64> = elements
+        .iter()
+        .take(crate::navigator::MAX_NAVIGATOR_ELEMENTS)
+        .map(|element| element.backend_node_id)
+        .collect();
+    let measured = tokio::time::timeout(ZONE_BUDGET, async {
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for id in &head {
+            if let Ok(highlight) = browser.node_rect(*id).await {
+                points.push((
+                    highlight.x + highlight.width / 2.0,
+                    highlight.y + highlight.height / 2.0,
+                ));
+            } else {
+                points.push((f64::NAN, f64::NAN));
+            }
+        }
+        points
     })
+    .await
+    .ok();
+    let Some(points) = measured else {
+        return vec![None; head.len()];
+    };
+    let finite: Vec<(f64, f64)> = points
+        .iter()
+        .copied()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return vec![None; head.len()];
+    }
+    let (min_x, max_x) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (x, _)| {
+        (lo.min(*x), hi.max(*x))
+    });
+    let (min_y, max_y) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, y)| {
+        (lo.min(*y), hi.max(*y))
+    });
+    points
+        .iter()
+        .map(|(x, y)| {
+            if x.is_finite() && y.is_finite() {
+                Some(zone_for(*x, *y, (min_x, min_y, max_x, max_y)))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Diagnostic for a failed in-page pursuit: the noun plus every actionable

@@ -2,6 +2,7 @@
  * Backend errors arrive as `AppError`, an adjacently-tagged enum serialized as
  * `{ code, message? }`. The code is the stable contract; the copy below is the
  * one place that turns each code into something a person can act on.
+ * `workflow_failed` may carry a string array of journal lines as its message.
  */
 
 /** The `AppError` discriminant, when the rejection carries one. */
@@ -22,8 +23,18 @@ export function message(error: unknown): string {
       return "Local storage is unavailable. Check app data permissions.";
     if (error.code === "session_required")
       return "Connect this portal and finish signing in in the managed browser before running tasks.";
-    if (error.code === "workflow_failed")
+    if (error.code === "workflow_failed") {
+      // Failed runs carry their journal lines as the message payload
+      // (see AppError::WorkflowFailed): surface the evidence instead of
+      // the generic card copy.
+      if ("message" in error && Array.isArray(error.message)) {
+        const lines = (error.message as unknown[]).filter(
+          (line): line is string => typeof line === "string" && line.length > 0,
+        );
+        if (lines.length > 0) return lines.join("\n");
+      }
       return "The workflow could not finish. Check its saved macro and the latest task checkpoint; no automatic retry was attempted.";
+    }
     if (error.code === "picker_unavailable")
       return "Element picking needs the visible managed Chromium window. Replays run headless — click Sync session to reopen it, then pick again.";
     if ("message" in error && typeof error.message === "string") return error.message;

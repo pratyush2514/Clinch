@@ -958,6 +958,34 @@ pub fn parse_grammar(prompt: &str, connected_origin: Option<&url::Url>) -> Parse
         // One-character site names never survive `tokens`: recover the raw
         // word after the clause's open-verb (`open x for me` → `x`).
         .or_else(|| direct_object_token(prompt).map(|token| singular_stem(&token)));
+    // Adjectival site: `open my reddit profile` while on reddit.com. No
+    // preposition cue, but a content token names the connected portal, so
+    // the target noun is really an artifact on that portal. Promote to
+    // site+artifact so the in-page follow-up fires. The match is against
+    // the live connected origin only — no site list, no hardcoding — and
+    // it cannot fire on a cold prompt, where there is no portal to verify
+    // against (`open my work profile` must not ground `work` as a site).
+    if let (Some(target), Some(origin)) = (target_noun.as_ref(), connected_origin) {
+        let host = origin.host_str().unwrap_or_default().to_lowercase();
+        let adjectival_site = words.iter().find(|token| {
+            let text = token.as_str();
+            text != target.as_str()
+                && is_content(text)
+                && !is_action_verb(text)
+                && !host.is_empty()
+                && host.contains(text)
+        });
+        if let Some(site) = adjectival_site {
+            return ParsedGrammar {
+                artifact_noun: Some(target.clone()),
+                site_context: Some(site.clone()),
+                target_noun: None,
+                // Both slots are filled by construction, like the
+                // prepositional branch.
+                confidence: confidence(true),
+            };
+        }
+    }
     ParsedGrammar {
         artifact_noun: None,
         site_context: None,

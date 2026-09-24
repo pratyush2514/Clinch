@@ -26,7 +26,11 @@ pub enum AppError {
     Internal,
     StaleApproval,
     SessionRequired,
-    WorkflowFailed,
+    /// A run failed. Carries the run's recent journal lines (`session_events`)
+    /// because failed runs return `Err` — the UI never sees the telemetry
+    /// carried on success outcomes, so without this the miss is invisible
+    /// without dumping SQLite by hand. Empty when there is no run context.
+    WorkflowFailed(Vec<String>),
     /// Extension bridge reports a logged-out session for the target portal.
     /// Carries the full human-readable message so the UI can surface it.
     AuthenticationRequired(String),
@@ -800,7 +804,7 @@ impl AppService {
     pub async fn downloaded_file(&self, id: TaskId, index: usize) -> Result<PathBuf, AppError> {
         let task = self.task(id).await?;
         if task.state != orchestration_engine::TaskState::Completed {
-            return Err(AppError::WorkflowFailed);
+            return Err(AppError::WorkflowFailed(Vec::new()));
         }
         let file = task
             .plan
@@ -919,6 +923,24 @@ impl AppService {
             .await
             .map_err(|_| AppError::StorageUnavailable)?;
         Ok(())
+    }
+
+    /// Oldest-first recent journal lines for a failed run's error payload.
+    /// The operation semaphore serializes dispatches, so the newest lines
+    /// belong to the run that just failed. Best-effort: a failed read
+    /// yields an empty journal, never a second error.
+    async fn recent_journal(&self, limit: usize) -> Vec<String> {
+        let Ok(database) = self.database().await else {
+            return Vec::new();
+        };
+        let lines: Vec<String> = sqlx::query_scalar(
+            "SELECT outcome FROM session_events ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(database)
+        .await
+        .unwrap_or_default();
+        lines.into_iter().rev().collect()
     }
 
     pub async fn sync(&self, request: SyncRequest) -> Result<SessionStatus, AppError> {
@@ -1116,7 +1138,7 @@ impl AppService {
                 BridgeError::NoCookies => AppError::InvalidInput(
                     "The companion found no cookies for this portal. Sign in there first.",
                 ),
-                _ => AppError::WorkflowFailed,
+                _ => AppError::WorkflowFailed(Vec::new()),
             })
     }
 
@@ -2495,7 +2517,8 @@ impl AppService {
                 // Journal the evidence (which links the page did offer)
                 // before failing, so a miss is diagnosable.
                 let _ = self.record(&format!("search_follow_failed: {error}")).await;
-                return Err(AppError::WorkflowFailed);
+                let journal = self.recent_journal(16).await;
+                return Err(AppError::WorkflowFailed(journal));
             }
         };
         let mut portal = followed.landed.clone();
@@ -3196,7 +3219,8 @@ impl AppService {
                 let _ = self
                     .record(&format!("in_page_goal_miss: {diagnostic}"))
                     .await;
-                return Err(AppError::WorkflowFailed);
+                let journal = self.recent_journal(16).await;
+                return Err(AppError::WorkflowFailed(journal));
             }
             Err(macro_engine::IntentError::Browser(_)) => {
                 let _ = self.record("in_page_goal_miss: browser error").await;
@@ -4279,7 +4303,7 @@ fn engine_error(error: &EngineError) -> AppError {
             "Check the workflow name, portal, and selectors. Saved workflows must use the same portal URL.",
         ),
         EngineError::Database(_) | EngineError::Io(_) => AppError::StorageUnavailable,
-        _ => AppError::WorkflowFailed,
+        _ => AppError::WorkflowFailed(Vec::new()),
     }
 }
 

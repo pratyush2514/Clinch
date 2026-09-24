@@ -22,6 +22,7 @@ zeroize.workspace = true
 playbook-store = { path = "../playbook-store" }
 tempfile.workspace = true
 session-sync = { path = "../session-sync" }
+base64 = "0.22"
 
 [lints]
 workspace = true

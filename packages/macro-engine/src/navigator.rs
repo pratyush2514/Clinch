@@ -16,10 +16,17 @@
 //! * The `target` element id is validated against the live snapshot before
 //!   any click: the model can only touch what the harness showed it.
 //! * The model never sees credentials, cookies, or page HTML — only the
-//!   goal string and the element list (id, role, name, landmark).
+//!   goal string and the element list (id, role, name, landmark, coarse
+//!   position zone).
 //! * One bounded HTTP call per step; the loop still caps total steps.
 
 use browser_driver::AxElement;
+
+/// How many snapshot elements one navigation decision may see. Bounds the
+/// prompt: a portal header plus its menus fit comfortably; the rest of the
+/// page is noise for a follow-up. Shared by the zone measurer (which must
+/// zone exactly the slice the navigator renders) and the renderer itself.
+pub const MAX_NAVIGATOR_ELEMENTS: usize = 60;
 
 /// The closed action set a navigator may express. Deserialized directly
 /// from the model's strict-JSON reply — any shape outside these three
@@ -47,4 +54,85 @@ pub enum PageAction {
 /// a stalled or confused model degrades to the honest miss, never a hang.
 pub trait PageNavigator: Send + Sync {
     fn next_action(&self, goal: &str, elements: &[AxElement]) -> Option<PageAction>;
+
+    /// Zone-aware variant: `zones[i]` is the coarse on-page position of
+    /// `elements[i]` (`None` when geometry was unavailable). The default
+    /// drops the zones so existing implementers keep working; navigators
+    /// that render the element list override this to surface position.
+    fn next_action_zoned(
+        &self,
+        goal: &str,
+        elements: &[AxElement],
+        zones: &[Option<PositionZone>],
+    ) -> Option<PageAction> {
+        let _ = zones;
+        self.next_action(goal, elements)
+    }
+}
+
+/// Coarse on-page position of one element, rendered for the model as
+/// `top-left` … `bottom-right`. Computed against the bounding box of the
+/// rendered control set — distribution-relative, so it needs no viewport
+/// metrics and stays meaningful on scrolled pages. Lets the model pick an
+/// unnamed avatar button by its header position instead of guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionZone {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    MiddleLeft,
+    MiddleCenter,
+    MiddleRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl std::fmt::Display for PositionZone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            PositionZone::TopLeft => "top-left",
+            PositionZone::TopCenter => "top-center",
+            PositionZone::TopRight => "top-right",
+            PositionZone::MiddleLeft => "middle-left",
+            PositionZone::MiddleCenter => "middle-center",
+            PositionZone::MiddleRight => "middle-right",
+            PositionZone::BottomLeft => "bottom-left",
+            PositionZone::BottomCenter => "bottom-center",
+            PositionZone::BottomRight => "bottom-right",
+        };
+        formatter.write_str(label)
+    }
+}
+
+/// Zone of the point `(x, y)` inside `bounds = (min_x, min_y, max_x,
+/// max_y)`: each axis split into thirds. Pure and unit-tested; the pursuit
+/// loop supplies the bounds from the measured control set.
+#[must_use]
+pub fn zone_for(x: f64, y: f64, bounds: (f64, f64, f64, f64)) -> PositionZone {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let third = |value: f64, min: f64, max: f64| -> u8 {
+        if max <= min {
+            return 1;
+        }
+        let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
+        if ratio < 1.0 / 3.0 {
+            0
+        } else if ratio < 2.0 / 3.0 {
+            1
+        } else {
+            2
+        }
+    };
+    match (third(x, min_x, max_x), third(y, min_y, max_y)) {
+        (0, 0) => PositionZone::TopLeft,
+        (1, 0) => PositionZone::TopCenter,
+        (2, 0) => PositionZone::TopRight,
+        (0, 1) => PositionZone::MiddleLeft,
+        (1, 1) => PositionZone::MiddleCenter,
+        (2, 1) => PositionZone::MiddleRight,
+        (0, 2) => PositionZone::BottomLeft,
+        (1, 2) => PositionZone::BottomCenter,
+        _ => PositionZone::BottomRight,
+    }
 }

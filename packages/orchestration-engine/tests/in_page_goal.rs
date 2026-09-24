@@ -31,6 +31,43 @@ fn names_connected_portal_with_artifact() {
 }
 
 #[test]
+fn adjectival_site_names_connected_portal() {
+    let reddit = origin("https://www.reddit.com/");
+    // No preposition cue: the portal adjective ("reddit") next to the
+    // artifact ("profile") still names the connected portal. Verified
+    // against the live origin — no site list involved.
+    for (prompt, artifact) in [
+        ("open my reddit profile", "profile"),
+        ("show my reddit notifications", "notification"),
+        ("open reddit settings", "setting"),
+    ] {
+        assert_eq!(
+            detect_in_page_goal(prompt, Some(&reddit)),
+            Some(artifact.to_string()),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn adjectival_site_stays_conservative() {
+    let reddit = origin("https://www.reddit.com/");
+    // Bare artifact with no portal adjective: still not a follow-up.
+    assert_eq!(detect_in_page_goal("open my profile", Some(&reddit)), None);
+    // Cold prompt (no connected portal): the adjective cannot be verified,
+    // so it stays a plain target — `open my work profile` must never
+    // ground `work` as a site.
+    assert_eq!(detect_in_page_goal("open my reddit profile", None), None);
+    assert_eq!(detect_in_page_goal("open my work profile", Some(&reddit)), None);
+    // The adjective naming a different portal: not a follow-up here.
+    let github = origin("https://github.com/");
+    assert_eq!(
+        detect_in_page_goal("open my reddit profile", Some(&github)),
+        None
+    );
+}
+
+#[test]
 fn rejects_non_follow_ups() {
     let reddit = origin("https://www.reddit.com/");
     let google = origin("https://www.google.com/");

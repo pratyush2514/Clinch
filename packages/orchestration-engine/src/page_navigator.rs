@@ -9,8 +9,8 @@
 //! The fence is structural:
 //!
 //! * Only the goal string and the rendered element list (id, role, name,
-//!   landmark) leave the machine. No prompt text beyond the goal, no page
-//!   HTML, no cookies, no URLs.
+//!   landmark, coarse position zone) leave the machine. No prompt text beyond
+//!   the goal, no page HTML, no cookies, no URLs.
 //! * The model's reply must deserialize into [`macro_engine::PageAction`],
 //!   a closed three-variant enum — this is the typesafe integration, and
 //!   [`serde`] already provides it. No JSON-schema validator or
@@ -25,7 +25,7 @@
 //! `GROQ_API_KEY` (zeroized on drop); Ollama needs only the local daemon.
 
 use crate::domain_grounder::GrounderProvider;
-use macro_engine::{PageAction, PageNavigator};
+use macro_engine::{PageAction, PageNavigator, PositionZone, MAX_NAVIGATOR_ELEMENTS};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -39,17 +39,13 @@ const GROQ_MODEL: &str = "openai/gpt-oss-20b";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434";
 const OLLAMA_MODEL: &str = "qwen2.5:1.5b";
 
-/// How many snapshot elements the model sees per decision. Bounds the
-/// prompt: a portal header plus its menus fit comfortably; the rest of the
-/// page is noise for a follow-up.
-const MAX_ELEMENTS_PER_DECISION: usize = 60;
 /// Visible names are truncated so one long label cannot eat the budget.
 const MAX_NAME_CHARS: usize = 60;
 
 /// The single instruction both providers receive. It names no sites and no
 /// controls — the only page knowledge in the call is the rendered element
 /// list in the user line.
-const SYSTEM_PROMPT: &str = "You are a web page navigator. Given a goal and a numbered list of page elements, reply with ONLY one JSON object describing the next single action — no other text.\n\n{\"action\": \"click\", \"target\": 42} — click the element with this id\n{\"action\": \"done\"} — the goal is already achieved on this page; nothing to click\n{\"action\": \"give_up\", \"reason\": \"brief reason\"} — no element can advance the goal\n\nRules: target must be an id from the list. Prefer elements whose visible name relates to the goal. If the goal hides behind a menu, click the menu button first.";
+const SYSTEM_PROMPT: &str = "You are a web page navigator. Given a goal and a numbered list of page elements, reply with ONLY one JSON object describing the next single action — no other text.\n\n{\"action\": \"click\", \"target\": 42} — click the element with this id\n{\"action\": \"done\"} — the goal is already achieved on this page; nothing to click\n{\"action\": \"give_up\", \"reason\": \"brief reason\"} — no element can advance the goal\n\nRules: target must be an id from the list. Prefer elements whose visible name relates to the goal. A [zone] suffix like [top-right] names the element's coarse on-page position — account controls usually live there. If the goal hides behind a menu, click the menu button first.";
 
 /// Raw environment values for navigator construction.
 /// [`LlmPageNavigator::from_env`] reads the process environment into this;
@@ -278,7 +274,17 @@ impl PageNavigator for LlmPageNavigator {
         goal: &str,
         elements: &[browser_driver::AxElement],
     ) -> Option<PageAction> {
-        let rendered = render_elements(elements);
+        let zones = vec![None; elements.len().min(MAX_NAVIGATOR_ELEMENTS)];
+        self.next_action_zoned(goal, elements, &zones)
+    }
+
+    fn next_action_zoned(
+        &self,
+        goal: &str,
+        elements: &[browser_driver::AxElement],
+        zones: &[Option<PositionZone>],
+    ) -> Option<PageAction> {
+        let rendered = render_elements(elements, zones);
         let content = match self.provider {
             GrounderProvider::Groq => self.groq_completion(goal, &rendered)?,
             GrounderProvider::Ollama => self.ollama_generate(goal, &rendered)?,
@@ -288,23 +294,33 @@ impl PageNavigator for LlmPageNavigator {
 }
 
 /// Render the snapshot's actionable elements for the model: one line per
-/// element — `[id] role "name" (landmark)`. Capped at
-/// [`MAX_ELEMENTS_PER_DECISION`] lines with truncated names so the prompt
+/// element — `[id] role "name" (landmark) [zone]`. Capped at
+/// [`MAX_NAVIGATOR_ELEMENTS`] lines with truncated names so the prompt
 /// stays bounded; header controls (where follow-up targets live) come
-/// first in snapshot order anyway.
-fn render_elements(elements: &[browser_driver::AxElement]) -> String {
+/// first in snapshot document order. `zones[i]` describes line `i`;
+/// missing zones render as nothing rather than a guess.
+fn render_elements(elements: &[browser_driver::AxElement], zones: &[Option<PositionZone>]) -> String {
+    let unzoned: Option<PositionZone> = None;
     elements
         .iter()
-        .take(MAX_ELEMENTS_PER_DECISION)
-        .map(|element| {
+        .take(MAX_NAVIGATOR_ELEMENTS)
+        .enumerate()
+        .map(|(index, element)| {
             let name: String = element.name.chars().take(MAX_NAME_CHARS).collect();
             let landmark = element
                 .landmark
                 .as_deref()
                 .map(|landmark| format!(" ({landmark})"))
                 .unwrap_or_default();
+            let zone = zones
+                .get(index)
+                .copied()
+                .flatten()
+                .or(unzoned)
+                .map(|zone| format!(" [{zone}]"))
+                .unwrap_or_default();
             format!(
-                "[{}] {} \"{name}\"{landmark}",
+                "[{}] {} \"{name}\"{landmark}{zone}",
                 element.backend_node_id, element.role
             )
         })

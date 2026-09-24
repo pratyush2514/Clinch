@@ -388,6 +388,27 @@ impl ManagedBrowser {
             matches: 1,
         })
     }
+    /// Viewport CSS dimensions `(width, height)`, for geometry heuristics
+    /// that need a page frame (header-strip bounds, zone rendering).
+    /// Best-effort: `None` fails the caller closed, never the run.
+    pub async fn viewport_size(&self) -> Option<(f64, f64)> {
+        let dimensions: [f64; 2] = tokio::time::timeout(IO_TIMEOUT, async {
+            self.page
+                .evaluate("[window.innerWidth,window.innerHeight]")
+                .await
+                .ok()?
+                .into_value::<[f64; 2]>()
+                .ok()
+        })
+        .await
+        .ok()??;
+        if dimensions[0] > 0.0 && dimensions[1] > 0.0 && dimensions.iter().all(|v| v.is_finite()) {
+            Some((dimensions[0], dimensions[1]))
+        } else {
+            None
+        }
+    }
+
     /// Seed extracted `LocalStorage` pairs via `Page.addScriptToEvaluateOnNewDocument`
     ///
     /// The script runs in the portal origin before every document load, so it

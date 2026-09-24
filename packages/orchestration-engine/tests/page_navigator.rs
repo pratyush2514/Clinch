@@ -270,3 +270,78 @@ fn request_carries_only_goal_and_elements() {
     assert!(body.contains("Open user menu"), "elements must be sent");
     assert!(!body.contains("test-key"), "key must stay in the header");
 }
+
+// --- Zone-aware rendering ---
+
+#[test]
+fn zoned_rendering_surfaces_position_zones() {
+    use macro_engine::PositionZone;
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_server(
+        200,
+        groq_envelope(r#"{"action": "done"}"#),
+        Some(captured.clone()),
+    )
+    .expect("loopback mock failed to bind");
+    let nav = LlmPageNavigator::groq("test-key", &base, "test-model");
+    let zones = vec![
+        Some(PositionZone::TopRight),
+        None,
+        Some(PositionZone::BottomLeft),
+    ];
+    assert_eq!(
+        nav.next_action_zoned("profile", &snapshot(), &zones),
+        Some(PageAction::Done)
+    );
+    let body = captured
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
+    // The request body is JSON: quotes arrive escaped, newlines as `\n`.
+    // Zoned lines carry their zone; unzoned lines render no suffix.
+    assert!(
+        body.contains("[1] button \\\"Open user menu\\\" (banner) [top-right]"),
+        "rendered: {body}"
+    );
+    assert!(
+        body.contains("[2] link \\\"Home\\\" (navigation)"),
+        "rendered: {body}"
+    );
+    assert!(
+        !body.contains("[2] link \\\"Home\\\" (navigation) ["),
+        "rendered: {body}"
+    );
+    assert!(
+        body.contains("[3] button \\\"Search\\\" (banner) [bottom-left]"),
+        "rendered: {body}"
+    );
+}
+
+#[test]
+fn unzoned_fallback_renders_without_zones() {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_server(
+        200,
+        groq_envelope(r#"{"action": "done"}"#),
+        Some(captured.clone()),
+    )
+    .expect("loopback mock failed to bind");
+    let nav = LlmPageNavigator::groq("test-key", &base, "test-model");
+    // The plain trait method degrades to zone-less rendering.
+    assert_eq!(
+        nav.next_action("profile", &snapshot()),
+        Some(PageAction::Done)
+    );
+    let body = captured
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
+    // No zone suffix on any element line (the system prompt may name zones;
+    // the rendered elements must not).
+    assert!(
+        !body.contains("(banner) [") && !body.contains("(navigation) ["),
+        "rendered: {body}"
+    );
+}
