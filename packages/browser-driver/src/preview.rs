@@ -127,6 +127,48 @@ impl ManagedBrowser {
         .unwrap_or(true)
     }
 
+    /// Whether the page has been network- and DOM-quiet since the previous
+    /// probe: no new resource timings and no DOM mutations. The first call
+    /// installs a one-shot MutationObserver and baseline, and reports not
+    /// quiet so the caller allows an observation window.
+    ///
+    /// SPAs keep fetching after `readyState === "complete"`; polling this
+    /// before a screenshot avoids freezing a loading spinner. Fail-open:
+    /// any CDP failure reads as quiet.
+    pub async fn page_quiet(&self) -> bool {
+        const PROBE: &str = r#"(() => {
+            const w = window;
+            if (!w.__clinchSettleProbe) {
+                w.__clinchSettleProbe = {
+                    res: performance.getEntriesByType('resource').length,
+                    mut: 0,
+                };
+                new MutationObserver(() => { w.__clinchSettleProbe.mut++; })
+                    .observe(document, {
+                        childList: true, subtree: true,
+                        attributes: true, characterData: true,
+                    });
+                return false;
+            }
+            const s = w.__clinchSettleProbe;
+            const resNow = performance.getEntriesByType('resource').length;
+            const newRes = resNow - s.res;
+            const newMut = s.mut;
+            s.res = resNow;
+            s.mut = 0;
+            return newRes === 0 && newMut === 0;
+        })()"#;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.page.evaluate(PROBE),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .and_then(|value| value.into_value::<bool>().ok())
+        .unwrap_or(true)
+    }
+
     /// Local-only viewport preview in CSS pixels.
     /// # Errors
     /// Returns CDP or capture errors.

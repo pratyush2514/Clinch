@@ -1370,7 +1370,7 @@ impl AppService {
                             false,
                             "unconfirmed",
                             Some(format!(
-                                "Synced {count} cookies and the page no longer shows logged-out prompts, but no signed-in state is visible — the session may have applied. Re-run the open to confirm."
+                                "Synced {count} cookies — the preview above is the fresh post-sync state. No signed-in marker is visible, so the session is unconfirmed."
                             )),
                         ),
                     }
@@ -3735,6 +3735,23 @@ impl AppService {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        // SPAs keep fetching after readyState: wait for network/DOM
+        // quietness (no new resources, no mutations across two 250ms
+        // polls) so the frame doesn't freeze a loading spinner. Same
+        // bounded, fail-open contract as above.
+        let quiet_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut quiet_polls = 0;
+        while quiet_polls < 2 {
+            if std::time::Instant::now() >= quiet_deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if browser.page_quiet().await {
+                quiet_polls += 1;
+            } else {
+                quiet_polls = 0;
+            }
         }
         // A capture raced by a committing navigation surfaces as
         // PageChanging; give the new document a bounded moment to settle,

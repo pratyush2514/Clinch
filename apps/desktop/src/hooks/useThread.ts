@@ -461,7 +461,7 @@ export function useThread(
           id: entryId,
           auth: outcome.cleared
             ? { status: "synced", reason: null, frame: outcome.finalFrame, forgetting: "idle" }
-            : { status: "failed", reason: outcome.reason, frame: null, forgetting: "idle" },
+            : { status: "failed", reason: outcome.reason, frame: outcome.finalFrame ?? null, forgetting: "idle" },
         });
         report(
           outcome.cleared
