@@ -248,3 +248,63 @@ fn miss_diagnostic_lists_tried_clicks() {
     assert!(diagnostic.contains("menu opened"));
     assert!(diagnostic.contains("no new controls"));
 }
+
+// ---- revealed-profile freshness ----
+
+fn revealed_element(id: i64, role: &str, name: &str, container: &[&str]) -> AxElement {
+    AxElement {
+        backend_node_id: id,
+        role: role.to_owned(),
+        name: name.to_owned(),
+        description: String::new(),
+        container_text: container.iter().map(|s| (*s).to_owned()).collect(),
+        landmark: None,
+    }
+}
+
+/// Regression: the container-text rollup shares an opened menu's "Profile"
+/// wording with the header buttons that were already on the page. A
+/// revealed destination must be genuinely new since the previous
+/// snapshot, or the worker clicks the header chrome itself and burns its
+/// click budget (caught by the live-browser proof).
+#[test]
+fn revealed_profile_ignores_stale_header_buttons() {
+    use macro_engine::select_revealed_profile;
+    use std::collections::HashSet;
+    // Document order: header buttons first, the menu link last — like a
+    // real opened menu.
+    let elements = vec![
+        revealed_element(1, "button", "Search", &["Profile"]),
+        revealed_element(2, "button", "kx7", &["Profile"]),
+        revealed_element(3, "link", "Profile", &[]),
+    ];
+    let clicked = vec![2];
+    // The header buttons were in the previous snapshot: only the menu
+    // link is genuinely revealed.
+    let seen: HashSet<i64> = [1, 2].into_iter().collect();
+    let picked = select_revealed_profile(&elements, &clicked, &seen).expect("revealed link picked");
+    assert_eq!(picked.backend_node_id, 3);
+}
+
+#[test]
+fn revealed_profile_without_freshness_would_pick_stale_chrome() {
+    use macro_engine::select_revealed_profile;
+    use std::collections::HashSet;
+    // Pins the failure mode the freshness set exists to prevent: without
+    // it, the first header button wins by document order.
+    let elements = vec![
+        revealed_element(1, "button", "Search", &["Profile"]),
+        revealed_element(3, "link", "Profile", &[]),
+    ];
+    let picked =
+        select_revealed_profile(&elements, &[2], &HashSet::new()).expect("something picked");
+    assert_eq!(picked.backend_node_id, 1);
+}
+
+#[test]
+fn revealed_profile_stays_gated_on_worker_opened_something() {
+    use macro_engine::select_revealed_profile;
+    use std::collections::HashSet;
+    let elements = vec![revealed_element(3, "link", "u/someone", &[])];
+    assert!(select_revealed_profile(&elements, &[], &HashSet::new()).is_none());
+}

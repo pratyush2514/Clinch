@@ -1090,15 +1090,24 @@ async fn pursue_identity_chrome(
 ) -> Result<PageGoalOutcome, IntentError> {
     let mut clicked: Vec<i64> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    // Node ids from the previous iteration's snapshot. A "revealed"
+    // destination must be genuinely new: the container-text rollup lets an
+    // opened menu's "Profile" wording match every header button that was
+    // already on the page, so without this the worker clicks the header
+    // chrome itself as the profile destination and burns its click budget.
+    let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     for _ in 0..IDENTITY_MAX_CLICKS {
         let (elements, _, _) = browser.ax_snapshot(origin).await;
         let actionable_before = count_actionable(&elements);
+        let currently_seen: std::collections::HashSet<i64> =
+            elements.iter().map(|el| el.backend_node_id).collect();
 
         // 1. A revealed profile destination ends the hunt — but only after
-        // the worker opened something. A bare page's `u/someone` author
+        // the worker opened something, and only when the candidate actually
+        // appeared after that opening. A bare page's `u/someone` author
         // links are other users, never "my" profile.
-        if let Some(target) = select_revealed_profile(&elements, &clicked) {
+        if let Some(target) = select_revealed_profile(&elements, &clicked, &previously_seen) {
             let label = target.name.clone();
             let node_id = target.backend_node_id;
             // Prefer the page-revealed href when the control is a link
@@ -1122,6 +1131,7 @@ async fn pursue_identity_chrome(
                 return verify_account_home(browser, origin, &label, &landed, username.as_deref())
                     .await;
             }
+            previously_seen = currently_seen;
             continue;
         }
 
@@ -1143,6 +1153,7 @@ async fn pursue_identity_chrome(
             "no new controls"
         };
         tried.push(format!("{role} '{name}' → {effect}"));
+        previously_seen = currently_seen;
     }
     Err(IntentError::NoMatch(identity_miss_diagnostic(&tried)))
 }
@@ -1189,12 +1200,16 @@ async fn select_identity_control<'a>(
 
 /// A revealed profile destination: an actionable control mentioning
 /// profile/account words or carrying a `u/`-style username, not yet
-/// clicked. Gated on `clicked` being non-empty (see
-/// [`pursue_identity_chrome`]) so author links on a bare page never
-/// qualify.
-fn select_revealed_profile<'a>(
+/// clicked, and genuinely new since the previous snapshot — the
+/// container-text rollup shares an opened menu's wording with the header
+/// buttons that were already there, so "new" is what makes it revealed.
+/// Gated on `clicked` being non-empty (see [`pursue_identity_chrome`]) so
+/// author links on a bare page never qualify.
+#[must_use]
+pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
     elements: &'a [AxElement],
     clicked: &[i64],
+    previously_seen: &std::collections::HashSet<i64, S>,
 ) -> Option<&'a AxElement> {
     if clicked.is_empty() {
         return None;
@@ -1202,6 +1217,7 @@ fn select_revealed_profile<'a>(
     elements.iter().find(|element| {
         PAGE_GOAL_ROLES.contains(&element.role.as_str())
             && !clicked.contains(&element.backend_node_id)
+            && !previously_seen.contains(&element.backend_node_id)
             && (mentions_noun(element, "profile")
                 || mentions_noun(element, "account")
                 || username_from_menu_text(&element.name).is_some())
