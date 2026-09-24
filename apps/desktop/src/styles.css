@@ -71,9 +71,99 @@ footer .status { border-left: 0; background: transparent; padding: 14px 36px 0; 
 .cast .browser-frame { position: relative; width: 100%; max-height: 360px; overflow: hidden; border: 1px solid #e0e1d7; border-radius: 6px; background: #eeeee5; }
 .cast .browser-frame img { display: block; width: 100%; height: auto; max-height: 360px; object-fit: contain; object-position: top; }
 .cast .actions { margin-top: 14px; }
-.cast-preview { width: min(1100px, 92vw); padding: 18px; }
-.cast-preview img { display: block; width: 100%; height: auto; border: 1px solid #e0e1d7; border-radius: 6px; }
-.cast-preview .actions { margin-top: 14px; justify-content: flex-end; }
+/* ── Full-viewport preview overlay ─────────────────────────────────────── */
+/* Near-fullscreen browser window: chrome on top (tab, URL pill, live/final
+   badge), the frame filling the viewport below. Backdrop click and Esc both
+   close it; the native <dialog> keeps it centered and traps focus. */
+.cast-preview {
+  width: min(1400px, 96vw);
+  height: 90vh;
+  max-height: 90vh;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f5f4ed;
+  box-shadow: 0 24px 80px rgba(20, 22, 18, 0.35);
+}
+.cast-preview::backdrop { background: rgba(20, 22, 18, 0.55); }
+.preview-chrome {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #e9e8de;
+  border-bottom: 1px solid #d9dacf;
+  min-height: 48px;
+}
+.preview-traffic { display: inline-flex; gap: 6px; flex: none; }
+.preview-traffic i { width: 11px; height: 11px; border-radius: 50%; background: #cfccc0; }
+.preview-traffic i:nth-child(1) { background: #e2a49a; }
+.preview-traffic i:nth-child(2) { background: #e8cf9a; }
+.preview-traffic i:nth-child(3) { background: #a9cfa4; }
+.preview-tab {
+  flex: none;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: #4a4e40;
+  background: #f5f4ed;
+  border: 1px solid #d9dacf;
+  border-bottom-color: transparent;
+  border-radius: 8px 8px 0 0;
+  padding: 6px 12px;
+}
+.preview-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: #6b705c;
+  background: #fbfaf5;
+  border: 1px solid #d9dacf;
+  border-radius: 999px;
+  padding: 6px 14px;
+}
+.preview-url span { margin-right: 6px; }
+.preview-badge {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: #898f78;
+  border: 1px solid #d9dacf;
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #fbfaf5;
+}
+.preview-badge.is-live { color: #3f7a37; border-color: #a9cfa4; background: #f2f8f0; }
+.preview-close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid #d9dacf;
+  background: #fbfaf5;
+  color: #4a4e40;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.preview-close:hover { background: #efeee6; }
+.preview-viewport {
+  height: calc(90vh - 49px);
+  overflow: auto;
+  background: #ffffff;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+}
+.preview-viewport img { display: block; width: 100%; height: auto; }
 
 /* ── Step progress, gate, telemetry ────────────────────────────────────── */
 ol { list-style: none; padding: 0; margin: 20px 0; }
@@ -114,6 +204,15 @@ li small { display: block; color: #737a66; margin-top: 3px; }
 .challenge-offer { margin-top: 18px; border-top: 1px solid #e0e1d7; padding-top: 18px; }
 .challenge-offer p { font-size: 12px; margin: 0 0 10px; }
 .challenge-offer code { font-size: 10px; overflow-wrap: anywhere; }
+/* Signed-out guest landing: the auth-sync card shares the challenge card's
+ * layout language so both consent handoffs read as one family. */
+.auth-offer { margin-top: 18px; border-top: 1px solid #e0e1d7; padding-top: 18px; }
+.auth-offer p { font-size: 12px; margin: 0 0 10px; }
+.auth-offer .notice { color: #7a7c72; font-size: 11px; }
+/* Quiet destructive-ish control: revoking a synced session. */
+button.subtle { background: none; border: none; color: #8a8c84; font-size: 11px; text-decoration: underline; padding: 0; cursor: pointer; }
+button.subtle:hover:not(:disabled) { color: #5c5e58; }
+button.subtle:disabled { cursor: default; opacity: 0.6; }
 
 /* ── Composer ──────────────────────────────────────────────────────────── */
 .composer { margin: 0; padding: 14px 36px 22px; }

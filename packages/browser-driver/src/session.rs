@@ -147,6 +147,73 @@ pub enum ChallengeKind {
     InteractiveGate,
 }
 
+/// What the settle-time auth probe read on the live page. `Authenticated`
+/// and `LoggedOut` are heuristic readings of the page's own visible text
+/// (title plus body) — never of cookie names, which vary per site and would
+/// be a hardcoded map. `Unknown` is the fail-open default: the run keeps
+/// today's behavior and no card renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthState {
+    Authenticated,
+    LoggedOut,
+    Unknown,
+}
+
+/// Markers that only appear once a session is active. Near-certain: a
+/// guest page has no "log out" affordance to show.
+const AUTHENTICATED_MARKERS: &[&str] = &["log out", "logout", "sign out", "signout"];
+
+/// Guest-landing markers. Individually weak ("sign up" also sells
+/// newsletters), so `LoggedOut` requires corroboration: two distinct
+/// markers in the page text, or a login-form URL path.
+const LOGGED_OUT_MARKERS: &[&str] = &[
+    "log in",
+    "login",
+    "sign in",
+    "signin",
+    "create account",
+    "sign up",
+    "signup",
+    "continue with google",
+    "continue with apple",
+    "continue with email",
+    "continue with phone number",
+];
+
+/// URL paths that mean the page *is* the login form — a single signal,
+/// no corroboration needed.
+const LOGIN_PATH_MARKERS: &[&str] = &["/login", "/signin", "/signup", "/register"];
+
+/// Pure classifier behind [`ManagedBrowser::auth_state`]: title, URL, and
+/// visible text in, [`AuthState`] out. Authenticated markers outrank
+/// logged-out ones — a signed-in page can still advertise "log in" for a
+/// second profile.
+fn auth_state_of(title: &str, url: &Url, body_text: &str) -> AuthState {
+    let text = format!("{} {}", title.to_lowercase(), body_text.to_lowercase());
+    if AUTHENTICATED_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return AuthState::Authenticated;
+    }
+    let path = url.path().to_lowercase();
+    if LOGIN_PATH_MARKERS
+        .iter()
+        .any(|marker| path.contains(marker))
+    {
+        return AuthState::LoggedOut;
+    }
+    let hits = LOGGED_OUT_MARKERS
+        .iter()
+        .filter(|marker| text.contains(*marker))
+        .count();
+    if hits >= 2 {
+        AuthState::LoggedOut
+    } else {
+        AuthState::Unknown
+    }
+}
+
 fn challenge_kind(title: &str, url: &Url, body_text: &str) -> Option<ChallengeKind> {
     // Interactive markers are the more specific signal: check them first
     // so a gate page is never misrouted through L1. Existing markers keep
@@ -221,6 +288,38 @@ impl ManagedBrowser {
         let (url, title, body) = self.challenge_probe().await?;
         let kind = challenge_kind(&title, &url, &body)?;
         Some((url.to_string(), kind))
+    }
+
+    /// Settle-time auth reading on the live page: signed-in session,
+    /// guest landing, or unclassifiable. Reuses the challenge probe's
+    /// inputs (URL plus title and visible text) — no DOM selectors, no
+    /// cookie-name map.
+    ///
+    /// Ordering contract: callers check [`ManagedBrowser::challenge_detected_kind`]
+    /// first. A gated page can carry login copy ("sign in to continue"),
+    /// and the challenge card must win. Fail-open: any probe failure
+    /// yields [`AuthState::Unknown`], never a card.
+    pub async fn auth_state(&self) -> AuthState {
+        let Some((url, title, body)) = self.challenge_probe().await else {
+            return AuthState::Unknown;
+        };
+        auth_state_of(&title, &url, &body)
+    }
+
+    /// Best-effort document title for the preview overlay's browser chrome.
+    /// Fail-open: `None` on any CDP or timeout failure — the overlay falls
+    /// back to the entry's anchor host rather than showing a wrong title.
+    pub async fn page_title(&self) -> Option<String> {
+        tokio::time::timeout(IO_TIMEOUT, async {
+            self.page
+                .evaluate("document.title")
+                .await
+                .ok()?
+                .into_value::<String>()
+                .ok()
+        })
+        .await
+        .ok()?
     }
 
     /// Shared live-page probe for challenge detection: current URL plus
@@ -592,6 +691,83 @@ mod tests {
                 "Enter your email to sign in",
             ),
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auth_state_reads_guest_landings_and_sessions() -> Result<(), Box<dyn std::error::Error>> {
+        // Reddit's logged-out feed: sign-up/login CTAs everywhere.
+        assert_eq!(
+            auth_state_of(
+                "Reddit - Dive into anything",
+                &url("https://www.reddit.com/")?,
+                "Join the most real place on the internet\nContinue with Google\nContinue with Apple\nSign Up\nLog In",
+            ),
+            AuthState::LoggedOut
+        );
+        // X's sign-in landing: corroborated markers.
+        assert_eq!(
+            auth_state_of(
+                "X. It's what's happening",
+                &url("https://x.com/")?,
+                "Happening now.\nContinue with Google\nContinue with Apple\nCreate account\nSign in",
+            ),
+            AuthState::LoggedOut
+        );
+        // A login-form URL is decisive on its own.
+        assert_eq!(
+            auth_state_of(
+                "Sign in",
+                &url("https://example.com/signin")?,
+                "Enter your email",
+            ),
+            AuthState::LoggedOut
+        );
+        // A signed-in page advertising "log out" wins over guest markers.
+        assert_eq!(
+            auth_state_of(
+                "Reddit - Dive into anything",
+                &url("https://www.reddit.com/")?,
+                "u/someone\nHome\nPopular\nLog Out\nSign up for premium",
+            ),
+            AuthState::Authenticated
+        );
+        // One weak marker (newsletter CTA) is not a guest landing.
+        assert_eq!(
+            auth_state_of(
+                "Some blog",
+                &url("https://blog.example.com/post")?,
+                "Great article. Sign up for our newsletter below.",
+            ),
+            AuthState::Unknown
+        );
+        // A plain destination page: nothing to classify.
+        assert_eq!(
+            auth_state_of(
+                "Claude",
+                &url("https://claude.ai/")?,
+                "Welcome back\nHow can I help you today?",
+            ),
+            AuthState::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auth_state_never_masks_a_challenge() -> Result<(), Box<dyn std::error::Error>> {
+        // A gated page can carry login copy ("sign in to continue") — the
+        // classifier may read it either way, but the service checks the
+        // challenge detector first, so the challenge card always wins.
+        // This test pins the classifier's honest reading, not the ordering.
+        let body = "Prove your humanity\nComplete the challenge below\nSign in to continue";
+        assert_eq!(
+            challenge_kind("Reddit", &url("https://www.reddit.com/")?, body),
+            Some(ChallengeKind::InteractiveGate)
+        );
+        assert_eq!(
+            auth_state_of("Reddit", &url("https://www.reddit.com/")?, body),
+            AuthState::Unknown
         );
         Ok(())
     }

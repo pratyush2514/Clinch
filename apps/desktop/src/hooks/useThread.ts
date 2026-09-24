@@ -57,11 +57,22 @@ export type ThreadApi = {
   dismissShortcut: (entryId: string) => void;
   openFile: (entryId: string, chip: OutputChip, reveal: boolean) => Promise<void>;
   /**
-   * L1.5 session lending: the challenge-card consent tap. Pulls the
-   * challenged site's cookies from the companion extension into the managed
-   * browser (session-only) and re-probes the gate. One attempt per run.
+   * Session lending: the challenge-card consent tap. Pulls the challenged
+   * site's cookies from the companion extension into the managed browser
+   * and re-probes the gate. One attempt per run.
    */
   lendSession: (entryId: string, runId: string) => Promise<void>;
+  /**
+   * Auth sync: the auth-sync-card consent tap. Same lend path, but the
+   * session lands on the auth-sync card with its persisted badge; the
+   * cookies persist to Clinch's app profile.
+   */
+  syncAuthSession: (entryId: string, runId: string) => Promise<void>;
+  /**
+   * Forget a synced session: delete the site's cookies from Clinch's own
+   * profile. The daily browser is untouched.
+   */
+  forgetSiteSession: (entryId: string, host: string) => Promise<void>;
   /** Attribute the newest frame to whichever entry is currently live. */
   noteFrame: (frame: string) => void;
 };
@@ -192,8 +203,14 @@ export function useThread(
           // Human-verification gate instead of the destination: the card
           // offers headed takeover so the user solves it once.
           challenge: outcome.challenge ?? null,
+          // Clean signed-out guest landing: the thread renders the
+          // auth-sync card.
+          authUrl: outcome.authUrl ?? null,
           // Backend run id so the challenge card can lend a session.
           runId: outcome.runId ?? null,
+          // Settle-time page description for the preview overlay chrome.
+          finalUrl: outcome.finalUrl ?? null,
+          pageTitle: outcome.pageTitle ?? null,
         });
       } catch (error) {
         fail(id, error);
@@ -390,10 +407,10 @@ export function useThread(
       dispatch({
         type: "lendState",
         id: entryId,
-        lend: { status: "busy", reason: null, frame: null },
+        lend: { status: "busy", reason: null, frame: null, forgetting: "idle" },
       });
       try {
-        const outcome = await invoke<LendOutcome>("lend_challenge_session", { runId });
+        const outcome = await invoke<LendOutcome>("lend_session", { runId });
         dispatch({
           type: "lendState",
           id: entryId,
@@ -401,6 +418,7 @@ export function useThread(
             status: outcome.cleared ? "cleared" : "persistent",
             reason: outcome.reason,
             frame: outcome.finalFrame,
+            forgetting: "idle",
           },
         });
         report(
@@ -412,8 +430,106 @@ export function useThread(
         dispatch({
           type: "lendState",
           id: entryId,
-          lend: { status: "persistent", reason: message(error), frame: null },
+          lend: { status: "persistent", reason: message(error), frame: null, forgetting: "idle" },
         });
+      }
+    },
+    [report],
+  );
+
+  /** Auth-sync card: same consent-gated lend, but the synced state lands on
+   * the auth-sync card with its persisted badge and "Forget this site"
+   * control. `host` is derived from the card's backend-supplied URL. */
+  const syncAuthSession = useCallback(
+    async (entryId: string, runId: string) => {
+      dispatch({
+        type: "authState",
+        id: entryId,
+        auth: { status: "busy", reason: null, frame: null, forgetting: "idle" },
+      });
+      try {
+        const outcome = await invoke<LendOutcome>("lend_session", { runId });
+        dispatch({
+          type: "authState",
+          id: entryId,
+          auth: outcome.cleared
+            ? { status: "synced", reason: null, frame: outcome.finalFrame, forgetting: "idle" }
+            : { status: "failed", reason: outcome.reason, frame: null, forgetting: "idle" },
+        });
+        report(
+          outcome.cleared
+            ? `Session synced (${outcome.cookiesLent} cookies) — you're logged in inside Clinch's own browser profile.`
+            : (outcome.reason ?? "The sync didn't take."),
+        );
+      } catch (error) {
+        dispatch({
+          type: "authState",
+          id: entryId,
+          auth: { status: "failed", reason: message(error), frame: null, forgetting: "idle" },
+        });
+      }
+    },
+    [report],
+  );
+
+  /** Revoke a synced session: delete the site's cookies from Clinch's own
+   * profile. The daily browser is untouched. On the auth-sync card the
+   * offer returns (the live probe, not the badge, decides next); on a
+   * cleared challenge card a confirmation line shows instead. */
+  const forgetSiteSession = useCallback(
+    async (entryId: string, host: string) => {
+      const entry = latest.current.find(candidate => candidate.id === entryId);
+      const auth = entry?.auth ?? null;
+      const lend = !auth ? (entry?.lend ?? null) : null;
+      if (!auth && !lend) return;
+      if (auth) {
+        dispatch({
+          type: "authState",
+          id: entryId,
+          auth: { ...auth, forgetting: "busy" },
+        });
+      } else if (lend) {
+        dispatch({
+          type: "lendState",
+          id: entryId,
+          lend: { ...lend, forgetting: "busy" },
+        });
+      }
+      try {
+        const cleared = await invoke<number>("forget_site_session", { host });
+        report(
+          cleared > 0
+            ? `Forgot ${host} — ${cleared} cookies cleared from Clinch's browser.`
+            : `Forgot ${host} — nothing left to clear.`,
+        );
+        const current = latest.current.find(candidate => candidate.id === entryId);
+        if (auth) {
+          // The persisted copy is gone; the auth card drops back to the
+          // signed-out offer.
+          dispatch({ type: "authState", id: entryId, auth: null });
+        } else if (current?.lend) {
+          dispatch({
+            type: "lendState",
+            id: entryId,
+            lend: { ...current.lend, forgetting: "done" },
+          });
+        }
+      } catch (error) {
+        const current = latest.current.find(candidate => candidate.id === entryId);
+        if (auth && current?.auth) {
+          dispatch({
+            type: "authState",
+            id: entryId,
+            auth: { ...current.auth, forgetting: "failed" },
+          });
+        } else if (lend && current?.lend) {
+          dispatch({
+            type: "lendState",
+            id: entryId,
+            lend: { ...current.lend, forgetting: "failed" },
+          });
+        }
+        report(message(error));
       }
     },
     [report],
@@ -454,6 +570,8 @@ export function useThread(
     dismissShortcut,
     openFile,
     lendSession,
+    syncAuthSession,
+    forgetSiteSession,
     noteFrame,
   };
 }

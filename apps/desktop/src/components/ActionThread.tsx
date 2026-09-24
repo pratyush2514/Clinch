@@ -21,6 +21,8 @@ export default function ActionThread({
   onFile,
   onTakeControl,
   onLendSession,
+  onSyncAuthSession,
+  onForgetSession,
   onRelease,
   onConnect,
   onSaveShortcut,
@@ -36,6 +38,8 @@ export default function ActionThread({
   onFile: (entryId: string, chip: OutputChip, reveal: boolean) => void;
   onTakeControl: (url?: string) => void;
   onLendSession: (entryId: string, runId: string) => void;
+  onSyncAuthSession: (entryId: string, runId: string) => void;
+  onForgetSession: (entryId: string, host: string) => void;
   onRelease: () => void;
   onConnect: () => void;
   onSaveShortcut: (entryId: string) => void;
@@ -89,6 +93,8 @@ export default function ActionThread({
               onFile={(chip, reveal) => onFile(entry.id, chip, reveal)}
               onTakeControl={onTakeControl}
               onLendSession={(runId) => onLendSession(entry.id, runId)}
+              onSyncAuthSession={(runId) => onSyncAuthSession(entry.id, runId)}
+              onForgetSession={(host) => onForgetSession(entry.id, host)}
               onRelease={onRelease}
               onConnect={onConnect}
               onSaveShortcut={() => onSaveShortcut(entry.id)}

@@ -120,15 +120,26 @@ async fn bridge_sync_session(
 ) -> Result<SessionStatus, AppError> {
     state.bridge_sync(&portal_url).await
 }
-/// L1.5 session lending: the challenge-card "Sync my session" tap. The tap
-/// is the consent event; the backend resolves the challenged host from the
-/// run registry, never from client input.
+/// Consent-gated session lending: the challenge-card or auth-sync-card
+/// "Sync my session" tap. The tap is the consent event; the backend
+/// resolves the page URL from the run registry, never from client input.
+/// The synced session persists to Clinch's app profile ("sync once, stay
+/// logged in"); the daily browser is never written to.
 #[tauri::command]
-async fn lend_challenge_session(
+async fn lend_session(
     run_id: String,
     state: tauri::State<'_, AppService>,
 ) -> Result<LendOutcome, AppError> {
-    state.lend_challenge_session(run_id).await
+    state.lend_session(run_id).await
+}
+/// Revoke a persisted session: delete every cookie the app profile holds
+/// for `host`. The "Forget this site" control behind a synced badge.
+#[tauri::command]
+async fn forget_site_session(
+    host: String,
+    state: tauri::State<'_, AppService>,
+) -> Result<usize, AppError> {
+    state.forget_site_session(host).await
 }
 #[tauri::command]
 async fn auth_status(state: tauri::State<'_, AppService>) -> Result<Option<AuthPanel>, AppError> {
@@ -304,7 +315,8 @@ fn with_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         close_browser,
         bridge_status,
         bridge_sync_session,
-        lend_challenge_session,
+        lend_session,
+        forget_site_session,
         auth_status,
         begin_embedded_auth,
         complete_embedded_auth,

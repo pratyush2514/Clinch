@@ -1,4 +1,5 @@
 import ChallengeCard from "./ChallengeCard";
+import AuthSyncCard from "./AuthSyncCard";
 import OutcomeCard from "./OutcomeCard";
 import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
@@ -31,6 +32,8 @@ export default function ActionCard({
   onFile,
   onTakeControl,
   onLendSession,
+  onSyncAuthSession,
+  onForgetSession,
   onRelease,
   onConnect,
   onSaveShortcut,
@@ -48,6 +51,8 @@ export default function ActionCard({
   onFile: (chip: OutputChip, reveal: boolean) => void;
   onTakeControl: (url?: string) => void;
   onLendSession: (runId: string) => void;
+  onSyncAuthSession: (runId: string) => void;
+  onForgetSession: (host: string) => void;
   onRelease: () => void;
   onConnect: () => void;
   onSaveShortcut: () => void;
@@ -73,6 +78,9 @@ export default function ActionCard({
           live={live}
           headless={headless}
           busy={browserBusy}
+          finalUrl={entry.finalUrl}
+          pageTitle={entry.pageTitle}
+          anchorHost={entry.anchor}
           onTakeControl={onTakeControl}
           onRelease={onRelease}
         />
@@ -99,6 +107,18 @@ export default function ActionCard({
           lend={entry.lend}
           onTakeControl={url => onTakeControl(url)}
           onLendSession={onLendSession}
+          onForgetSession={onForgetSession}
+        />
+      )}
+      {!entry.challenge && entry.authUrl && (
+        <AuthSyncCard
+          url={entry.authUrl}
+          runId={entry.runId}
+          busy={browserBusy}
+          auth={entry.auth}
+          onTakeControl={url => onTakeControl(url)}
+          onSyncSession={onSyncAuthSession}
+          onForgetSession={onForgetSession}
         />
       )}
       {entry.shortcutOffer && !entry.shortcutDismissed && (

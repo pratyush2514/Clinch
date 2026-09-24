@@ -105,9 +105,18 @@ export type DispatchOutcome = {
   finalFrame?: string | null;
   /** Page URL when the run settled on a bot-mitigation interstitial. */
   challenge?: string | null;
+  /** Page URL when the run settled on a clean signed-out guest landing.
+   * When set (and `challenge` is absent) the thread renders the auth-sync
+   * card: sync the daily browser's session via the Companion bridge, or
+   * Take Control and log in by hand. Additive. */
+  authUrl?: string | null;
+  /** Live page URL when the run settled, for the preview overlay chrome. */
+  finalUrl?: string | null;
+  /** Live page document title when the run settled, for the overlay tab. */
+  pageTitle?: string | null;
 };
 
-/** Result of one L1.5 session-lend attempt (`lend_challenge_session`). */
+/** Result of one session-lend attempt (`lend_session`). */
 export type LendOutcome = {
   cleared: boolean;
   cookiesLent: number;

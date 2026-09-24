@@ -102,10 +102,21 @@ export type ThreadEntry = {
    * offers headed takeover so the user solves the check once.
    */
   challenge: string | null;
+  /** Page URL when the run settled on a clean signed-out guest landing.
+   * The thread renders the auth-sync card; backend keeps the run in the
+   * same lend registry the challenge card uses. Absent means the page
+   * read as authenticated or unclassifiable. */
+  authUrl: string | null;
   /** Backend run id for challenged runs, so the card can lend a session. */
   runId: string | null;
   /** L1.5 session-lend state for this entry's challenge card. */
   lend: LendUiState | null;
+  /** Synced-session state for this entry's auth-sync card. */
+  auth: AuthUiState | null;
+  /** Settle-time page URL for the preview overlay's browser chrome. */
+  finalUrl: string | null;
+  /** Settle-time document title for the overlay's tab label. */
+  pageTitle: string | null;
   elapsedMs: number | null;
   result: EntryResult | null;
   saveName: string;
@@ -119,13 +130,26 @@ export type ThreadEntry = {
   error: { message: string; code: string | null } | null;
 };
 
-/** L1.5 session-lend UI state for a challenged entry. */
+/** Session-lend UI state for a challenge card or an auth-sync card. */
 export type LendUiState = {
   status: "busy" | "cleared" | "persistent";
   /** Static user-facing reason when the gate did not clear. */
   reason: string | null;
   /** Fresh settle-time frame captured after a cleared lend. */
   frame: string | null;
+  /** "Forget this site" revocation: deleting the persisted cookies. */
+  forgetting: "idle" | "busy" | "done" | "failed";
+};
+
+/** Auth-sync card state for a signed-out guest landing. */
+export type AuthUiState = {
+  status: "synced" | "busy" | "failed";
+  /** Static user-facing reason when the sync did not work. */
+  reason: string | null;
+  /** Fresh frame captured after the session landed. */
+  frame: string | null;
+  /** "Forget this site" revocation: deleting the persisted cookies. */
+  forgetting: "idle" | "busy" | "done" | "failed";
 };
 
 export type ThreadAction =
@@ -136,9 +160,10 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; runId?: string | null }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; authUrl?: string | null; runId?: string | null; finalUrl?: string | null; pageTitle?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "lendState"; id: string; lend: LendUiState }
+  | { type: "authState"; id: string; auth: AuthUiState | null }
   | { type: "rename"; id: string; saveName: string }
   | { type: "saved"; id: string; savedId: string }
   | { type: "shortcutSaved"; id: string }
@@ -180,8 +205,13 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           notes: [],
           frame: null,
           challenge: null,
+          authUrl: null,
           runId: null,
           lend: null,
+          auth: null,
+          /** Settle-time page URL/title for the preview overlay chrome. */
+          finalUrl: null,
+          pageTitle: null,
           elapsedMs: null,
           result: null,
           saveName: "",
@@ -253,10 +283,18 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         // A completed run that landed on a human-verification gate keeps
         // the challenge URL so the thread can offer headed takeover.
         challenge: action.challenge ?? null,
+        // A completed run that landed on a clean signed-out guest landing
+        // keeps the auth URL so the thread can render the auth-sync card.
+        authUrl: action.authUrl ?? null,
         // Backend run id travels so the challenge card can lend a session;
         // a fresh settle resets any previous lend state.
         runId: action.runId ?? null,
         lend: null,
+        auth: null,
+        // Settle-time page description for the preview overlay's browser
+        // chrome; absent when the target died mid-settle.
+        finalUrl: action.finalUrl ?? null,
+        pageTitle: action.pageTitle ?? null,
       }));
     case "lendState":
       return patch(entries, action.id, entry => ({
@@ -264,6 +302,14 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         lend: action.lend,
         // A cleared lend brings a fresh frame of the landed page.
         frame: action.lend.frame ?? entry.frame,
+      }));
+    case "authState":
+      return patch(entries, action.id, entry => ({
+        ...entry,
+        auth: action.auth,
+        // A synced session brings a fresh frame of the landed page;
+        // a forgotten session drops the frame so the next run re-reads.
+        frame: action.auth?.frame ?? entry.frame,
       }));
     case "failed":
       return patch(entries, action.id, entry => ({

@@ -160,20 +160,20 @@ describe("threadReducer", () => {
     const busy = threadReducer(base, {
       type: "lendState",
       id: "e1",
-      lend: { status: "busy", reason: null, frame: null },
+      lend: { status: "busy", reason: null, frame: null, forgetting: "idle" },
     });
     expect(busy[0].lend?.status).toBe("busy");
     const cleared = threadReducer(busy, {
       type: "lendState",
       id: "e1",
-      lend: { status: "cleared", reason: null, frame: "fresh-frame" },
+      lend: { status: "cleared", reason: null, frame: "fresh-frame", forgetting: "idle" },
     });
     expect(cleared[0].lend?.status).toBe("cleared");
     expect(cleared[0].frame).toBe("fresh-frame");
     const persistent = threadReducer(cleared, {
       type: "lendState",
       id: "e1",
-      lend: { status: "persistent", reason: "Still there.", frame: null },
+      lend: { status: "persistent", reason: "Still there.", frame: null, forgetting: "idle" },
     });
     expect(persistent[0].lend?.status).toBe("persistent");
     expect(persistent[0].lend?.reason).toBe("Still there.");
@@ -201,6 +201,50 @@ describe("threadReducer", () => {
       },
     ]);
     expect(settled[0].challenge).toBe("https://claude.ai/login");
+  });
+
+  it("carries the auth URL onto the settled entry for the sync card", () => {
+    const settled = fold([
+      SUBMIT,
+      {
+        type: "settled",
+        id: "e1",
+        at: 1_500,
+        result: {
+          status: "completed",
+          completedSteps: 0,
+          totalSteps: 0,
+          stoppedAt: null,
+          chips: [],
+          save: null,
+        },
+        authUrl: "https://www.reddit.com/",
+      },
+    ]);
+    expect(settled[0].authUrl).toBe("https://www.reddit.com/");
+    expect(settled[0].challenge).toBeNull();
+    expect(settled[0].auth).toBeNull();
+  });
+
+  it("tracks the auth-sync lifecycle and clears the card on forget", () => {
+    const base = fold([SUBMIT]);
+    const busy = threadReducer(base, {
+      type: "authState",
+      id: "e1",
+      auth: { status: "busy", reason: null, frame: null, forgetting: "idle" },
+    });
+    expect(busy[0].auth?.status).toBe("busy");
+    const synced = threadReducer(busy, {
+      type: "authState",
+      id: "e1",
+      auth: { status: "synced", reason: null, frame: "fresh-frame", forgetting: "idle" },
+    });
+    expect(synced[0].auth?.status).toBe("synced");
+    expect(synced[0].frame).toBe("fresh-frame");
+    // Forgetting the site drops the synced state: the card returns to the
+    // signed-out offer and the live probe decides next.
+    const forgotten = threadReducer(synced, { type: "authState", id: "e1", auth: null });
+    expect(forgotten[0].auth).toBeNull();
   });
 
   it("leaves challenge null when the run settled on the destination", () => {

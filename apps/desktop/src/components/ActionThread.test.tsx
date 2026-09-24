@@ -123,6 +123,8 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
       onFile={vi.fn()}
       onTakeControl={vi.fn()}
       onLendSession={vi.fn()}
+      onSyncAuthSession={vi.fn()}
+      onForgetSession={vi.fn()}
       onRelease={vi.fn()}
       onConnect={vi.fn()}
       onSaveShortcut={vi.fn()}

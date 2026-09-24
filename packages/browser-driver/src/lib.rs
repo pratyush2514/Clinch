@@ -21,7 +21,8 @@ pub use chromiumoxide::cdp::browser_protocol::accessibility::AxNode;
 use chromiumoxide::{
     Browser, Page,
     cdp::browser_protocol::network::{
-        CookieSameSite as CdpSameSite, SetCookieParams, TimeSinceEpoch,
+        CookieSameSite as CdpSameSite, DeleteCookiesParams, GetCookiesParams, SetCookieParams,
+        TimeSinceEpoch,
     },
     cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
 };
@@ -31,7 +32,7 @@ pub use picker::{
 };
 pub use preview::{DomRegion, Viewport};
 pub use screencast::{SCREENCAST_JPEG_QUALITY, ScreencastFrame};
-pub use session::{AuthSignal, ChallengeKind, detect_auth_signal};
+pub use session::{AuthSignal, AuthState, ChallengeKind, detect_auth_signal};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
 use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
@@ -550,32 +551,23 @@ impl ManagedBrowser {
         Ok(managed)
     }
 
-    /// Inject only the prepared cookie set through Network.setCookie.
+    /// Inject a cookie set through Network.setCookie, preserving the
+    /// server's expiry semantics exactly: cookies that arrive with an
+    /// `expires` are written to the app profile's cookie database by
+    /// Chromium (persistent login), cookies without one stay memory-only.
+    /// No lifetime is ever invented — a session cookie the server meant to
+    /// be ephemeral must not become a 30-day token. Used by session lending
+    /// ("sync once, stay logged in") and the older import paths alike.
     ///
     /// # Errors
     /// Reports rejected or timed-out commands; never marks partial import successful.
     pub async fn inject(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
-        self.inject_inner(cookies, false).await
+        self.inject_inner(cookies).await
     }
 
-    /// Inject a cookie set as *session-only* cookies: `expires` is stripped
-    /// so Chromium keeps them in process memory and never writes them to
-    /// the app profile's cookie database on disk. Used by L1.5 session
-    /// lending — the lent identity must not outlive the browser process.
-    ///
-    /// # Errors
-    /// Reports rejected or timed-out commands; never marks partial import successful.
-    pub async fn inject_session(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
-        self.inject_inner(cookies, true).await
-    }
-
-    async fn inject_inner(
-        &self,
-        cookies: &[Cookie],
-        session_only: bool,
-    ) -> Result<(), BrowserError> {
+    async fn inject_inner(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
         for cookie in cookies {
-            let params = cookie_params(cookie, session_only)?;
+            let params = cookie_params(cookie)?;
             // Current CDP returns an empty result on success and a protocol error on failure.
             tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
                 .await
@@ -583,6 +575,43 @@ impl ManagedBrowser {
                 .map_err(|_| BrowserError::Injection)?;
         }
         Ok(())
+    }
+
+    /// Delete every cookie the profile holds for `host` — bare host and
+    /// leading-dot domain forms, plus subdomains of it. The revocation
+    /// path behind "Forget this site": the persisted session leaves the
+    /// app profile's cookie database, so the next run reads the site as
+    /// logged out. Returns the number of cookies deleted.
+    ///
+    /// # Errors
+    /// Reports connection failure or timeout.
+    pub async fn clear_host_cookies(&self, host: &str) -> Result<usize, BrowserError> {
+        let cookies =
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(GetCookiesParams::default()))
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|_| BrowserError::Connection)?
+                .result
+                .cookies;
+        let mut cleared = 0;
+        for cookie in cookies.iter().filter(|cookie| {
+            let domain = cookie.domain.trim_start_matches('.');
+            // Suffix match on a dot boundary: `evilreddit.com` must not
+            // match `reddit.com`.
+            domain == host || domain.ends_with(&format!(".{host}"))
+        }) {
+            let params = DeleteCookiesParams::builder()
+                .name(&cookie.name)
+                .domain(&cookie.domain)
+                .build()
+                .map_err(|_| BrowserError::Injection)?;
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|_| BrowserError::Injection)?;
+            cleared += 1;
+        }
+        Ok(cleared)
     }
 
     /// Read the live target's current URL, if the page reports a parseable
@@ -732,13 +761,12 @@ impl Drop for ManagedBrowser {
     }
 }
 
-/// Map a bridge cookie to CDP `Network.setCookie` params. When
-/// `session_only` is set, `expires` is stripped so Chromium treats the
-/// cookie as a session cookie — process memory only, never persisted to
-/// the profile's cookie database. L1.5 session lending requires this: a
-/// lent identity with a year-long expiry would otherwise be written to
-/// disk, silently violating the in-memory-only promise.
-fn cookie_params(cookie: &Cookie, session_only: bool) -> Result<SetCookieParams, BrowserError> {
+/// Map a bridge cookie to CDP `Network.setCookie` params, preserving the
+/// server's expiry semantics exactly: a validated `expires` is passed
+/// through so Chromium persists the cookie to the profile's cookie
+/// database; an absent `expires` stays a memory-only session cookie.
+/// Lifetimes are never invented.
+fn cookie_params(cookie: &Cookie) -> Result<SetCookieParams, BrowserError> {
     let mut builder = SetCookieParams::builder()
         .name(&cookie.name)
         .value(cookie.value.as_str())
@@ -758,7 +786,7 @@ fn cookie_params(cookie: &Cookie, session_only: bool) -> Result<SetCookieParams,
         CookieSameSite::Lax => builder.same_site(CdpSameSite::Lax),
         CookieSameSite::Strict => builder.same_site(CdpSameSite::Strict),
     };
-    if !session_only && let Some(expires) = cookie.expires {
+    if let Some(expires) = cookie.expires {
         // Avoid a 2038 cutoff. CDP represents seconds as a floating-point number.
         if !(0..=253_402_300_799).contains(&expires) {
             return Err(BrowserError::Injection);
@@ -788,27 +816,28 @@ mod tests {
     }
     #[test]
     fn preserves_host_only_and_session_cookie_semantics() -> Result<(), BrowserError> {
-        let host = cookie_params(&cookie("example.com"), false)?;
+        let host = cookie_params(&cookie("example.com"))?;
         assert!(host.domain.is_none());
         assert_eq!(host.url.as_deref(), Some("https://example.com/"));
         assert!(host.expires.is_none());
-        let domain = cookie_params(&cookie(".example.com"), false)?;
+        let domain = cookie_params(&cookie(".example.com"))?;
         assert_eq!(domain.domain.as_deref(), Some(".example.com"));
         assert!(domain.url.is_none());
         Ok(())
     }
 
     #[test]
-    fn session_only_injection_strips_expiry() -> Result<(), BrowserError> {
-        // Regression: a lent cookie with a year-long expiry must reach CDP
-        // with no `expires`, or Chromium persists the lent identity to the
-        // app profile's cookie database on disk.
+    fn injection_preserves_server_expiry_exactly() -> Result<(), BrowserError> {
+        // Contract: a lent cookie's `expires` reaches CDP untouched, so
+        // Chromium persists it per the server's own lifetime — "sync once,
+        // stay logged in". Lifetimes are never invented: a cookie without
+        // `expires` stays memory-only.
         let mut lent = cookie("example.com");
         lent.expires = Some(1_893_456_000); // 2030-01-01
-        let persistent = cookie_params(&lent, false)?;
-        assert!(persistent.expires.is_some());
-        let session_only = cookie_params(&lent, true)?;
-        assert!(session_only.expires.is_none());
+        let params = cookie_params(&lent)?;
+        assert!(params.expires.is_some());
+        let ephemeral = cookie_params(&cookie("example.com"))?;
+        assert!(ephemeral.expires.is_none());
         Ok(())
     }
 

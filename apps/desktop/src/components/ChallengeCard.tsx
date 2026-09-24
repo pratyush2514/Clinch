@@ -1,4 +1,5 @@
 import type { LendUiState } from "../lib/thread";
+import ForgetSiteButton from "./ForgetSiteButton";
 
 /**
  * The human-verification handoff: the run completed but landed on a
@@ -7,13 +8,15 @@ import type { LendUiState } from "../lib/thread";
  * Chromium is always distinguishable — so the check goes to the one party
  * the gate trusts: the user.
  *
- * Two rungs: L1.5 session lending first — one tap pulls this site's cookies
- * from the Clinch Companion extension into the managed browser, session-only
- * (never written to disk), and re-probes the gate. The tap is the consent
- * event; nothing is synced without it, and the flow is one-way (the daily
- * browser is never written to). L2 Take Control opens a headed window on
- * the same profile for solving the check by hand; solving it once keeps
- * the clearance in Clinch's profile for later runs.
+ * Two rungs: session lending first — one tap pulls this site's cookies
+ * from the Clinch Companion extension into the managed browser and
+ * re-probes the gate. The tap is the consent event; nothing is synced
+ * without it, and the flow is one-way (the daily browser is never written
+ * to). A synced session persists into Clinch's own browser profile — sync
+ * once, stay logged in — with the "Forget this site" revocation as the
+ * exit path. L2 Take Control opens a headed window on the same profile for
+ * solving the check by hand; solving it once keeps the clearance in
+ * Clinch's profile for later runs.
  */
 export default function ChallengeCard({
   url,
@@ -22,6 +25,7 @@ export default function ChallengeCard({
   lend,
   onTakeControl,
   onLendSession,
+  onForgetSession,
 }: {
   url: string;
   runId: string | null;
@@ -29,6 +33,7 @@ export default function ChallengeCard({
   lend: LendUiState | null;
   onTakeControl: (url: string) => void;
   onLendSession: (runId: string) => void;
+  onForgetSession: (host: string) => void;
 }) {
   let host = url;
   try {
@@ -45,9 +50,15 @@ export default function ChallengeCard({
           ✅ <strong>{host}</strong> loaded with your synced session.
         </p>
         <p className="notice">
-          The lent cookies live only in the managed browser&apos;s memory — nothing was
-          written to disk or back to your daily browser.
+          The session persists in Clinch&apos;s own browser profile with the
+          site&apos;s own login lifetimes — sync once, stay logged in. Your
+          daily browser is untouched.
         </p>
+        <ForgetSiteButton
+          host={host}
+          forgetting={lend.forgetting}
+          onForget={onForgetSession}
+        />
       </div>
     );
   }
@@ -58,7 +69,8 @@ export default function ChallengeCard({
       </p>
       <p className="notice">
         Bots can&apos;t click through this — but your own session can. Sync it once from
-        your daily browser, or take control to solve it by hand.
+        your daily browser, or take control to solve it by hand. A synced session
+        persists in Clinch&apos;s own browser profile, and you can forget it any time.
       </p>
       <div className="actions">
         <button
