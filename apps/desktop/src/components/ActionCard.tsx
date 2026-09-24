@@ -5,7 +5,7 @@ import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
 import ShortcutCard from "./ShortcutCard";
 import { TIER_LABELS, type OutputChip, type ThreadEntry } from "../lib/thread";
-import { needsSession } from "../lib/errors";
+import { needsSession, isPursuitMiss } from "../lib/errors";
 
 const STATUS_WORDS: Record<ThreadEntry["status"], string> = {
   running: "running",
@@ -158,6 +158,21 @@ export default function ActionCard({
             <div className="actions">
               <button className="primary" type="button" onClick={onConnect}>
                 Connect a portal
+              </button>
+            </div>
+          )}
+          {/* Account-home pursuit miss: the worker journaled what it tried
+              and the browser is still on the portal — hand the window over
+              so the user can click the avatar themselves. */}
+          {isPursuitMiss(entry.error.code, entry.error.message) && (
+            <div className="actions">
+              <button
+                className="secondary"
+                type="button"
+                disabled={browserBusy}
+                onClick={() => onTakeControl()}
+              >
+                Take control
               </button>
             </div>
           )}

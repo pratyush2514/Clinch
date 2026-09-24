@@ -83,13 +83,10 @@ async fn settle(browser: &ManagedBrowser, origin: &Url) {
 }
 
 async fn save_shot(browser: &ManagedBrowser, path: &Path) {
-        let viewport = browser.viewport().await.expect("viewport screenshot");
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &viewport.data,
-        )
+    let viewport = browser.viewport().await.expect("viewport screenshot");
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &viewport.data)
         .expect("base64 jpeg");
-        std::fs::write(path, &bytes).unwrap();
+    std::fs::write(path, &bytes).unwrap();
     println!(
         "shot: {} ({} bytes, {}x{})",
         path.display(),

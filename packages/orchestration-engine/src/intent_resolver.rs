@@ -1182,10 +1182,7 @@ pub fn is_direct_open(prompt: &str, grammar: &ParsedGrammar) -> bool {
 /// the old direct-open behavior, and a different named site ("open amazon"
 /// while on reddit.com) still opens a new portal.
 #[must_use]
-pub fn detect_in_page_goal(
-    prompt: &str,
-    connected_origin: Option<&url::Url>,
-) -> Option<String> {
+pub fn detect_in_page_goal(prompt: &str, connected_origin: Option<&url::Url>) -> Option<String> {
     let origin = connected_origin?;
     let grammar = parse_grammar(prompt, Some(origin));
     if !grammar.confidence.is_high() {
@@ -1594,6 +1591,31 @@ pub fn ephemeral_name(prompt: &str) -> String {
     } else {
         slug
     }
+}
+
+/// Pure follow-up decision for the already-on-origin fast path: the
+/// prompt names an explicit site + artifact noun with high grammar
+/// confidence, and the live browser host already contains the site
+/// token. Pure strings — the browser read stays with the caller;
+/// integration tests pin this decision down. Returns the (site,
+/// artifact) pair the dispatcher pursues in-page, or `None` to keep
+/// the normal resolution ladder.
+#[must_use]
+pub fn follow_up_on_origin(
+    grammar: &ParsedGrammar,
+    current_host: Option<&str>,
+) -> Option<(String, String)> {
+    let (site, artifact) = match (&grammar.site_context, &grammar.artifact_noun) {
+        (Some(site), Some(artifact)) if grammar.confidence.is_high() => {
+            (site.clone(), artifact.clone())
+        }
+        _ => return None,
+    };
+    let host = current_host?.to_lowercase();
+    if !host.contains(&site.to_lowercase()) {
+        return None;
+    }
+    Some((site, artifact))
 }
 
 #[cfg(test)]

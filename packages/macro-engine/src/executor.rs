@@ -9,7 +9,7 @@
 //! here, and no candidate is ever vetoed for partial container text: weak
 //! evidence lowers a score, never disqualifies.
 
-use browser_driver::{AxElement, Highlight, ManagedBrowser, Mark};
+use browser_driver::{AuthState, AxElement, Highlight, ManagedBrowser, Mark};
 use serde::{Deserialize, Serialize};
 
 /// What a Playbook step wants, in words. Role and label are required: a bare
@@ -726,10 +726,7 @@ fn is_page_chrome(element: &AxElement) -> bool {
 /// A tiny closed synonym table covers vocabulary sites use interchangeably
 /// for the same surface (`profile`/`account` name the signed-in user's
 /// page on most portals). General words only — never site procedures.
-const NOUN_SYNONYMS: &[(&str, &[&str])] = &[
-    ("profile", &["account"]),
-    ("account", &["profile"]),
-];
+const NOUN_SYNONYMS: &[(&str, &[&str])] = &[("profile", &["account"]), ("account", &["profile"])];
 
 fn mentions_noun(element: &AxElement, noun: &str) -> bool {
     let stem = noun.trim().to_lowercase();
@@ -965,6 +962,18 @@ pub enum PageGoalOutcome {
     Navigated { label: String, landed: url::Url },
     /// The goal was already achieved on the current page; nothing to click.
     AlreadyThere { landed: url::Url },
+    /// Verified account-home landing: the label that got us there, the
+    /// landed URL, and the username the live page revealed (if any). Only
+    /// produced by the account-home worker's verifier — a click alone
+    /// never yields this.
+    Verified {
+        label: String,
+        landed: url::Url,
+        username: Option<String>,
+    },
+    /// The page is a signed-out guest landing: there is no identity
+    /// chrome to pursue, so the worker stops before any click.
+    SignedOut,
 }
 
 /// In-page follow-up budget: observe-act steps before the pursuit gives up
@@ -1022,6 +1031,395 @@ pub async fn pursue_page_goal(
     pursue_with_model(browser, origin, noun, navigator, deterministic_miss).await
 }
 
+/// Pursue an `account_home` goal ("my profile", "my account") on the
+/// already-loaded portal page. Unlike the generic noun hunt, this worker
+/// is scoped to the header identity chrome:
+///
+/// 1. **Guest short-circuit**: a signed-out page has no identity chrome,
+///    so the worker stops before any click (`SignedOut`).
+/// 2. **Deterministic chrome walk**: open the header identity control
+///    (landmarked → account-worded → rightmost-in-strip), quiet-wait for
+///    the revealed layer, then take the page-revealed profile destination
+///    — a validated href when the page offers one, else a click with an
+///    observed URL change. Every click must show an effect (new controls
+///    or navigation) or the candidate is discarded.
+/// 3. **Verifier**: a click alone never succeeds — the landed page must
+///    be same-origin, non-root, and carry the revealed username when one
+///    was read.
+/// 4. **Model fallback** (only when `navigator` is `Some`): the model
+///    picks the identity click, then the verifier still decides.
+///
+/// [`IntentError::NoMatch`] carries the tried-click log, not a control
+/// dump, so the FAILED card shows what the worker actually attempted.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the goal is not reached or the
+/// page is signed out (as `SignedOut`, not an error), and
+/// [`IntentError::Browser`] on CDP failure.
+pub async fn pursue_account_home(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+) -> Result<PageGoalOutcome, IntentError> {
+    if browser.auth_state().await == AuthState::LoggedOut {
+        return Ok(PageGoalOutcome::SignedOut);
+    }
+    let deterministic_miss = match pursue_identity_chrome(browser, origin).await {
+        Ok(outcome) => return Ok(outcome),
+        // Browser errors fail fast: retrying them through the model would
+        // just burn model calls on a dead CDP session.
+        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+    };
+    let Some(navigator) = navigator else {
+        return Err(IntentError::NoMatch(deterministic_miss));
+    };
+    pursue_account_home_with_model(browser, origin, navigator, deterministic_miss).await
+}
+
+/// Identity-chrome click budget: opening the account menu plus one
+/// revealed control is two clicks; a third covers a nested disclosure.
+/// Bounded so a hostile header can't burn the run.
+const IDENTITY_MAX_CLICKS: usize = 3;
+
+/// Deterministic half of [`pursue_account_home`]: open the header identity
+/// control, read what the live page reveals, navigate, verify.
+async fn pursue_identity_chrome(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+) -> Result<PageGoalOutcome, IntentError> {
+    let mut clicked: Vec<i64> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+
+    for _ in 0..IDENTITY_MAX_CLICKS {
+        let (elements, _, _) = browser.ax_snapshot(origin).await;
+        let actionable_before = count_actionable(&elements);
+
+        // 1. A revealed profile destination ends the hunt — but only after
+        // the worker opened something. A bare page's `u/someone` author
+        // links are other users, never "my" profile.
+        if let Some(target) = select_revealed_profile(&elements, &clicked) {
+            let label = target.name.clone();
+            let node_id = target.backend_node_id;
+            // Prefer the page-revealed href when the control is a link
+            // that discloses one; validated in Rust, never trusted raw.
+            if let Some(href) = browser.node_href(node_id).await
+                && let Some(url) = validate_revealed_href(&href, origin)
+            {
+                tried.push(tried_label(target, "revealed href → navigate"));
+                browser.navigate(&url).await?;
+                let username = username_from_href(&url);
+                let landed = browser.current_url().await.ok().flatten().unwrap_or(url);
+                return verify_account_home(browser, origin, &label, &landed, username.as_deref())
+                    .await;
+            }
+            // No usable href: click the revealed control and watch the URL.
+            click_element(browser, target).await?;
+            clicked.push(node_id);
+            tried.push(tried_label(target, "clicked, watching URL"));
+            if let Some(landed) = wait_for_url_change(browser).await {
+                let username = username_from_menu_text(&label);
+                return verify_account_home(browser, origin, &label, &landed, username.as_deref())
+                    .await;
+            }
+            continue;
+        }
+
+        // 2. No revealed destination: open the next identity control and
+        // quiet-wait for its layer to render before re-snapshotting.
+        let Some(control) = select_identity_control(browser, &elements, &clicked).await else {
+            break;
+        };
+        let name = control.name.clone();
+        let role = control.role.clone();
+        let node_id = control.backend_node_id;
+        click_element(browser, control).await?;
+        clicked.push(node_id);
+        wait_for_menu(browser).await;
+        let (after, _, _) = browser.ax_snapshot(origin).await;
+        let effect = if count_actionable(&after) > actionable_before {
+            "menu opened"
+        } else {
+            "no new controls"
+        };
+        tried.push(format!("{role} '{name}' → {effect}"));
+    }
+    Err(IntentError::NoMatch(identity_miss_diagnostic(&tried)))
+}
+
+/// Model-guided half of [`pursue_account_home`]: the navigator picks the
+/// identity click from the live snapshot, but the verifier still decides
+/// success — a model-picked click alone never yields `Verified`.
+async fn pursue_account_home_with_model(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    deterministic_miss: String,
+) -> Result<PageGoalOutcome, IntentError> {
+    let goal = "account home: open the account/avatar menu in the page header, then the profile control, to reach my own profile page";
+    match pursue_with_model(browser, origin, goal, navigator, deterministic_miss).await {
+        Ok(PageGoalOutcome::Navigated { label, landed }) => {
+            verify_account_home(browser, origin, &label, &landed, None).await
+        }
+        Ok(other) => Ok(other),
+        Err(error) => Err(error),
+    }
+}
+
+/// Identity-control pick for the account-home lane: semantic evidence
+/// first (an account-worded button), then the rightmost button in the
+/// header strip for landmark-less, word-less headers (avatar buttons
+/// named after the username). Deliberately NOT the first landmarked
+/// header button — "Chat"/"Create"/"Log in" also live in headers and
+/// are not identity chrome.
+async fn select_identity_control<'a>(
+    browser: &ManagedBrowser,
+    elements: &'a [AxElement],
+    clicked: &[i64],
+) -> Option<&'a AxElement> {
+    if let Some(control) = elements.iter().find(|element| {
+        element.role == "button"
+            && !clicked.contains(&element.backend_node_id)
+            && mentions_account_word(element)
+    }) {
+        return Some(control);
+    }
+    select_rightmost_button(browser, elements, clicked).await
+}
+
+/// A revealed profile destination: an actionable control mentioning
+/// profile/account words or carrying a `u/`-style username, not yet
+/// clicked. Gated on `clicked` being non-empty (see
+/// [`pursue_identity_chrome`]) so author links on a bare page never
+/// qualify.
+fn select_revealed_profile<'a>(
+    elements: &'a [AxElement],
+    clicked: &[i64],
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    elements.iter().find(|element| {
+        PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            && !clicked.contains(&element.backend_node_id)
+            && (mentions_noun(element, "profile")
+                || mentions_noun(element, "account")
+                || username_from_menu_text(&element.name).is_some())
+    })
+}
+
+/// Count actionable controls in a snapshot: the click-effect check
+/// compares this before and after a disclosure click.
+fn count_actionable(elements: &[AxElement]) -> usize {
+    elements
+        .iter()
+        .filter(|element| PAGE_GOAL_ROLES.contains(&element.role.as_str()))
+        .count()
+}
+
+/// Quiet-wait after a disclosure click: the first probe installs the
+/// observer (reads not-quiet), then poll until quiet or the deadline.
+/// A menu that renders instantly costs one extra poll, not two seconds.
+async fn wait_for_menu(browser: &ManagedBrowser) {
+    let _ = browser.page_quiet().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if browser.page_quiet().await {
+            break;
+        }
+    }
+}
+
+/// Validate a page-revealed href in Rust before navigating: absolute
+/// `https`, same site as the portal (modulo a `www.` prefix), no
+/// credentials, non-root path. Relative hrefs resolve against the
+/// origin. A rejection is never an error — the caller falls back to
+/// clicking the control itself.
+#[must_use]
+pub fn validate_revealed_href(href: &str, origin: &url::Url) -> Option<url::Url> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    // Reject non-navigable schemes before parsing: `javascript:`,
+    // `data:`, `mailto:`, and bare fragments never become destinations.
+    let url = if href.starts_with('/') || !href.contains(':') {
+        origin.join(href).ok()?
+    } else {
+        url::Url::parse(href).ok()?
+    };
+    if url.scheme() != "https" {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let host = url.host_str()?.to_lowercase();
+    let origin_host = origin.host_str()?.to_lowercase();
+    if !same_site_host(&host, &origin_host) {
+        return None;
+    }
+    if url.path() == "/" || url.path().is_empty() {
+        return None;
+    }
+    Some(url)
+}
+
+/// Same-site host comparison: equal after lowercasing and stripping a
+/// `www.` prefix. Conservative on purpose — `old.reddit.com` is not
+/// `www.reddit.com`, and a mismatch fails the candidate closed, never
+/// the run.
+#[must_use]
+pub fn same_site_host(host: &str, origin_host: &str) -> bool {
+    fn normalize(h: &str) -> String {
+        let lower = h.to_lowercase();
+        lower.strip_prefix("www.").unwrap_or(&lower).to_owned()
+    }
+    normalize(host) == normalize(origin_host)
+}
+
+/// Username from a revealed profile URL: the last non-empty path
+/// segment. Generic — whatever the site puts last is treated as the
+/// username and must reappear in the verified landing URL.
+#[must_use]
+pub fn username_from_href(url: &url::Url) -> Option<String> {
+    url.path_segments()?
+        .rfind(|segment| !segment.is_empty())
+        .map(str::to_owned)
+}
+
+/// Username from menu text: `u/name`, `U/name`, or `@name` handle shapes.
+/// Single token only — a sentence that happens to start with `u/` is not
+/// a username. Evidence only: a match strengthens verification (the
+/// landing path must contain the handle); a miss falls back to the
+/// weaker account-word checks, never to a guessed destination.
+#[must_use]
+pub fn username_from_menu_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    for prefix in ["u/", "U/", "@"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.chars().any(char::is_whitespace) {
+                return Some(rest.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Verify an account-home landing. The URL must be same-site and non-root
+/// (a click that went nowhere verifies nothing); when the page revealed a
+/// username, the landed path must carry it. Reads the live current URL —
+/// the navigation target is evidence, not proof.
+/// Closed general vocabulary for account-home URL paths: a landing
+/// whose path names the account area is evidence even without a
+/// username. General words, never site routes.
+const ACCOUNT_PATH_WORDS: &[&str] = &["profile", "account", "settings", "user", "me"];
+
+/// A URL path names the account area when one of its segments is an
+/// account word (`/user/name/`, `/settings`).
+#[must_use]
+pub fn path_names_account(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| ACCOUNT_PATH_WORDS.contains(&segment.to_lowercase().as_str()))
+}
+
+/// Profile/account evidence in a control label: the trigger that led to
+/// the landing was itself profile-worded.
+#[must_use]
+pub fn label_names_profile(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    lower.contains("profile") || lower.contains("account")
+}
+
+/// Pure account-home verification decision: given the live current URL,
+/// the portal origin, the trigger label, and an optional page-revealed
+/// username, decide whether the landing is the user's account home. The
+/// browser read stays in [`verify_account_home`]; this is the decision
+/// integration tests pin down.
+///
+/// # Errors
+///
+/// Returns the miss diagnostic when the landing is not verifiably the
+/// user's account home (wrong site, root page, username mismatch, or no
+/// account evidence without a username).
+pub fn verify_account_landing(
+    current: &url::Url,
+    origin: &url::Url,
+    label: &str,
+    username: Option<&str>,
+) -> Result<PageGoalOutcome, String> {
+    let origin_host = origin.host_str().unwrap_or("").to_lowercase();
+    let current_host = current.host_str().unwrap_or("").to_lowercase();
+    let same_site = same_site_host(&current_host, &origin_host);
+    let non_root = current.path() != "/" && !current.path().is_empty();
+    let path = current.path().to_lowercase();
+    let accepted = match username {
+        // Strongest: the page-revealed username must reappear in the URL.
+        Some(name) => same_site && non_root && path.contains(&name.to_lowercase()),
+        // Without a username, same-site non-root alone is not enough:
+        // the path must name the account area, or the trigger control
+        // must have been profile/account-worded. Arbitrary navigation
+        // fails the verification, never the run.
+        None => {
+            same_site
+                && non_root
+                && (path_names_account(current.path()) || label_names_profile(label))
+        }
+    };
+    if accepted {
+        Ok(PageGoalOutcome::Verified {
+            label: label.to_owned(),
+            landed: current.clone(),
+            username: username.map(str::to_owned),
+        })
+    } else {
+        Err(format!(
+            "account-home landing failed verification: at {current} (label '{label}')"
+        ))
+    }
+}
+
+async fn verify_account_home(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    label: &str,
+    landed: &url::Url,
+    username: Option<&str>,
+) -> Result<PageGoalOutcome, IntentError> {
+    // The live page is the truth: re-read the URL after the navigation
+    // and verify that, not the URL we asked for.
+    let current = browser
+        .current_url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| landed.clone());
+    verify_account_landing(&current, origin, label, username).map_err(IntentError::NoMatch)
+}
+
+/// One tried-click log line: role, truncated name, observed effect.
+#[must_use]
+pub fn tried_label(element: &AxElement, effect: &str) -> String {
+    let name: String = element.name.chars().take(40).collect();
+    format!("{} '{name}' → {effect}", element.role)
+}
+
+/// Miss diagnostic for the account-home worker: what it actually tried,
+/// never a dump of the controls it evaluated.
+#[must_use]
+pub fn identity_miss_diagnostic(tried: &[String]) -> String {
+    if tried.is_empty() {
+        "account-home: no identity control found in the header chrome".to_owned()
+    } else {
+        format!(
+            "account-home: identity control not reached. Tried: [{}]",
+            tried.join("; ")
+        )
+    }
+}
+
 /// Phase 1: deterministic observe-act loop. Evidence-only: every click
 /// targets a control the live AX tree actually offered. Already-clicked
 /// nodes are never re-clicked, so menus cannot be toggled shut by the loop
@@ -1048,17 +1446,16 @@ async fn pursue_deterministic(
             continue;
         }
         // 2. No direct hit: reveal more controls via one header menu —
-        // landmarked or account-worded first, then the topmost header
+        // landmarked or account-worded first, then the rightmost header
         // button by live geometry for landmark-less headers.
         if let Some(menu) = select_menu_button(&elements, &clicked) {
             clicked.push(menu.backend_node_id);
             click_element(browser, menu).await?;
             continue;
         }
-        if let Some(topmost) = select_topmost_button(browser, &elements, &clicked).await
-        {
-            clicked.push(topmost.backend_node_id);
-            click_element(browser, topmost).await?;
+        if let Some(rightmost) = select_rightmost_button(browser, &elements, &clicked).await {
+            clicked.push(rightmost.backend_node_id);
+            click_element(browser, rightmost).await?;
             continue;
         }
         // 3. Nothing left to try.
@@ -1126,9 +1523,7 @@ async fn pursue_with_model(
                     .iter()
                     .find(|element| element.backend_node_id == target)
                     .ok_or_else(|| {
-                        IntentError::NoMatch(format!(
-                            "navigator picked unknown element {target}"
-                        ))
+                        IntentError::NoMatch(format!("navigator picked unknown element {target}"))
                     })?;
                 let label = element.name.clone();
                 click_element(browser, element).await?;
@@ -1184,19 +1579,13 @@ pub fn select_page_control<'a>(
 /// the async [`select_topmost_button`] — live geometry as a last resort.
 /// Already-clicked nodes are skipped.
 #[must_use]
-pub fn select_menu_button<'a>(
-    elements: &'a [AxElement],
-    clicked: &[i64],
-) -> Option<&'a AxElement> {
+pub fn select_menu_button<'a>(elements: &'a [AxElement], clicked: &[i64]) -> Option<&'a AxElement> {
     elements
         .iter()
         .find(|element| {
             element.role == "button"
                 && !clicked.contains(&element.backend_node_id)
-                && matches!(
-                    element.landmark.as_deref(),
-                    Some("banner") | Some("navigation")
-                )
+                && matches!(element.landmark.as_deref(), Some("banner" | "navigation"))
         })
         .or_else(|| {
             elements.iter().find(|element| {
@@ -1216,12 +1605,13 @@ const ACCOUNT_MENU_WORDS: &[&str] = &["menu", "account", "user", "avatar"];
 fn mentions_account_word(element: &AxElement) -> bool {
     [&element.name, &element.description]
         .iter()
-        .flat_map(|text| normalize(text).split(' ').map(str::to_owned).collect::<Vec<_>>())
-        .any(|token| {
-            ACCOUNT_MENU_WORDS
-                .iter()
-                .any(|word| token.contains(word))
+        .flat_map(|text| {
+            normalize(text)
+                .split(' ')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
         })
+        .any(|token| ACCOUNT_MENU_WORDS.iter().any(|word| token.contains(word)))
 }
 
 /// Header strip as a fraction of viewport height: account controls live in
@@ -1229,41 +1619,46 @@ fn mentions_account_word(element: &AxElement) -> bool {
 /// page content, never a header menu — fail closed, never click it.
 const HEADER_STRIP_FRACTION: f64 = 0.25;
 
-/// Pure ranking for the geometry fallback: smallest `y` (topmost) wins,
-/// but only inside the header strip. Untestable CDP calls stay outside in
-/// [`select_topmost_button`]; the decision itself is unit-tested.
+/// Pure ranking for the geometry fallback: largest `x` (rightmost) wins,
+/// but only inside the header strip. Account controls cluster at the
+/// right end of horizontal headers (chat, create, notifications, avatar
+/// share one row), so rightmost beats topmost — the old topmost prior
+/// picked an arbitrary header button on Reddit. Untestable CDP calls stay
+/// outside in [`select_rightmost_button`]; the decision itself is
+/// unit-tested.
 #[must_use]
-pub fn pick_topmost(rects: &[(i64, f64)], strip_bottom: f64) -> Option<i64> {
+pub fn pick_rightmost(rects: &[(i64, f64, f64)], strip_bottom: f64) -> Option<i64> {
     rects
         .iter()
-        .filter(|(_, y)| *y <= strip_bottom)
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(id, _)| *id)
+        .filter(|(_, _, y)| *y <= strip_bottom)
+        .max_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, _, _)| *id)
 }
 
 /// Last-resort header-menu pick for landmark-less, word-less headers
 /// (avatar buttons named after the username, web-component headers with
 /// no AX landmark). Measures every unclicked button via `DOM.getBoxModel`
-/// and takes the topmost one inside the header strip. Best-effort:
+/// and takes the rightmost one inside the header strip. Best-effort:
 /// unreadable geometry or an unreadable viewport fails closed to `None`.
-async fn select_topmost_button<'a>(
+async fn select_rightmost_button<'a>(
     browser: &ManagedBrowser,
     elements: &'a [AxElement],
     clicked: &[i64],
 ) -> Option<&'a AxElement> {
     let (_, viewport_height) = browser.viewport_size().await?;
     let strip_bottom = viewport_height * HEADER_STRIP_FRACTION;
-    let mut rects: Vec<(i64, f64)> = Vec::new();
-    for element in elements.iter().filter(|element| {
-        element.role == "button" && !clicked.contains(&element.backend_node_id)
-    }) {
+    let mut rects: Vec<(i64, f64, f64)> = Vec::new();
+    for element in elements
+        .iter()
+        .filter(|element| element.role == "button" && !clicked.contains(&element.backend_node_id))
+    {
         // `node_rect` rejects degenerate (hidden) boxes, so invisible
         // controls never become candidates.
         if let Ok(highlight) = browser.node_rect(element.backend_node_id).await {
-            rects.push((element.backend_node_id, highlight.y));
+            rects.push((element.backend_node_id, highlight.x, highlight.y));
         }
     }
-    let winner = pick_topmost(&rects, strip_bottom)?;
+    let winner = pick_rightmost(&rects, strip_bottom)?;
     elements
         .iter()
         .find(|element| element.backend_node_id == winner)
@@ -1312,12 +1707,16 @@ async fn position_zones(
     if finite.is_empty() {
         return vec![None; head.len()];
     }
-    let (min_x, max_x) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (x, _)| {
-        (lo.min(*x), hi.max(*x))
-    });
-    let (min_y, max_y) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, y)| {
-        (lo.min(*y), hi.max(*y))
-    });
+    let (min_x, max_x) = finite
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (x, _)| {
+            (lo.min(*x), hi.max(*x))
+        });
+    let (min_y, max_y) = finite
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, y)| {
+            (lo.min(*y), hi.max(*y))
+        });
     points
         .iter()
         .map(|(x, y)| {

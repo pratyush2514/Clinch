@@ -2,6 +2,7 @@
 //! Task → Plan → Step execution with durable boundaries and typed progress.
 mod domain_grounder;
 mod entity_resolver;
+mod goal_class;
 mod intent_parser;
 mod intent_resolver;
 mod page_navigator;
@@ -12,8 +13,8 @@ mod task;
 mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
-pub use page_navigator::{LlmPageNavigator, NavigatorEnv};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
+pub use goal_class::{GoalClass, goal_class_for};
 pub use intent_parser::{
     IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,
     parse_prompt_bounded,
@@ -21,10 +22,11 @@ pub use intent_parser::{
 pub use intent_resolver::{
     AppCommand, CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent,
     VariableExtraction, VariableKind, decompose_command, detect_in_page_goal, ephemeral_name,
-    extract_dynamic_variables, extract_identifier, is_direct_open, parse_grammar,
-    parse_intent_structured, prompt_key, resolve_app_command, resolve_command,
+    extract_dynamic_variables, extract_identifier, follow_up_on_origin, is_direct_open,
+    parse_grammar, parse_intent_structured, prompt_key, resolve_app_command, resolve_command,
 };
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
+pub use page_navigator::{LlmPageNavigator, NavigatorEnv};
 pub use route_proposer::{
     BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,
     LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,

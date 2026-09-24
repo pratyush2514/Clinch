@@ -37,6 +37,31 @@ pub struct SiteShortcut {
     pub url: String,
 }
 
+/// One remembered identity fact per (origin, goal class): the profile URL
+/// a previous run revealed from the live page (or a connector), never
+/// guessed. Lets a repeat "open my profile" become a single validated
+/// navigation instead of another header hunt. `username` is optional —
+/// some menus disclose only an href. No cookies, no credentials.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IdentityMemory {
+    pub origin: String,
+    pub goal_class: String,
+    pub username: Option<String>,
+    pub href: String,
+    pub source: String,
+}
+
+/// Normalize an origin into the memory keyspace: lowercase, trimmed.
+/// Origins never carry interior whitespace, so no collapsing is needed.
+/// Normalize an identity-memory origin key: lowercase, trimmed, and with
+/// a single leading `www.` stripped — the same normalization the
+/// same-site host check uses. `www.reddit.com` and `reddit.com` name one
+/// site, so they must key one row for remember, recall, and forget.
+fn normalize_identity_origin(origin: &str) -> String {
+    let origin = origin.trim().to_lowercase();
+    origin.strip_prefix("www.").unwrap_or(&origin).to_owned()
+}
+
 /// Normalize a shortcut name into the ladder's keyspace: lowercase,
 /// trimmed, interior whitespace collapsed. Grammar target nouns are
 /// already lowercase single tokens, so saves and lookups meet here.
@@ -331,6 +356,111 @@ impl PlaybookStore {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Remember a revealed identity fact: the profile URL a run read from
+    /// the live page (or a connector) for this origin and goal class.
+    /// Upserted — a fresh discovery replaces a stale one, never appends.
+    /// The href must be an absolute `https` URL; anything else is rejected
+    /// so a malformed read can never poison future runs.
+    ///
+    /// # Errors
+    /// Returns validation or database errors.
+    pub async fn remember_identity(
+        &self,
+        origin: &str,
+        goal_class: &str,
+        username: Option<&str>,
+        href: &str,
+        source: &str,
+    ) -> Result<IdentityMemory, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        let goal_class = goal_class.trim().to_lowercase();
+        let source = source.trim().to_lowercase();
+        if origin.is_empty() || goal_class.is_empty() || source.is_empty() {
+            return Err(StoreError::Shortcut(
+                "origin, goal class, and source must be non-empty".to_owned(),
+            ));
+        }
+        let parsed = url::Url::parse(href)
+            .ok()
+            .filter(|parsed| parsed.scheme() == "https" && parsed.has_host());
+        let Some(parsed) = parsed else {
+            return Err(StoreError::Shortcut(
+                "identity href must be an absolute https URL".to_owned(),
+            ));
+        };
+        sqlx::query(
+            "INSERT INTO identity_memory(origin, goal_class, username, href, source, seen_at) VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(origin, goal_class) DO UPDATE SET username=excluded.username, href=excluded.href, source=excluded.source, seen_at=CURRENT_TIMESTAMP",
+        )
+        .bind(&origin)
+        .bind(&goal_class)
+        .bind(username)
+        .bind(parsed.as_str())
+        .bind(&source)
+        .execute(&self.pool)
+        .await?;
+        Ok(IdentityMemory {
+            origin,
+            goal_class,
+            username: username.map(str::to_owned),
+            href: parsed.as_str().to_owned(),
+            source,
+        })
+    }
+
+    /// Recall a remembered identity fact. Unknown origins read back as
+    /// unset rather than erroring: the worker falls back to the live
+    /// header read, exactly as before memory existed.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn recall_identity(
+        &self,
+        origin: &str,
+        goal_class: &str,
+    ) -> Result<Option<IdentityMemory>, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        let goal_class = goal_class.trim().to_lowercase();
+        let row: Option<(String, String, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT origin, goal_class, username, href, source FROM identity_memory WHERE origin = ? AND goal_class = ?",
+        )
+        .bind(&origin)
+        .bind(&goal_class)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(origin, goal_class, username, href, source)| IdentityMemory {
+                origin,
+                goal_class,
+                username,
+                href,
+                source,
+            },
+        ))
+    }
+
+    /// Forget every remembered identity fact for an origin. Called by the
+    /// "Forget this site" flow alongside cookie revocation, so a signed-out
+    /// origin can never be navigated from a stale remembered profile.
+    /// Matches the host with or without a `www.` prefix, since the row may
+    /// have been keyed by either form. Returns the number of rows removed.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn forget_identity_for_origin(&self, origin: &str) -> Result<u64, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        // Match with or without a `www.` prefix: the row may have been
+        // keyed by either form, and the forget call may name the other.
+        let bare = origin.strip_prefix("www.").unwrap_or(&origin);
+        let done =
+            sqlx::query("DELETE FROM identity_memory WHERE origin = ? OR origin = 'www.' || ?")
+                .bind(bare)
+                .bind(bare)
+                .execute(&self.pool)
+                .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Newest-first summaries for the workflow list. A single corrupt row
     /// fails the listing closed rather than silently hiding a workflow.
     ///
@@ -513,6 +643,15 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
     // databases gain it on next open.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS site_shortcuts (name TEXT PRIMARY KEY, url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await?;
+    // Remembered identity facts: one row per (origin, goal class) holding
+    // the profile URL a run revealed from the live page. Same additive,
+    // idempotent story — existing databases gain it on next open, and the
+    // composite key keeps one origin from collecting stale duplicates.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS identity_memory (origin TEXT NOT NULL, goal_class TEXT NOT NULL, username TEXT, href TEXT NOT NULL, source TEXT NOT NULL, seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (origin, goal_class))",
     )
     .execute(&pool)
     .await?;

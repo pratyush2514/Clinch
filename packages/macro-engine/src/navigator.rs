@@ -35,15 +35,11 @@ pub const MAX_NAVIGATOR_ELEMENTS: usize = 60;
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PageAction {
     /// Click the element with this snapshot id.
-    Click {
-        target: i64,
-    },
+    Click { target: i64 },
     /// The goal is already achieved on this page; nothing to click.
     Done,
     /// No element can advance the goal.
-    GiveUp {
-        reason: String,
-    },
+    GiveUp { reason: String },
 }
 
 /// Decides the next in-page step toward `goal`, given the live snapshot's

@@ -297,4 +297,45 @@ describe("ActionThread", () => {
     screen.getByRole("button", { name: "Not now" }).click();
     expect(onDismissShortcut).toHaveBeenCalledWith("e1");
   });
+
+  it("hands the browser over on an account-home pursuit miss", () => {
+    const onTakeControl = vi.fn();
+    const entries = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "open my profile on reddit", at: 1_000 },
+      {
+        type: "failed",
+        id: "e1",
+        at: 1_200,
+        message:
+          "account-home: tried avatar button (menu opened); tried profile link (no new controls); no verified destination",
+        code: "workflow_failed",
+      },
+    ]);
+    view(entries, { onTakeControl });
+
+    // The worker journaled what it tried; the browser is still on the
+    // portal, so the card offers the window instead of a dead end.
+    const button = screen.getByRole("button", { name: "Take control" });
+    button.click();
+    expect(onTakeControl).toHaveBeenCalledTimes(1);
+    expect(onTakeControl).toHaveBeenCalledWith();
+  });
+
+  it("does not offer Take control on other workflow failures", () => {
+    const entries = fold([
+      { type: "submit", id: "e1", lane: "playbook", prompt: "download my invoices", at: 1_000 },
+      {
+        type: "failed",
+        id: "e1",
+        at: 1_200,
+        message: "The run failed before anything could be tried.",
+        code: "workflow_failed",
+      },
+    ]);
+    view(entries);
+
+    // The miss affordance is gated on the worker's own journal contract;
+    // unrelated failures must not grow a Take control button.
+    expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
+  });
 });

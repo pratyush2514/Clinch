@@ -8,7 +8,7 @@
 
 use browser_driver::AxElement;
 use macro_engine::{
-    page_goal_diagnostic, pick_topmost, select_menu_button, select_page_control, zone_for,
+    page_goal_diagnostic, pick_rightmost, select_menu_button, select_page_control, zone_for,
 };
 
 fn el(id: i64, role: &str, name: &str, landmark: Option<&str>) -> AxElement {
@@ -73,10 +73,7 @@ fn select_menu_button_prefers_header() {
 
 #[test]
 fn page_goal_diagnostic_renders_evidence() {
-    let elements = vec![
-        el(1, "link", "Home", None),
-        el(2, "button", "Log in", None),
-    ];
+    let elements = vec![el(1, "link", "Home", None), el(2, "button", "Log in", None)];
     let diagnostic = page_goal_diagnostic(&elements, "profile");
     assert!(diagnostic.contains("profile"), "{diagnostic}");
     assert!(diagnostic.contains("Home"), "{diagnostic}");
@@ -145,13 +142,20 @@ fn select_page_control_expands_profile_to_account() {
 }
 
 #[test]
-fn pick_topmost_selects_highest_button_in_strip() {
-    // (backend_node_id, y): smallest y wins when inside the strip.
-    assert_eq!(pick_topmost(&[(1, 40.0), (2, 12.0), (3, 80.0)], 200.0), Some(2));
+fn pick_rightmost_selects_rightmost_button_in_strip() {
+    // (backend_node_id, x, y): largest x wins when inside the strip.
+    // Header buttons share one row, so y alone can't distinguish them.
+    assert_eq!(
+        pick_rightmost(&[(1, 40.0, 12.0), (2, 300.0, 12.0), (3, 80.0, 14.0)], 200.0),
+        Some(2)
+    );
     // Below the strip is page content, never a header menu.
-    assert_eq!(pick_topmost(&[(1, 300.0), (2, 500.0)], 200.0), None);
+    assert_eq!(
+        pick_rightmost(&[(1, 900.0, 300.0), (2, 950.0, 500.0)], 200.0),
+        None
+    );
     // Empty candidates: none.
-    assert_eq!(pick_topmost(&[], 200.0), None);
+    assert_eq!(pick_rightmost(&[], 200.0), None);
 }
 
 #[test]

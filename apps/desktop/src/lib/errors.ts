@@ -50,3 +50,16 @@ export function message(error: unknown): string {
 export function needsSession(code: string | null): boolean {
   return code === "session_required";
 }
+
+/**
+ * Whether a failed run was an account-home pursuit miss — the worker tried
+ * the header identity chrome, found nothing it could verify, and journaled
+ * its attempts. The managed browser is still sitting on the portal page,
+ * so the honest recovery is handing the window to the user.
+ *
+ * The `"account-home:"` prefix is Clinch's own journal contract (see
+ * `identity_miss_diagnostic` in the macro-engine), not user text.
+ */
+export function isPursuitMiss(code: string | null, messageText: string): boolean {
+  return code === "workflow_failed" && messageText.includes("account-home:");
+}

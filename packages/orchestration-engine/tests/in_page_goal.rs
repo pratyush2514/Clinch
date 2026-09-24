@@ -58,7 +58,10 @@ fn adjectival_site_stays_conservative() {
     // so it stays a plain target — `open my work profile` must never
     // ground `work` as a site.
     assert_eq!(detect_in_page_goal("open my reddit profile", None), None);
-    assert_eq!(detect_in_page_goal("open my work profile", Some(&reddit)), None);
+    assert_eq!(
+        detect_in_page_goal("open my work profile", Some(&reddit)),
+        None
+    );
     // The adjective naming a different portal: not a follow-up here.
     let github = origin("https://github.com/");
     assert_eq!(
@@ -72,7 +75,10 @@ fn rejects_non_follow_ups() {
     let reddit = origin("https://www.reddit.com/");
     let google = origin("https://www.google.com/");
     // Different named site: still a fresh portal open.
-    assert_eq!(detect_in_page_goal("open amazon for me", Some(&reddit)), None);
+    assert_eq!(
+        detect_in_page_goal("open amazon for me", Some(&reddit)),
+        None
+    );
     // Named site is not the connected portal.
     assert_eq!(
         detect_in_page_goal("open my profile in reddit", Some(&google)),

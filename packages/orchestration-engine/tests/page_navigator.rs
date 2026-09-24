@@ -108,7 +108,9 @@ fn groq_envelope(content: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n");
-    format!(r#"{{"choices": [{{"message": {{"content": "{escaped}"}}, "finish_reason": "stop"}}]}}"#)
+    format!(
+        r#"{{"choices": [{{"message": {{"content": "{escaped}"}}, "finish_reason": "stop"}}]}}"#
+    )
 }
 
 // --- Provider selection ---
@@ -215,8 +217,11 @@ fn groq_invented_action_declines() {
 
 #[test]
 fn groq_http_error_declines() {
-    let Some(base) = mock_server(500, r#"{"error": {"code": "server_error"}}"#.to_owned(), None)
-    else {
+    let Some(base) = mock_server(
+        500,
+        r#"{"error": {"code": "server_error"}}"#.to_owned(),
+        None,
+    ) else {
         panic!("loopback mock failed to bind")
     };
     let nav = LlmPageNavigator::groq("test-key", &base, "test-model");

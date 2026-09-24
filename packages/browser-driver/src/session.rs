@@ -214,6 +214,25 @@ fn auth_state_of(title: &str, url: &Url, body_text: &str) -> AuthState {
     }
 }
 
+/// Pure attribute scan behind [`ManagedBrowser::node_href`]: CDP flattens
+/// a node's attributes into alternating name/value strings. The decision
+/// itself is pure and covered by integration tests; the CDP call stays
+/// outside.
+#[must_use]
+pub fn href_from_attributes(attributes: Option<&[String]>) -> Option<String> {
+    let attrs = attributes?;
+    let (pairs, _remainder) = attrs.as_chunks::<2>();
+    for pair in pairs {
+        if pair[0].eq_ignore_ascii_case("href") {
+            let href = pair[1].trim();
+            if !href.is_empty() {
+                return Some(href.to_owned());
+            }
+        }
+    }
+    None
+}
+
 fn challenge_kind(title: &str, url: &Url, body_text: &str) -> Option<ChallengeKind> {
     // Interactive markers are the more specific signal: check them first
     // so a gate page is never misrouted through L1. Existing markers keep
@@ -388,6 +407,25 @@ impl ManagedBrowser {
             matches: 1,
         })
     }
+    /// Best-effort `href` of the DOM node behind a backend node id, for
+    /// links the live page reveals (account menus disclose profile URLs).
+    /// Resolved lazily per candidate — never for the whole snapshot.
+    /// `None` on any CDP failure, timeout, or missing/empty href: the
+    /// caller falls back to clicking the control itself.
+    pub async fn node_href(&self, backend_node_id: i64) -> Option<String> {
+        use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams};
+        let params = DescribeNodeParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .build();
+        let node = tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
+            .await
+            .ok()?
+            .ok()?
+            .result
+            .node;
+        href_from_attributes(node.attributes.as_deref())
+    }
+
     /// Viewport CSS dimensions `(width, height)`, for geometry heuristics
     /// that need a page frame (header-strip bounds, zone rendering).
     /// Best-effort: `None` fails the caller closed, never the run.

@@ -933,13 +933,12 @@ impl AppService {
         let Ok(database) = self.database().await else {
             return Vec::new();
         };
-        let lines: Vec<String> = sqlx::query_scalar(
-            "SELECT outcome FROM session_events ORDER BY rowid DESC LIMIT ?",
-        )
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(database)
-        .await
-        .unwrap_or_default();
+        let lines: Vec<String> =
+            sqlx::query_scalar("SELECT outcome FROM session_events ORDER BY rowid DESC LIMIT ?")
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(database)
+                .await
+                .unwrap_or_default();
         lines.into_iter().rev().collect()
     }
 
@@ -2158,12 +2157,134 @@ impl AppService {
         }
     }
 
+    /// Follow-up fast-path probe: does the prompt name the site the live
+    /// browser already shows, with an artifact noun to pursue on it?
+    /// Returns the portal (current origin, path reset) plus the noun.
+    /// The site token is content-bearing (never a stopword), so the
+    /// substring check on the host mirrors `detect_in_page_goal` — no
+    /// site list, no grounding call. `None` keeps the normal ladder.
+    async fn follow_up_in_page_goal(&self, prompt: &str) -> Option<(url::Url, String)> {
+        let grammar = orchestration_engine::parse_grammar(prompt, None);
+        let browser = self.browser(BrowserIntent::Background).await.ok()?;
+        let current = browser.current_url().await.ok()??;
+        let (_, artifact) =
+            orchestration_engine::follow_up_on_origin(&grammar, current.host_str())?;
+        let mut portal = current;
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        *self.session_origin.lock().ok()? = Some(portal.clone());
+        Some((portal, artifact))
+    }
+
+    /// Already-on-origin follow-up: journal the skipped ladder, pursue the
+    /// artifact noun in-page on the live portal, then settle. Extracted so
+    /// `dispatch_adhoc_auto_acquire` stays within the line budget.
+    async fn dispatch_follow_up_goal(
+        &self,
+        portal: url::Url,
+        prompt: String,
+        noun: String,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        let _ = self
+            .record(&format!(
+                "route: already_on_origin ({}) · ladder skipped",
+                portal.host_str().unwrap_or("?")
+            ))
+            .await;
+        let mut outcome = self
+            .dispatch_in_page_goal(portal, prompt, noun, emit)
+            .await?;
+        self.settle_ephemeral_outcome(&mut outcome).await;
+        Ok(outcome)
+    }
+
+    /// Cold-start in-page goal: the prompt names a site and carries an
+    /// artifact noun ("open my profile on the reddit"), and the ladder
+    /// grounded the site itself — never a search page. Land the site, then
+    /// pursue the noun on the live page: the navigated URL is observed from
+    /// real controls, never predicted from the prompt. Verbs decide nothing
+    /// here; only the (site, artifact) noun pair does, so
+    /// "open/show/take me to my profile" all take this path. The caller
+    /// checks the noun first, so this always handles the goal.
+    /// Extracted to keep `dispatch_adhoc_auto_acquire` within the line
+    /// budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_cold_in_page_goal(
+        &self,
+        prompt: String,
+        source: Option<orchestration_engine::RouteSource>,
+        entry: Option<String>,
+        noun: String,
+        route_log: Option<String>,
+        emit: impl FnMut(PlaybookEvent) + Send,
+    ) -> Result<DispatchOutcome, AppError> {
+        let entry = entry.ok_or(AppError::InvalidInput(
+            "The derived intent is not runnable.",
+        ))?;
+        let site_url = url::Url::parse(&entry)
+            .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        // Strict validation before any navigation or session write —
+        // the same provenance-aware bar as the normal path. The site
+        // was named by the user, so structural validation suffices.
+        let valid = orchestration_engine::entry_url_valid(source, site_url.as_str());
+        if !valid {
+            return Err(AppError::InvalidInput(
+                "The derived intent is not runnable.",
+            ));
+        }
+        // The entry origin becomes the run portal, recorded as the
+        // session origin so the run machinery's origin check passes.
+        let mut portal = site_url.clone();
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
+        let browser = self.browser(BrowserIntent::Background).await?;
+        // Land the site before acting: the pursuit snapshots the live
+        // page, so acting must start from the destination, not
+        // about:blank.
+        macro_engine::ensure_at_entry_url(&browser, &site_url)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        let _ = self
+            .record(&format!(
+                "in_page_goal_cold: '{noun}' → {}",
+                portal.host_str().unwrap_or("?")
+            ))
+            .await;
+        let mut outcome = self
+            .dispatch_in_page_goal(portal, prompt, noun, emit)
+            .await?;
+        // Keep the site route line above the goal line so Session
+        // Activity reads proposal → goal in order.
+        if let Some(site_line) = route_log {
+            outcome.route_log = Some(match outcome.route_log.take() {
+                Some(goal_line) => format!("{site_line}\n{goal_line}"),
+                None => site_line,
+            });
+        }
+        // Settle (final frame + challenge/auth branching) runs here,
+        // exactly like the normal path.
+        self.settle_ephemeral_outcome(&mut outcome).await;
+        Ok(outcome)
+    }
+
     async fn dispatch_adhoc_auto_acquire(
         &self,
         prompt: String,
         mut intent: macro_engine::SemanticIntent,
         emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Fast path: already on the named origin → pursue the artifact in-page.
+        if !intent.is_plural
+            && let Some((portal, noun)) = self.follow_up_in_page_goal(&prompt).await
+        {
+            return self
+                .dispatch_follow_up_goal(portal, prompt, noun, emit)
+                .await;
+        }
         // Tiered resolution first so the destination is journaled even when
         // the browser cannot start (mirrors the connected lane ordering).
         // `propose_entry_url` validates every tier (https, no credentials,
@@ -2180,67 +2301,23 @@ impl AppService {
         }
         // Cold-start in-page goal: the prompt names a site and carries an
         // artifact noun ("open my profile on the reddit"), and the ladder
-        // grounded the site itself — never a search page. Land the site,
-        // then pursue the noun on the live page: the navigated URL is
-        // observed from real controls, never predicted from the prompt.
-        // Verbs decide nothing here; only the (site, artifact) noun pair
-        // does, so "open/show/take me to my profile" all take this path.
-        if !intent.is_plural
-            && let Some(noun) = Self::cold_in_page_goal(&prompt, proposed.source)
-        {
-            let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
-                "The derived intent is not runnable.",
-            ))?;
-            let site_url = url::Url::parse(&entry)
-                .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
-            // Strict validation before any navigation or session write —
-            // the same provenance-aware bar as the normal path. The site
-            // was named by the user, so structural validation suffices.
-            let valid =
-                orchestration_engine::entry_url_valid(proposed.source, site_url.as_str());
-            if !valid {
-                return Err(AppError::InvalidInput(
-                    "The derived intent is not runnable.",
-                ));
-            }
-            // The entry origin becomes the run portal, recorded as the
-            // session origin so the run machinery's origin check passes.
-            let mut portal = site_url.clone();
-            portal.set_path("/");
-            portal.set_query(None);
-            portal.set_fragment(None);
-            *self
-                .session_origin
-                .lock()
-                .map_err(|_| AppError::Internal)? = Some(portal.clone());
-            let browser = self.browser(BrowserIntent::Background).await?;
-            // Land the site before acting: the pursuit snapshots the live
-            // page, so acting must start from the destination, not
-            // about:blank.
-            macro_engine::ensure_at_entry_url(&browser, &site_url)
-                .await
-                .map_err(|_| AppError::BrowserUnavailable)?;
-            let _ = self
-                .record(&format!(
-                    "in_page_goal_cold: '{noun}' → {}",
-                    portal.host_str().unwrap_or("?")
-                ))
+        // grounded the site itself — never a search page.
+        let cold_noun = if intent.is_plural {
+            None
+        } else {
+            Self::cold_in_page_goal(&prompt, proposed.source)
+        };
+        if let Some(noun) = cold_noun {
+            return self
+                .dispatch_cold_in_page_goal(
+                    prompt,
+                    proposed.source,
+                    intent.entry_url.clone(),
+                    noun,
+                    route_log,
+                    emit,
+                )
                 .await;
-            let mut outcome = self
-                .dispatch_in_page_goal(portal, prompt, noun, emit)
-                .await?;
-            // Keep the site route line above the goal line so Session
-            // Activity reads proposal → goal in order.
-            if let Some(site_line) = route_log {
-                outcome.route_log = Some(match outcome.route_log.take() {
-                    Some(goal_line) => format!("{site_line}\n{goal_line}"),
-                    None => site_line,
-                });
-            }
-            // Settle (final frame + challenge/auth branching) runs here,
-            // exactly like the normal path.
-            self.settle_ephemeral_outcome(&mut outcome).await;
-            return Ok(outcome);
         }
         let entry = intent.entry_url.clone().ok_or(AppError::InvalidInput(
             "The derived intent is not runnable.",
@@ -3198,6 +3275,19 @@ impl AppService {
                 }
             ))
             .await;
+        // Goal-class branch: identity goals ("my profile", "my account")
+        // get the chrome worker with memory and verification; every other
+        // artifact keeps the generic noun-hunt path below.
+        if let Some(goal_class) = orchestration_engine::goal_class_for(&noun) {
+            let _ = self
+                .record(&format!("in_page_goal_class: {}", goal_class.as_str()))
+                .await;
+            return self
+                .dispatch_account_home_goal(
+                    &browser, &portal, &name, goal_class, navigator, goal_line,
+                )
+                .await;
+        }
         match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
                 let _ = self
@@ -3226,6 +3316,15 @@ impl AppService {
                 let _ = self.record("in_page_goal_miss: browser error").await;
                 return Err(AppError::BrowserUnavailable);
             }
+            Ok(
+                macro_engine::PageGoalOutcome::Verified { .. }
+                | macro_engine::PageGoalOutcome::SignedOut,
+            ) => {
+                // `pursue_page_goal` never yields the account-home
+                // variants; defensive so the enum can grow without
+                // breaking this lane.
+                return Err(AppError::Internal);
+            }
         }
         // A pure in-page goal ends at the landing like a pure direct open:
         // the navigation IS the task, and there are no playbook steps.
@@ -3249,6 +3348,245 @@ impl AppService {
             final_url: None,
             page_title: None,
         })
+    }
+
+    /// Shared outcome builder for in-page follow-ups: a pure goal ends at
+    /// the landing like a pure direct open — the navigation IS the task.
+    fn in_page_goal_outcome(
+        name: &str,
+        goal_line: String,
+        final_url: Option<String>,
+    ) -> DispatchOutcome {
+        DispatchOutcome {
+            kind: "ephemeral",
+            name: name.to_owned(),
+            result: orchestration_engine::SequenceOutcome {
+                completed_steps: 0,
+                total_steps: 0,
+                status: orchestration_engine::SequenceStatus::Completed,
+                stopped_at: None,
+            },
+            steps: Vec::new(),
+            run_id: None,
+            lend_id: None,
+            route_log: Some(goal_line),
+            telemetry_log: None,
+            final_frame: None,
+            challenge: None,
+            auth_url: None,
+            final_url,
+            page_title: None,
+        }
+    }
+
+    /// `account_home` dispatch: memory fast path first, live chrome worker
+    /// second, verifier-gated success, honest miss. The identity row is an
+    /// observed fact from the user's own run — written automatically,
+    /// announced in the journal, revoked by "Forget this site".
+    /// Memory fast path for `account_home`: recall the remembered
+    /// identity href, validate and navigate it, verify the live page.
+    /// Returns `Some(outcome)` on a live hit, `None` on miss or stale
+    /// (stale rows are deleted here). Extracted so
+    /// `dispatch_account_home_goal` stays within the line budget.
+    async fn recall_account_home(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        origin_host: &str,
+        class_key: &str,
+        name: &str,
+        goal_line: String,
+    ) -> Result<Option<DispatchOutcome>, AppError> {
+        let remembered = self
+            .playbooks()
+            .await?
+            .recall_identity(origin_host, class_key)
+            .await
+            .map_err(|_| AppError::StorageUnavailable)?;
+        let Some(remembered) = remembered else {
+            let _ = self.record("in_page_goal_memory: miss").await;
+            return Ok(None);
+        };
+        let _ = self
+            .record(&format!("in_page_goal_memory: hit {}", remembered.href))
+            .await;
+        if let Some(landed) = self
+            .navigate_remembered_identity(browser, portal, &remembered)
+            .await
+        {
+            let _ = self
+                .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                .await;
+            return Ok(Some(Self::in_page_goal_outcome(
+                name,
+                goal_line,
+                Some(landed.as_str().to_owned()),
+            )));
+        }
+        // Stale: drop the row and fall through to the live chrome read.
+        let _ = self
+            .playbooks()
+            .await?
+            .forget_identity_for_origin(origin_host)
+            .await;
+        let _ = self.record("in_page_goal_memory: stale → rediscover").await;
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_account_home_goal(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        name: &str,
+        goal_class: orchestration_engine::GoalClass,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        goal_line: String,
+    ) -> Result<DispatchOutcome, AppError> {
+        let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
+        let class_key = goal_class.as_str();
+
+        // 1. Memory: a previous run revealed this origin's profile URL from
+        // the live page. A live hit completes here; miss or stale falls
+        // through to the chrome worker.
+        if let Some(outcome) = self
+            .recall_account_home(
+                browser,
+                portal,
+                &origin_host,
+                class_key,
+                name,
+                goal_line.clone(),
+            )
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        // 2. Live chrome worker with verifier.
+        match macro_engine::pursue_account_home(browser, portal, navigator).await {
+            Ok(macro_engine::PageGoalOutcome::Verified {
+                label,
+                landed,
+                username,
+            }) => {
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: verified '{label}' → {}",
+                        landed.as_str()
+                    ))
+                    .await;
+                match self
+                    .playbooks()
+                    .await?
+                    .remember_identity(
+                        &origin_host,
+                        class_key,
+                        username.as_deref(),
+                        landed.as_str(),
+                        "page_menu",
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = self
+                            .record(&format!(
+                                "in_page_goal_memory: write {origin_host} {class_key}"
+                            ))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .record(&format!("in_page_goal_memory: write failed ({error})"))
+                            .await;
+                    }
+                }
+                Ok(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                ))
+            }
+            Ok(macro_engine::PageGoalOutcome::SignedOut) => {
+                let _ = self
+                    .record("in_page_goal_signed_out: guest landing · no pursuit")
+                    .await;
+                // Settle's own auth probe renders the lend/Take Control
+                // card from the live page — no separate error path needed.
+                Ok(Self::in_page_goal_outcome(name, goal_line, None))
+            }
+            Ok(
+                macro_engine::PageGoalOutcome::Navigated { .. }
+                | macro_engine::PageGoalOutcome::AlreadyThere { .. },
+            ) => {
+                // `pursue_account_home` never yields these; defensive.
+                Err(AppError::Internal)
+            }
+            Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
+                let _ = self
+                    .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                let journal = self.recent_journal(16).await;
+                Err(AppError::WorkflowFailed(journal))
+            }
+            Err(macro_engine::IntentError::Browser(_)) => {
+                let _ = self.record("in_page_goal_miss: browser error").await;
+                Err(AppError::BrowserUnavailable)
+            }
+        }
+    }
+
+    /// Navigate a remembered identity href after Rust-side validation, then
+    /// confirm the live page agrees. Returns the live URL on agreement,
+    /// `None` when anything disagrees (stale row, redirect to login, …).
+    async fn navigate_remembered_identity(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        remembered: &playbook_store::IdentityMemory,
+    ) -> Option<url::Url> {
+        let url = url::Url::parse(&remembered.href).ok()?;
+        if url.scheme() != "https" || url.path() == "/" || url.path().is_empty() {
+            return None;
+        }
+        // A remembered href is navigation-only: credentials embedded in
+        // it are rejected, never sent.
+        if !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        if !macro_engine::same_site_host(
+            url.host_str().unwrap_or(""),
+            portal.host_str().unwrap_or(""),
+        ) {
+            return None;
+        }
+        if let Some(username) = remembered.username.as_deref()
+            && !url.path().to_lowercase().contains(&username.to_lowercase())
+        {
+            return None;
+        }
+        browser.navigate(&url).await.ok()?;
+        let current = browser.current_url().await.ok().flatten()?;
+        // The live page is the truth: a logout or account switch redirects
+        // away from the remembered URL, which must read as stale.
+        if !macro_engine::same_site_host(
+            current.host_str().unwrap_or(""),
+            url.host_str().unwrap_or(""),
+        ) {
+            return None;
+        }
+        if current.path() == "/" || current.path().is_empty() {
+            return None;
+        }
+        if let Some(username) = remembered.username.as_deref()
+            && !current
+                .path()
+                .to_lowercase()
+                .contains(&username.to_lowercase())
+        {
+            return None;
+        }
+        Some(current)
     }
 
     /// Run a plural intent across every matching control: snapshot once for
@@ -4094,6 +4432,17 @@ impl AppService {
             "session_forgotten: {host} · {cleared} cookies cleared"
         ))
         .await;
+        // Identity memory dies with the session: a signed-out origin must
+        // never be navigated from a stale remembered profile.
+        if let Ok(store) = self.playbooks().await
+            && let Ok(rows) = store.forget_identity_for_origin(&host).await
+            && rows > 0
+        {
+            self.journal_line(format!(
+                "identity_forgotten: {host} · {rows} remembered profile(s) cleared"
+            ))
+            .await;
+        }
         Ok(cleared)
     }
 

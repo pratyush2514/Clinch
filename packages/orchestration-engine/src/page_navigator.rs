@@ -25,7 +25,7 @@
 //! `GROQ_API_KEY` (zeroized on drop); Ollama needs only the local daemon.
 
 use crate::domain_grounder::GrounderProvider;
-use macro_engine::{PageAction, PageNavigator, PositionZone, MAX_NAVIGATOR_ELEMENTS};
+use macro_engine::{MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -261,10 +261,7 @@ impl LlmPageNavigator {
                 }),
             )
             .ok()?;
-        payload
-            .get("response")?
-            .as_str()
-            .map(str::to_owned)
+        payload.get("response")?.as_str().map(str::to_owned)
     }
 }
 
@@ -299,7 +296,10 @@ impl PageNavigator for LlmPageNavigator {
 /// stays bounded; header controls (where follow-up targets live) come
 /// first in snapshot document order. `zones[i]` describes line `i`;
 /// missing zones render as nothing rather than a guess.
-fn render_elements(elements: &[browser_driver::AxElement], zones: &[Option<PositionZone>]) -> String {
+fn render_elements(
+    elements: &[browser_driver::AxElement],
+    zones: &[Option<PositionZone>],
+) -> String {
     let unzoned: Option<PositionZone> = None;
     elements
         .iter()
