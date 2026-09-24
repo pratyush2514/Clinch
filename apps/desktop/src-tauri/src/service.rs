@@ -2253,26 +2253,43 @@ impl AppService {
             // Note: a run whose L1 escalation cleared keeps the silent
             // path — the headed browser is stood down right after, so a
             // sync tap would have nothing attached to work with.
-            if self.detect_auth_state().await == AuthState::LoggedOut
-                && let Some(page_url) = outcome.final_url.clone()
-            {
-                let host = url::Url::parse(&page_url)
-                    .ok()
-                    .and_then(|url| url.host_str().map(str::to_owned))
-                    .unwrap_or_else(|| page_url.clone());
-                // Only offer the card when the tap can actually run: the
-                // lend command resolves the page URL from this registry.
-                if let Some(run_id) = outcome.run_id.clone() {
-                    self.remember_session_lend(
-                        run_id,
-                        page_url.clone(),
-                        SessionLendOrigin::GuestLanding,
-                    );
-                    self.journal_line(format!("auth_state_detected: {host} · logged out"))
-                        .await;
-                    outcome.auth_url = Some(page_url);
+            //
+            // Every reading is journaled, not just the logged-out one: a
+            // silent Unknown is otherwise indistinguishable from "the probe
+            // never ran", which is exactly what made the first live test's
+            // missing card undiagnosable.
+            let probe_line = match self.detect_auth_state().await {
+                AuthState::LoggedOut => {
+                    if let Some(page_url) = outcome.final_url.clone() {
+                        let host = url::Url::parse(&page_url)
+                            .ok()
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                            .unwrap_or_else(|| page_url.clone());
+                        // Only offer the card when the tap can actually run: the
+                        // lend command resolves the page URL from this registry.
+                        if let Some(run_id) = outcome.run_id.clone() {
+                            self.remember_session_lend(
+                                run_id,
+                                page_url.clone(),
+                                SessionLendOrigin::GuestLanding,
+                            );
+                            outcome.auth_url = Some(page_url);
+                        }
+                        format!("auth_state_detected: {host} · logged out")
+                    } else {
+                        "auth_state_detected: logged out · no final url".to_string()
+                    }
                 }
-            }
+                AuthState::Authenticated => "auth_state_detected: authenticated".to_string(),
+                AuthState::Unknown => {
+                    "auth_state_detected: unknown · probe failed or page unclassifiable".to_string()
+                }
+            };
+            let line = self.journal_line(probe_line).await;
+            outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
+                Some(existing) => format!("{existing}\n{line}"),
+                None => line,
+            });
         }
     }
 
