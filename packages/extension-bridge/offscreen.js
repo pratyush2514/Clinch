@@ -10,18 +10,22 @@
  * Division of labour (deliberate):
  * - This document: socket lifecycle only (connect/backoff, heartbeat with
  *   real PONG correlation, message dispatch). It never touches cookies.
- * - The service worker (background.js): reads cookies on demand and owns
- *   the watchdog alarm that recreates this document if Chrome reclaims it.
+ * - The service worker (background.js): reads cookies on demand, owns all
+ *   chrome.storage access, and runs the watchdog alarm that recreates this
+ *   document if Chrome reclaims it.
+ *
+ * MV3 quirk: offscreen documents only expose chrome.runtime — chrome.storage
+ * is undefined here even with the "storage" permission. Every storage need
+ * in this file is proxied through the worker via OFFSCREEN_* messages.
  *
  * Message types on chrome.runtime (all fire-and-forget broadcasts except
- * WORKER_SYNC_REQUEST, which uses sendResponse):
+ * WORKER_SYNC_REQUEST and OFFSCREEN_GET_INSTALL_ID, which use sendResponse):
  * - WORKER_SYNC_REQUEST {requestId, domain}   -> worker (expects a reply)
+ * - OFFSCREEN_SOCKET_STATE {state}            -> worker (diagnostics write)
+ * - OFFSCREEN_GET_INSTALL_ID {}               -> worker (expects a reply)
  * - STATUS_PING_QUERY {nonce}                 -> this document (status page)
  * - STATUS_PING_PONG {nonce, ok, rttMs}       -> status page (from here)
  *
- * Socket state is mirrored to chrome.storage.session ("bridgeSocket") so
- * the status page can render it without any messaging round-trip.
- */
 
 const SOCKET_URL = "ws://127.0.0.1:9223";
 const RECONNECT_CAP_MS = 30_000;
@@ -36,9 +40,16 @@ let heartbeatTimer = null;
 const pendingPongs = new Map();
 
 function setSocketState(state) {
-  chrome.storage.session
-    .set({ bridgeSocket: state, bridgeSocketAt: Date.now() })
-    .catch(() => {});
+  // Fire-and-forget: this document has no chrome.storage (MV3 quirk), so
+  // the worker owns the write. Never throws — diagnostics must not break
+  // connect().
+  try {
+    chrome.runtime
+      .sendMessage({ type: "OFFSCREEN_SOCKET_STATE", state })
+      .catch(() => {});
+  } catch {
+    // ignore
+  }
 }
 
 function send(message) {
@@ -49,26 +60,29 @@ function send(message) {
 
 /** One stable id per install, minted on first boot and shared with the
  * status page through storage. Sent in HELLO so the desktop app can label
- * each connected companion ("Brave · a1b2c3d4"). */
+ * each connected companion ("Brave · a1b2c3d4"). This document has no
+ * chrome.storage (MV3 quirk), so the worker mints and owns it; a
+ * memory-cached fallback keeps HELLO working even if the worker is
+ * unreachable. */
+let installIdMemory = null;
 async function ensureInstallId() {
+  if (installIdMemory) return installIdMemory;
   try {
-    const stored = await chrome.storage.local.get("installId");
-    if (typeof stored.installId === "string" && stored.installId) {
-      return stored.installId;
+    const res = await chrome.runtime.sendMessage({
+      type: "OFFSCREEN_GET_INSTALL_ID",
+    });
+    if (res && typeof res.installId === "string" && res.installId) {
+      installIdMemory = res.installId;
+      return installIdMemory;
     }
   } catch {
-    // Storage unavailable: fall through to a session-scoped id.
+    // Worker unreachable: fall through to a memory-only id.
   }
-  const fresh =
+  installIdMemory =
     typeof crypto !== "undefined" && crypto.randomUUID
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  try {
-    await chrome.storage.local.set({ installId: fresh });
-  } catch {
-    // Best effort: HELLO still goes out with the fresh id.
-  }
-  return fresh;
+  return installIdMemory;
 }
 
 async function helloPayload() {

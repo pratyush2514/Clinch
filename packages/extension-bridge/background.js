@@ -151,8 +151,59 @@ async function handleSyncRequest(domain) {
   }
 }
 
+/** Offscreen documents only expose chrome.runtime — chrome.storage is
+ * undefined there (MV3 quirk), so the worker owns every storage write the
+ * offscreen document needs: socket-state diagnostics and the install id. */
+async function writeSocketState(state) {
+  const payload = { bridgeSocket: state, bridgeSocketAt: Date.now() };
+  for (const area of ["session", "local"]) {
+    try {
+      const store = chrome.storage && chrome.storage[area];
+      if (!store) continue;
+      await store.set(payload);
+      return;
+    } catch {
+      // try the next area
+    }
+  }
+}
+
+/** One stable id per install, minted on first boot. Shared with the status
+ * page and the offscreen document's HELLO through chrome.storage.local. */
+async function ensureWorkerInstallId() {
+  try {
+    const stored = await chrome.storage.local.get("installId");
+    if (typeof stored.installId === "string" && stored.installId) {
+      return stored.installId;
+    }
+  } catch {
+    // fall through to minting
+  }
+  const fresh =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  try {
+    await chrome.storage.local.set({ installId: fresh });
+  } catch {
+    // Best effort: still return the fresh id for this session.
+  }
+  return fresh;
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || message.type !== "WORKER_SYNC_REQUEST") return false;
+  if (!message || typeof message.type !== "string") return false;
+  if (message.type === "OFFSCREEN_SOCKET_STATE") {
+    void writeSocketState(
+      typeof message.state === "string" ? message.state : "unknown"
+    );
+    return false; // fire-and-forget
+  }
+  if (message.type === "OFFSCREEN_GET_INSTALL_ID") {
+    ensureWorkerInstallId().then((installId) => sendResponse({ installId }));
+    return true; // async reply
+  }
+  if (message.type !== "WORKER_SYNC_REQUEST") return false;
   const { requestId, domain } = message;
   if (typeof requestId !== "string" || !requestId || typeof domain !== "string" || !domain) {
     sendResponse({ ok: false, reason: "internal" });
