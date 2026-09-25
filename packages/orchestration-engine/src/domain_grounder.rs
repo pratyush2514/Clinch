@@ -35,20 +35,24 @@ use zeroize::Zeroizing;
 const GROUNDER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Default Groq OpenAI-compatible base URL. Overridable for tests via
-/// `CLINCH_GROQ_BASE_URL`.
-const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+/// `CLINCH_GROQ_BASE_URL`. Shared with the intent-parser adapter so both
+/// providers read the same defaults.
+pub(crate) const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 /// Default Groq chat model: Groq's recommended replacement for the retired
 /// `llama-3.1-8b-instant` (decommissioned 2026-08-16; requests to it fail
 /// with a `model_decommissioned` error). Overridable via `CLINCH_GROQ_MODEL`.
 /// Groq retires models aggressively — re-check
 /// <https://console.groq.com/docs/deprecations> when grounding starts
 /// missing; the miss journal line carries the provider's error code.
-const GROQ_MODEL: &str = "openai/gpt-oss-20b";
+/// Shared with the intent-parser adapter so both providers read the same
+/// defaults.
+pub(crate) const GROQ_MODEL: &str = "openai/gpt-oss-20b";
 /// Default local Ollama base URL. Overridable via `CLINCH_OLLAMA_URL`.
-const OLLAMA_BASE_URL: &str = "http://localhost:11434";
+/// Shared with the intent-parser adapter.
+pub(crate) const OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Small local model that answers JSON reliably. Overridable via
-/// `CLINCH_OLLAMA_MODEL`.
-const OLLAMA_MODEL: &str = "qwen2.5:1.5b";
+/// `CLINCH_OLLAMA_MODEL`. Shared with the intent-parser adapter.
+pub(crate) const OLLAMA_MODEL: &str = "qwen2.5:1.5b";
 
 /// The single instruction both providers receive. It names no sites — the
 /// only site knowledge in the whole call is the one slot in the user line.

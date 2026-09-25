@@ -539,11 +539,15 @@ pub struct AppService {
     /// grammar parse is not confident, and only for slots — never for URLs,
     /// selectors, or code.
     ///
-    /// Ships as [`orchestration_engine::StubIntentParser`], which declines
-    /// every prompt so low-confidence commands degrade to raw search. That
+    /// [`orchestration_engine::LlmIntentParser::from_env`] when a provider is
+    /// configured (`CLINCH_GROUNDER_PROVIDER` set to `groq` with
+    /// `GROQ_API_KEY`, or to `ollama` for the local daemon); otherwise the
+    /// declining [`orchestration_engine::StubIntentParser`]. Unconfigured
     /// keeps the app offline-first with no model dependency, no API key, and
-    /// no prompt leaving the machine; choosing a local or hosted provider is
-    /// a product decision that swaps this one field.
+    /// no prompt leaving the machine — behavior identical to the shipped
+    /// stub. A configured provider spends one bounded call per
+    /// low-confidence prompt, and every answer still passes the slot fence
+    /// before it is believed.
     intent_parser: Arc<dyn orchestration_engine::IntentParser>,
 }
 
@@ -642,7 +646,16 @@ impl AppService {
             next_lend_id: AtomicU64::new(1),
             next_journal_run: AtomicU64::new(1),
             journal_run: Mutex::new(None),
-            intent_parser: Arc::new(orchestration_engine::StubIntentParser),
+            // The real Tier 2B when configured, the declining stub otherwise:
+            // unconfigured keeps today's offline behavior exactly, so no
+            // key and no provider means no behavior change.
+            intent_parser: orchestration_engine::LlmIntentParser::from_env().map_or_else(
+                || {
+                    Arc::new(orchestration_engine::StubIntentParser)
+                        as Arc<dyn orchestration_engine::IntentParser>
+                },
+                |parser| Arc::new(parser) as Arc<dyn orchestration_engine::IntentParser>,
+            ),
         }
     }
 
@@ -2687,6 +2700,35 @@ impl AppService {
                 return Err(AppError::WorkflowFailed(journal));
             }
         };
+        // Goal verification for direct-open intents: the navigation IS the
+        // task, so a follow that never left the search page is a miss, not
+        // a landing — without this a pure direct open "completes" its zero
+        // steps on the results page, claiming a goal it never achieved.
+        // `intent.entry_url` still names the search template the dispatcher
+        // itself navigated to (it is overwritten below); the shape check
+        // derives from that URL, so no search engine is hardcoded.
+        let direct_open = orchestration_engine::is_direct_open(
+            &intent.raw_prompt,
+            &orchestration_engine::parse_grammar(&intent.raw_prompt, None),
+        );
+        if direct_open
+            && let Some(entry) = intent
+                .entry_url
+                .as_deref()
+                .and_then(|entry| url::Url::parse(entry).ok())
+            && orchestration_engine::still_on_search_page(&entry, &followed.landed)
+        {
+            let _ = self
+                .record(&format!(
+                    "search_follow_miss: still on search page after follow · landed {}{}",
+                    followed.landed.host_str().unwrap_or("?"),
+                    followed.landed.path()
+                ))
+                .await;
+            return Err(AppError::InvalidInput(
+                "The search didn't lead to the destination — I never left the results page. Try the full domain (for example 'open amazon.in'), or save a site shortcut and try again.",
+            ));
+        }
         let mut portal = followed.landed.clone();
         portal.set_path("/");
         portal.set_query(None);
@@ -3007,10 +3049,23 @@ impl AppService {
                 };
             }
             let line = format!(
-                "route_proposed:{}{} · source: {:?}",
+                "route_proposed:{}{} · source: {:?}{}{}",
                 route.url.host_str().unwrap_or("?"),
                 route.url.path(),
-                route.source
+                route.source,
+                // Backend transparency: name which directory backend served
+                // a SiteSearch hit (`· via ddg`); other sources carry none.
+                route
+                    .directory_backend
+                    .map(|backend| format!(" · via {backend}"))
+                    .unwrap_or_default(),
+                // A vetoed directory hit rides the fallthrough route so the
+                // journal reads as a veto, not a silent miss.
+                route
+                    .directory_veto
+                    .as_deref()
+                    .map(|veto| format!(" · {veto}"))
+                    .unwrap_or_default(),
             );
             let _ = self.record(&line).await;
             intent.entry_url = Some(route.url.as_str().to_owned());

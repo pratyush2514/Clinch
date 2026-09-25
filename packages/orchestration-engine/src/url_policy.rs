@@ -86,6 +86,42 @@ pub fn validate_user_directed_url(url: &str) -> Result<url::Url, UrlRejected> {
     Ok(parsed)
 }
 
+/// Whether the landed URL is still on the search-results page the
+/// dispatcher itself navigated to.
+///
+/// Derived entirely from the entry URL — same origin (with the usual
+/// `www.` folding), the entry's own search path, and a shared query key —
+/// so there is no search-engine allowlist and no hardcoded host names or
+/// paths. The template's shape comes from the URL the dispatcher
+/// navigated to, which today is always the grounded `?q=` template, but
+/// the check assumes nothing about that.
+///
+/// A Stage-2 follow that never left the results page is a miss, not a
+/// landing: without this check a pure direct open "completes" its zero
+/// steps on the results page, claiming a destination the run never
+/// reached.
+#[must_use]
+pub fn still_on_search_page(entry_url: &url::Url, landed_url: &url::Url) -> bool {
+    // Same site, with the usual `www.` folding: a results page on another
+    // host is a different page, however search-shaped its URL looks.
+    if !browser_driver::same_site_origin(entry_url, landed_url) {
+        return false;
+    }
+    // The search path is the template's identity, taken from the entry
+    // URL itself rather than a hardcoded "/search".
+    if entry_url.path() != landed_url.path() {
+        return false;
+    }
+    // The query shape: both carry a query sharing at least one key (the
+    // template's parameter, e.g. `q`). A bare search path with no query
+    // is not a results page.
+    entry_url.query_pairs().any(|(key, _)| {
+        landed_url
+            .query_pairs()
+            .any(|(landed_key, _)| landed_key == key)
+    })
+}
+
 /// Validation bar for a proposed entry URL, by route provenance.
 /// User-directed destinations — a typed domain, a saved shortcut, a site
 /// the directory resolved, a site the domain grounder resolved — were named

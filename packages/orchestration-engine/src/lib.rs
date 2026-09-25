@@ -5,6 +5,7 @@ mod entity_resolver;
 mod goal_class;
 mod intent_parser;
 mod intent_resolver;
+mod llm_intent_parser;
 mod page_navigator;
 mod route_proposer;
 mod runner;
@@ -25,12 +26,13 @@ pub use intent_resolver::{
     extract_dynamic_variables, extract_identifier, follow_up_on_origin, is_direct_open,
     parse_grammar, parse_intent_structured, prompt_key, resolve_app_command, resolve_command,
 };
+pub use llm_intent_parser::LlmIntentParser;
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use page_navigator::{LlmPageNavigator, NavigatorEnv};
 pub use route_proposer::{
     BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,
     LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,
-    SiteSearchClient, SlotSource, StubDomainGrounder, explicit_url_in_prompt,
+    SiteHit, SiteSearchClient, SlotSource, StubDomainGrounder, explicit_url_in_prompt,
     region_hint_from_timezone, resolve_entry_url, resolve_slots, sanitize_search_query,
     search_fallback_url, system_region_hint, validate_grounded_domain,
 };
@@ -44,7 +46,8 @@ use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
 pub use url_policy::{
-    UrlRejected, entry_url_valid, validate_proposed_url, validate_user_directed_url,
+    UrlRejected, entry_url_valid, still_on_search_page, validate_proposed_url,
+    validate_user_directed_url,
 };
 
 #[derive(Debug, thiserror::Error)]

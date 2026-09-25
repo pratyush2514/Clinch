@@ -8,15 +8,16 @@ use browser_driver::{
 pub use executor::{
     ClickedControl, DriftDetail, ExecuteOutcome, FOLLOW_POLL_MS, FOLLOW_TIMEOUT_MS,
     FastReplayMetrics, FollowedResult, IntentError, IntentOutcome, MAX_BATCH_CLICKS,
-    PageGoalOutcome, RESOLVE_COST_USD, ResolveOutcome, ResolvedIntent, SETTLE_POLL_MS,
-    SETTLE_TIMEOUT_MS, SemanticIntent, ensure_at_entry_url, entry_url_mismatched, execute_batch,
-    execute_intent, follow_diagnostic, follow_search_result, grounding_diagnostic,
-    identity_miss_diagnostic, label_names_profile, page_goal_diagnostic, path_names_account,
-    pick_rightmost, preview_batch, pursue_account_home, pursue_page_goal, resolve_batch,
-    resolve_fast, resolve_intent, resolve_with_drift, same_site_host, search_follow_noun,
-    select_menu_button, select_page_control, select_revealed_profile, select_search_result,
-    settle_probe_text, tried_label, username_from_href, username_from_menu_text,
-    validate_revealed_href, verify_account_landing, wait_for_settled_candidates,
+    MenuOpenBaseline, OpenMenuOutcome, PageGoalOutcome, RESOLVE_COST_USD, ResolveOutcome,
+    ResolvedIntent, SETTLE_POLL_MS, SETTLE_TIMEOUT_MS, SemanticIntent, ensure_at_entry_url,
+    entry_url_mismatched, execute_batch, execute_intent, follow_diagnostic, follow_search_result,
+    grounding_diagnostic, identity_miss_diagnostic, label_names_profile, open_identity_menu,
+    page_goal_diagnostic, path_names_account, pick_rightmost, preview_batch, pursue_account_home,
+    pursue_page_goal, rank_menu_candidates, resolve_batch, resolve_fast, resolve_intent,
+    resolve_with_drift, same_site_host, search_follow_noun, select_menu_button,
+    select_page_control, select_revealed_profile, select_search_result, settle_probe_text,
+    tried_label, username_from_href, username_from_menu_text, validate_revealed_href,
+    verify_account_landing, wait_for_settled_candidates,
 };
 pub use navigator::{MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone, zone_for};
 use serde::{Deserialize, Serialize};

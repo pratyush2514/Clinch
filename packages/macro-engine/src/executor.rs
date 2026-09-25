@@ -1141,7 +1141,6 @@ async fn pursue_identity_chrome(
         // for a menu that plainly opened. Before/after id sets share the
         // same full-list semantics so "genuinely new" stays correct.
         let (elements, check_before, _) = browser.ax_snapshot_untruncated(origin).await;
-        let actionable_before = count_actionable(&elements);
         let currently_seen: std::collections::HashSet<i64> =
             elements.iter().map(|el| el.backend_node_id).collect();
 
@@ -1177,47 +1176,23 @@ async fn pursue_identity_chrome(
             continue;
         }
 
-        // 2. No revealed destination: open the next identity control and
-        // quiet-wait for its layer to render before re-snapshotting.
-        let Some(control) = select_identity_control(browser, &elements, &clicked).await else {
-            break;
+        // 2. No revealed destination: open the next identity control via
+        // the shared menu primitive — one attempt per iteration so the
+        // IDENTITY_MAX_CLICKS budget keeps its per-click meaning — then
+        // loop and re-snapshot against the new tree.
+        let baseline = MenuOpenBaseline {
+            elements: &elements,
+            check: &check_before,
         };
-        let name = control.name.clone();
-        let role = control.role.clone();
-        let tried_key = ClickedControl::of(control);
-        click_element(browser, control).await?;
-        clicked.push(tried_key);
-        wait_for_menu(browser).await;
-        let (after, check_after, _) = browser.ax_snapshot_untruncated(origin).await;
-        let actionable_after = count_actionable(&after);
-        // Name what actually appeared: on the next miss the journal shows
-        // whether the menu opened with unexpected roles, or at all. Node
-        // ids churn on dynamic pages, so "new" here is informational —
-        // the retry exclusion above keys on stable identity, not ids. The
-        // raw AX node delta distinguishes "menu rendered past the old head
-        // truncation" from "the click changed nothing at all".
-        let before_ids: std::collections::HashSet<i64> =
-            elements.iter().map(|el| el.backend_node_id).collect();
-        let new_nodes: Vec<String> = after
-            .iter()
-            .filter(|el| !before_ids.contains(&el.backend_node_id))
-            .take(6)
-            .map(|el| format!("{} '{}'", el.role, el.name))
-            .collect();
-        let raw_before = check_before.node_count;
-        let raw_after = check_after.node_count;
-        let effect = if new_nodes.is_empty() {
-            format!(
-                "no new controls (actionable {actionable_before} → {actionable_after}; raw AX nodes {raw_before} → {raw_after})"
-            )
-        } else {
-            format!(
-                "+{} new [{}] (raw AX nodes {raw_before} → {raw_after})",
-                new_nodes.len(),
-                new_nodes.join(", ")
-            )
-        };
-        tried.push(format!("{role} '{name}' → {effect}"));
+        match open_identity_menu(browser, origin, baseline, &mut clicked, 1).await? {
+            OpenMenuOutcome::Opened { tried: line, .. } => tried.push(line),
+            OpenMenuOutcome::Miss { tried: lines } => {
+                if lines.is_empty() {
+                    break;
+                }
+                tried.extend(lines);
+            }
+        }
         previously_seen = currently_seen;
     }
     Err(IntentError::NoMatch(identity_miss_diagnostic(&tried)))
@@ -1248,25 +1223,238 @@ async fn pursue_account_home_with_model(
     }
 }
 
-/// Identity-control pick for the account-home lane: semantic evidence
-/// first (an account-worded button), then the rightmost button in the
-/// header strip for landmark-less, word-less headers (avatar buttons
-/// named after the username). Deliberately NOT the first landmarked
-/// header button — "Chat"/"Create"/"Log in" also live in headers and
-/// are not identity chrome.
-async fn select_identity_control<'a>(
-    browser: &ManagedBrowser,
+/// What one shared menu-opening attempt did. Both in-page lanes route
+/// their menu step through [`open_identity_menu`]; the tried-label lines
+/// feed each lane's own miss journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenMenuOutcome {
+    /// A candidate's click opened a menu/layer: the stable identity of
+    /// the clicked control plus its tried-label line
+    /// (`role 'name' → effect`) for the caller's journal.
+    Opened {
+        control: ClickedControl,
+        tried: String,
+    },
+    /// No candidate opened a menu. `tried` holds one tried-label line per
+    /// attempt, in attempt order; empty means no candidate existed at all.
+    Miss { tried: Vec<String> },
+}
+
+/// Baseline snapshot for [`open_identity_menu`]'s click-effect check:
+/// the element list plus the resync check carrying the raw AX node
+/// count, from a single `ax_snapshot_untruncated` call.
+#[derive(Debug)]
+pub struct MenuOpenBaseline<'a> {
+    pub elements: &'a [AxElement],
+    pub check: &'a browser_driver::AxResyncCheck,
+}
+
+/// Per-invocation click cap for the shared menu primitive: one candidate
+/// per try, each effect-verified. Callers with their own per-iteration
+/// budgets (the identity lane) pass a smaller `max_tries`; the primitive
+/// never exceeds this cap, so a hostile header can't burn the run.
+const MENU_OPEN_MAX_TRIES: usize = 3;
+
+/// Ordered menu-opening candidates, pure decision: (a) landmarked
+/// banner/navigation buttons, then (b) account-worded buttons
+/// ([`mentions_account_word`]), then (c) blank-named buttons inside the
+/// header strip — the unlabeled-avatar case, structural (empty name +
+/// header geometry), never a control-name string — then (d) the
+/// remaining unclicked buttons inside the header strip, rightmost first.
+/// Tier (d) folds in the rightmost-geometry fallback both lanes already
+/// had (`select_identity_control`'s second tier and
+/// [`select_rightmost_button`]), so sharing the primitive doesn't drop
+/// the named-but-wordless header button case; blank-named avatars still
+/// outrank arbitrary named buttons. `rects` carries the
+/// boundary-measured `(backend_node_id, x, y)` of the unclicked buttons;
+/// `strip_bottom` is the viewport-relative header cutoff (`None` when
+/// the viewport won't read — geometry tiers stay empty, fail closed).
+/// Already-clicked controls are excluded in every tier; each control
+/// appears once, at its highest tier. CDP stays in the callers; this
+/// stays unit-testable like [`pick_rightmost`].
+#[must_use]
+pub fn rank_menu_candidates<'a>(
     elements: &'a [AxElement],
     clicked: &[ClickedControl],
-) -> Option<&'a AxElement> {
-    if let Some(control) = elements.iter().find(|element| {
+    rects: &[(i64, f64, f64)],
+    strip_bottom: Option<f64>,
+) -> Vec<&'a AxElement> {
+    let in_strip: std::collections::HashMap<i64, (f64, f64)> = rects
+        .iter()
+        .filter(|(_, _, y)| strip_bottom.is_some_and(|bottom| *y <= bottom))
+        .map(|(id, x, y)| (*id, (*x, *y)))
+        .collect();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut ranked: Vec<&'a AxElement> = Vec::new();
+    let mut push = |element: &'a AxElement| {
+        if seen.insert(element.backend_node_id) {
+            ranked.push(element);
+        }
+    };
+    // (a) landmarked header chrome.
+    for element in elements.iter().filter(|element| {
+        element.role == "button"
+            && !already_clicked(clicked, element)
+            && matches!(element.landmark.as_deref(), Some("banner" | "navigation"))
+    }) {
+        push(element);
+    }
+    // (b) account-worded buttons anywhere.
+    for element in elements.iter().filter(|element| {
         element.role == "button"
             && !already_clicked(clicked, element)
             && mentions_account_word(element)
     }) {
-        return Some(control);
+        push(element);
     }
-    select_rightmost_button(browser, elements, clicked).await
+    // (c) + (d): in-strip buttons, blank-named first, each rightmost first.
+    let mut strip_buttons: Vec<(&'a AxElement, f64)> = elements
+        .iter()
+        .filter(|element| {
+            element.role == "button"
+                && !already_clicked(clicked, element)
+                && in_strip.contains_key(&element.backend_node_id)
+        })
+        .map(|element| (element, in_strip[&element.backend_node_id].0))
+        .collect();
+    strip_buttons.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut blank: Vec<(&'a AxElement, f64)> = Vec::new();
+    let mut named: Vec<(&'a AxElement, f64)> = Vec::new();
+    for entry in strip_buttons {
+        if entry.0.name.trim().is_empty() {
+            blank.push(entry);
+        } else {
+            named.push(entry);
+        }
+    }
+    for (element, _) in blank.into_iter().chain(named) {
+        push(element);
+    }
+    ranked
+}
+
+/// Header-geometry rects at the CDP boundary: `(backend_node_id, x, y)`
+/// for every unclicked button, feeding [`rank_menu_candidates`] tiers
+/// (c) and (d). `node_rect` rejects degenerate (hidden) boxes, so
+/// invisible controls never qualify.
+async fn header_button_rects(
+    browser: &ManagedBrowser,
+    elements: &[AxElement],
+    clicked: &[ClickedControl],
+) -> Vec<(i64, f64, f64)> {
+    let mut rects = Vec::new();
+    for element in elements
+        .iter()
+        .filter(|element| element.role == "button" && !already_clicked(clicked, element))
+    {
+        if let Ok(highlight) = browser.node_rect(element.backend_node_id).await {
+            rects.push((element.backend_node_id, highlight.x, highlight.y));
+        }
+    }
+    rects
+}
+
+/// Click-effect verdict after a disclosure click, in the established
+/// before/after diagnostic style: the menu counts as opened when the
+/// actionable count grew or genuinely new nodes appeared. Node ids churn
+/// on dynamic pages, so "new" is informational — retry exclusion keys on
+/// stable identity, not ids. The raw AX node delta distinguishes "menu
+/// rendered past the old head truncation" from "the click changed
+/// nothing at all". Returns `(opened, effect)`.
+fn menu_open_effect(
+    before_ids: &std::collections::HashSet<i64>,
+    actionable_before: usize,
+    raw_before: usize,
+    after: &[AxElement],
+    raw_after: usize,
+) -> (bool, String) {
+    let actionable_after = count_actionable(after);
+    let new_nodes: Vec<String> = after
+        .iter()
+        .filter(|element| !before_ids.contains(&element.backend_node_id))
+        .take(6)
+        .map(|element| format!("{} '{}'", element.role, element.name))
+        .collect();
+    let opened = actionable_after > actionable_before || !new_nodes.is_empty();
+    let effect = if new_nodes.is_empty() {
+        format!(
+            "no new controls (actionable {actionable_before} → {actionable_after}; raw AX nodes {raw_before} → {raw_after})"
+        )
+    } else {
+        format!(
+            "+{} new [{}] (raw AX nodes {raw_before} → {raw_after})",
+            new_nodes.len(),
+            new_nodes.join(", ")
+        )
+    };
+    (opened, effect)
+}
+
+/// Shared menu-opening primitive for both in-page lanes. Tries the
+/// ordered [`rank_menu_candidates`] (landmarked → account-worded →
+/// unlabeled-in-header → rightmost-in-header), one click per candidate,
+/// each followed by a quiet-wait and an untruncated re-snapshot; a
+/// candidate counts as opened only when its click-effect shows new
+/// controls (actionable count grew or new nodes appeared). Bounded by
+/// `max_tries` and the [`MENU_OPEN_MAX_TRIES`] cap. Browser errors
+/// propagate; every attempted click is recorded in `clicked` by stable
+/// identity so neither lane re-tries — or toggles shut — the same
+/// control.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+pub async fn open_identity_menu(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+    baseline: MenuOpenBaseline<'_>,
+    clicked: &mut Vec<ClickedControl>,
+    max_tries: usize,
+) -> Result<OpenMenuOutcome, IntentError> {
+    let before = baseline.elements;
+    let actionable_before = count_actionable(before);
+    let before_ids: std::collections::HashSet<i64> = before
+        .iter()
+        .map(|element| element.backend_node_id)
+        .collect();
+    let raw_before = baseline.check.node_count;
+
+    // Geometry tiers at the CDP boundary; tiers (a) and (b) are pure.
+    // An unreadable viewport fails the geometry tiers closed to empty —
+    // tiers (a) and (b) are still tried.
+    let strip_bottom = browser
+        .viewport_size()
+        .await
+        .map(|(_, height)| height * HEADER_STRIP_FRACTION);
+    let rects = header_button_rects(browser, before, clicked).await;
+    let candidates = rank_menu_candidates(before, clicked, &rects, strip_bottom);
+
+    let mut tried = Vec::new();
+    for candidate in candidates
+        .into_iter()
+        .take(max_tries.min(MENU_OPEN_MAX_TRIES))
+    {
+        let tried_key = ClickedControl::of(candidate);
+        click_element(browser, candidate).await?;
+        clicked.push(tried_key.clone());
+        wait_for_menu(browser).await;
+        let (after, check_after, _) = browser.ax_snapshot_untruncated(origin).await;
+        let (opened, effect) = menu_open_effect(
+            &before_ids,
+            actionable_before,
+            raw_before,
+            &after,
+            check_after.node_count,
+        );
+        let line = tried_label(candidate, &effect);
+        tried.push(line.clone());
+        if opened {
+            return Ok(OpenMenuOutcome::Opened {
+                control: tried_key,
+                tried: line,
+            });
+        }
+    }
+    Ok(OpenMenuOutcome::Miss { tried })
 }
 
 /// A revealed profile destination: an actionable control mentioning
@@ -1523,7 +1711,7 @@ async fn pursue_deterministic(
         // portal), past the 300-element head the capped snapshot keeps —
         // "open the Settings on reddit" failed intermittently because the
         // menu item was invisible to this selector.
-        let (elements, _, _) = browser.ax_snapshot_untruncated(origin).await;
+        let (elements, check_before, _) = browser.ax_snapshot_untruncated(origin).await;
         // 1. Direct hit: actionable control mentioning the noun.
         if let Some(target) = select_page_control(&elements, noun, &clicked) {
             let label = target.name.clone();
@@ -1537,9 +1725,21 @@ async fn pursue_deterministic(
             // re-snapshot against the new tree.
             continue;
         }
-        // 2. No direct hit: reveal more controls via one header menu —
-        // landmarked or account-worded first, then the rightmost header
-        // button by live geometry for landmark-less headers.
+        // 2. No direct hit: reveal more controls via the shared menu
+        // primitive (landmarked → account-worded → unlabeled-in-header →
+        // rightmost-in-header, each click effect-verified). The older
+        // picks stay as fallbacks for candidates the primitive's try
+        // budget didn't reach.
+        let baseline = MenuOpenBaseline {
+            elements: &elements,
+            check: &check_before,
+        };
+        match open_identity_menu(browser, origin, baseline, &mut clicked, MENU_OPEN_MAX_TRIES)
+            .await?
+        {
+            OpenMenuOutcome::Opened { .. } => continue,
+            OpenMenuOutcome::Miss { .. } => {}
+        }
         if let Some(menu) = select_menu_button(&elements, &clicked) {
             let tried_key = ClickedControl::of(menu);
             click_element(browser, menu).await?;

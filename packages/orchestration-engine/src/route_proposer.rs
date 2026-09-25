@@ -157,6 +157,17 @@ pub fn search_fallback_url(prompt: &str) -> Option<String> {
 pub struct ResolvedRoute {
     pub url: url::Url,
     pub source: RouteSource,
+    /// Which directory backend served a [`RouteSource::SiteSearch`] hit
+    /// (`"brave"` / `"ddg"` / the adapter's label). `None` for every other
+    /// source. The dispatcher journals it (`· via ddg`) so Session
+    /// Activity names the backend behind a directory navigation.
+    pub directory_backend: Option<&'static str>,
+    /// A `route_vetoed: …` note carried when the directory rung returned a
+    /// host-mismatched hit that the plausibility veto rejected before a
+    /// later rung grounded the name. `None` when the directory rung was
+    /// never tried, missed, or accepted. The dispatcher journals it
+    /// alongside `route_proposed` so a veto reads as a veto, not a miss.
+    pub directory_veto: Option<String>,
 }
 
 /// Optional resolution inputs. Every one is inert when unset, which is the
@@ -196,7 +207,12 @@ pub trait LlmUrlProposer: Send + Sync {
 /// Validate one tier's output, halting the whole resolution on failure.
 fn accept(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
     validate_proposed_url(url)
-        .map(|url| ResolvedRoute { url, source })
+        .map(|url| ResolvedRoute {
+            url,
+            source,
+            directory_backend: None,
+            directory_veto: None,
+        })
         .ok()
 }
 
@@ -206,7 +222,27 @@ fn accept(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
 /// rationale.
 fn accept_user_directed(url: &str, source: RouteSource) -> Option<ResolvedRoute> {
     validate_user_directed_url(url)
-        .map(|url| ResolvedRoute { url, source })
+        .map(|url| ResolvedRoute {
+            url,
+            source,
+            directory_backend: None,
+            directory_veto: None,
+        })
+        .ok()
+}
+
+/// Validate a directory hit like any user-directed target, carrying the
+/// serving backend on the route for the journal line. The hit already
+/// passed the plausibility veto ([`directory_veto_note`]); this is the
+/// unchanged structural bar (absolute https, real host, no credentials).
+fn accept_site_search(hit: &SiteHit) -> Option<ResolvedRoute> {
+    validate_user_directed_url(&hit.url)
+        .map(|url| ResolvedRoute {
+            url,
+            source: RouteSource::SiteSearch,
+            directory_backend: Some(hit.backend),
+            directory_veto: None,
+        })
         .ok()
 }
 
@@ -252,8 +288,21 @@ impl ShortcutStore for InMemoryShortcuts {
 /// are parsed, and bot challenges cannot produce a false destination —
 /// failure is `None`, which degrades to asking the user.
 pub trait SiteSearchClient: Send + Sync {
-    /// The best destination URL for `site_name`, or `None`.
-    fn search_site(&self, site_name: &str) -> Option<String>;
+    /// The best destination hit for `site_name`, or `None`. The hit names
+    /// the backend that served it so the journal can say which directory
+    /// answered; the plausibility veto ([`directory_veto_note`]) decides
+    /// whether the URL may be navigated.
+    fn search_site(&self, site_name: &str) -> Option<SiteHit>;
+}
+
+/// One directory answer: the destination URL plus the backend that served
+/// it (`"brave"` / `"ddg"` for the shipped adapters, the fake's label in
+/// tests). Carried so a wrong confident navigation can be told apart from
+/// a miss in the journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteHit {
+    pub url: String,
+    pub backend: &'static str,
 }
 
 /// Brave Search API as a [`SiteSearchClient`]. The key comes from the
@@ -301,7 +350,7 @@ fn brave_top_url(payload: &serde_json::Value) -> Option<String> {
 }
 
 impl SiteSearchClient for BraveSiteSearch {
-    fn search_site(&self, site_name: &str) -> Option<String> {
+    fn search_site(&self, site_name: &str) -> Option<SiteHit> {
         let query: String = url::form_urlencoded::byte_serialize(site_name.as_bytes()).collect();
         let endpoint = format!(
             "https://api.search.brave.com/res/v1/web/search?q={query}&count=1&safesearch=moderate"
@@ -316,7 +365,10 @@ impl SiteSearchClient for BraveSiteSearch {
             .into_body()
             .read_json()
             .ok()?;
-        brave_top_url(&payload)
+        brave_top_url(&payload).map(|url| SiteHit {
+            url,
+            backend: "brave",
+        })
     }
 }
 
@@ -425,7 +477,7 @@ fn ddg_unwrap_target(href: &str) -> Option<String> {
 }
 
 impl SiteSearchClient for DuckDuckGoSiteSearch {
-    fn search_site(&self, site_name: &str) -> Option<String> {
+    fn search_site(&self, site_name: &str) -> Option<SiteHit> {
         let query: String = url::form_urlencoded::byte_serialize(site_name.as_bytes()).collect();
         let response = self
             .agent
@@ -440,7 +492,10 @@ impl SiteSearchClient for DuckDuckGoSiteSearch {
             return None;
         }
         let html = response.into_body().read_to_string().ok()?;
-        ddg_top_url(&html)
+        ddg_top_url(&html).map(|url| SiteHit {
+            url,
+            backend: "ddg",
+        })
     }
 }
 
@@ -486,14 +541,107 @@ impl Default for ChainedSiteSearch {
 }
 
 impl SiteSearchClient for ChainedSiteSearch {
-    fn search_site(&self, site_name: &str) -> Option<String> {
+    fn search_site(&self, site_name: &str) -> Option<SiteHit> {
         if let Some(primary) = &self.primary
-            && let Some(url) = primary.search_site(site_name)
+            && let Some(hit) = primary.search_site(site_name)
         {
-            return Some(url);
+            return Some(hit);
         }
         self.fallback.search_site(site_name)
     }
+}
+
+/// Registrable-label approximation for the directory plausibility veto:
+/// strip a single leading `www.`, then take the last two dot-labels
+/// (`www.reddit.com` → `reddit.com`, `support.microsoft.com` →
+/// `microsoft.com`).
+///
+/// This is deliberately NOT a public-suffix list: `amazon.co.uk` labels as
+/// `co.uk`, so a directory hit there vetoes and the ladder falls through
+/// to the grounder rung. A real PSL crate would fix that; the
+/// approximation is documented here because the veto is a plausibility
+/// heuristic — it turns a wrong confident navigation into a miss — not a
+/// security boundary. Structural URL validation (`accept_*`) is unchanged
+/// and still owns safety.
+fn registrable_label(host: &str) -> &str {
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    // Last two dot-separated labels; hosts with fewer than two labels
+    // (e.g. `localhost`) keep the whole host.
+    let mut parts = host.rsplitn(3, '.');
+    match (parts.next(), parts.next()) {
+        (Some(tld), Some(sld)) => {
+            let start = host.len() - sld.len() - 1 - tld.len();
+            &host[start..]
+        }
+        _ => host,
+    }
+}
+
+/// Blessed site-name → host exceptions, checked before the containment
+/// rule. Exactly one entry: `gmail` is served from `mail.google.com`,
+/// whose registrable label (`google.com`) matches neither containment
+/// direction. This is a deliberate single exception, not a site table — do
+/// not grow it. A directory hit the name cannot plausibly explain must
+/// veto, never alias.
+const SITE_HOST_ALIASES: [(&str, &str); 1] = [("gmail", "mail.google.com")];
+
+/// Plausibility veto for one directory hit: `None` when the hit may serve
+/// the queried site name, `Some(note)` carrying a `route_vetoed: …`
+/// journal line when it may not. The name is normalized (lowercase,
+/// trimmed); the hit is accepted when the alias map blesses it or when
+/// the name and the host's registrable label contain one another in either
+/// direction (`reddit` ↔ `reddit.com`). Anything else — a support article
+/// for a site query, an unparseable URL, an empty name — is never accepted
+/// blindly: the caller falls through to the grounder rung.
+fn directory_veto_note(site_name: &str, hit: &SiteHit) -> Option<String> {
+    let name = site_name.trim().to_lowercase();
+    let note = |host: &str, reason: &str| {
+        format!("route_vetoed: site_search '{name}' → {host} · {reason}; trying grounder")
+    };
+    if name.is_empty() {
+        return Some(note("?", "empty site name"));
+    }
+    let Some(host) = url::Url::parse(&hit.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return Some(note("?", "unparseable URL"));
+    };
+    // Alias check first: exact normalized-name match, registrable-domain
+    // equality on the returned host. Strict on purpose — `gmail` → a
+    // `gmail.com` hit still vetoes; only the blessed host is accepted.
+    for (alias_name, alias_host) in SITE_HOST_ALIASES {
+        if name == alias_name {
+            if registrable_label(&host) == registrable_label(alias_host) {
+                return None;
+            }
+            return Some(note(&host, "host mismatch"));
+        }
+    }
+    let label = registrable_label(&host);
+    if label.contains(&name) || name.contains(label) {
+        None
+    } else {
+        Some(note(&host, "host mismatch"))
+    }
+}
+
+/// One Tier 3b directory step: query the client, veto host-mismatched hits,
+/// accept plausible ones. Returns the accepted route plus, when the hit
+/// was vetoed, the journal note — the caller falls through to the grounder
+/// rung and carries the note on whatever route grounds next, so the veto
+/// reads as a veto in Session Activity rather than a silent miss.
+fn directory_step(
+    client: &dyn SiteSearchClient,
+    site_name: &str,
+) -> (Option<ResolvedRoute>, Option<String>) {
+    let Some(hit) = client.search_site(site_name) else {
+        return (None, None);
+    };
+    if let Some(note) = directory_veto_note(site_name, &hit) {
+        return (None, Some(note));
+    }
+    (accept_site_search(&hit), None)
 }
 
 /// A fenced domain grounder: a site name in, a bare domain out.
@@ -864,38 +1012,50 @@ pub fn resolve_entry_url(
         // memory; the browser never sees a search page.
         // Trust note: the directory resolves a *name the user typed*, the
         // same way asking an assistant to "open amazon" does — it is name
-        // resolution, not a machine-invented destination. Strict
-        // validation here would mean a host allowlist, i.e. the curated
-        // table this design deleted, so the structural bar (absolute
-        // https, real host, no credentials) is the honest one. A
-        // name-similarity gate was considered and rejected: it passes
-        // `amazon-phishing.com` while failing legit `gmail` →
-        // `mail.google.com`, theater that breaks real cases. The residual
-        // wrong-site risk is handled where the search fallback already
-        // handles it — the browser is visible, submits and downloads keep
-        // their approval gates, and the portal re-anchors to the landed
-        // origin instead of trusting a prediction.
+        // resolution, not a machine-invented destination. The structural
+        // bar (absolute https, real host, no credentials) stays the honest
+        // one, but a structurally-valid URL can still be the WRONG site —
+        // a support article once shipped as a confident navigation. So
+        // every hit passes a plausibility veto first
+        // ([`directory_veto_note`]): the host's registrable label must
+        // contain the queried name or vice versa, with exactly one blessed
+        // alias (`gmail` → `mail.google.com`). A vetoed hit is never
+        // navigated — the ladder falls through to the grounder rung and
+        // the veto rides the journal line. The veto is a heuristic, not a
+        // security boundary: `amazon-phishing.com` still contains `amazon`,
+        // so phishing-shaped hosts pass it the way they pass any
+        // name check. The residual wrong-site risk is handled where the
+        // search fallback already handles it — the browser is visible,
+        // submits and downloads keep their approval gates, and the portal
+        // re-anchors to the landed origin instead of trusting a prediction.
+        let mut directory_veto: Option<String> = None;
         if let Some(client) = ctx.site_search
             && let Some(name) = target
-            && let Some(url) = client.search_site(name)
-            && let Some(route) = accept_user_directed(&url, RouteSource::SiteSearch)
         {
-            return Some(route);
+            let (route, veto) = directory_step(client, name);
+            directory_veto = veto;
+            if let Some(route) = route {
+                return Some(route);
+            }
         }
         // 3c. Fenced domain grounder: site slot + region hint → bare domain.
-        // Fallback when the directory finds nothing (or is throttled —
-        // both backends degrade to `None`, never a guess). The grounder sees
-        // only the normalized site name and the region code, never the raw
-        // prompt. Its output is validated in Rust (https, valid TLD, no
-        // credentials, no raw IP) before navigation. A malformed response
-        // degrades to the next rung, never to a guessed `www.{noun}.com`.
+        // Fallback when the directory finds nothing, is throttled, or had
+        // its hit vetoed (both backends degrade to `None`, never a guess).
+        // The grounder sees only the normalized site name and the region
+        // code, never the raw prompt. Its output is validated in Rust
+        // (https, valid TLD, no credentials, no raw IP) before navigation.
+        // A malformed response degrades to the next rung, never to a
+        // guessed `www.{noun}.com`.
         if let Some(grounder) = ctx.domain_grounder
             && let Some(name) = target
             && let Some(domain) = grounder.ground_domain(name, ctx.region_hint)
             && let Some(url) = validate_grounded_domain(&domain)
             && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
         {
-            return Some(route);
+            return Some(ResolvedRoute {
+                directory_veto,
+                ..route
+            });
         }
         // 3d. Ungrounded and no directory: a miss. The caller surfaces
         // "try a full domain or save a site shortcut" — asking once beats
@@ -931,12 +1091,16 @@ pub fn resolve_entry_url(
         {
             return Some(route);
         }
-        // 3b. Structured site directory (Brave API / keyless DDG).
-        if let Some(client) = ctx.site_search
-            && let Some(url) = client.search_site(site)
-            && let Some(route) = accept_user_directed(&url, RouteSource::SiteSearch)
-        {
-            return Some(route);
+        // 3b. Structured site directory (Brave API / keyless DDG), with the
+        // plausibility veto: a host-mismatched hit falls through to the
+        // grounder instead of navigating confidently.
+        let mut directory_veto: Option<String> = None;
+        if let Some(client) = ctx.site_search {
+            let (route, veto) = directory_step(client, site);
+            directory_veto = veto;
+            if let Some(route) = route {
+                return Some(route);
+            }
         }
         // 3c. Fenced domain grounder.
         if let Some(grounder) = ctx.domain_grounder
@@ -944,7 +1108,10 @@ pub fn resolve_entry_url(
             && let Some(url) = validate_grounded_domain(&domain)
             && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
         {
-            return Some(route);
+            return Some(ResolvedRoute {
+                directory_veto,
+                ..route
+            });
         }
         // 3d. Site ungrounded: fall through to the Tier 4 search template.
     }
@@ -1115,8 +1282,11 @@ mod tests {
     }
 
     impl SiteSearchClient for StubSiteSearch {
-        fn search_site(&self, _site_name: &str) -> Option<String> {
-            self.answer.clone()
+        fn search_site(&self, _site_name: &str) -> Option<SiteHit> {
+            self.answer.clone().map(|url| SiteHit {
+                url,
+                backend: "stub",
+            })
         }
     }
 
@@ -1352,8 +1522,11 @@ mod tests {
     }
 
     impl SiteSearchClient for MockDirectory {
-        fn search_site(&self, _site_name: &str) -> Option<String> {
-            self.url.clone()
+        fn search_site(&self, _site_name: &str) -> Option<SiteHit> {
+            self.url.clone().map(|url| SiteHit {
+                url,
+                backend: "mock",
+            })
         }
     }
 
@@ -1502,7 +1675,12 @@ mod tests {
             expect_region: None,
         };
         let directory = MockDirectory {
-            url: Some("https://www.amazon.co.uk/".to_owned()),
+            // `amazon.in`: the plausibility veto accepts it (registrable
+            // label `amazon.in` contains the queried name). `amazon.co.uk`
+            // would veto here — the last-two-labels approximation labels it
+            // `co.uk` — which is exactly what the veto is for; see the
+            // integration tests in `tests/route_veto.rs`.
+            url: Some("https://www.amazon.in/".to_owned()),
         };
         // Shortcut wins over directory.
         let ctx = ladder_ctx(Some(&shortcuts), Some(&directory), Some(&grounder), "IN");
@@ -1516,7 +1694,7 @@ mod tests {
             panic!("directory beats grounder");
         };
         assert_eq!(resolved.source, RouteSource::SiteSearch);
-        assert_eq!(resolved.url.as_str(), "https://www.amazon.co.uk/");
+        assert_eq!(resolved.url.as_str(), "https://www.amazon.in/");
         // Without directory, the grounder is the fallback.
         let ctx = ladder_ctx(None, None, Some(&grounder), "IN");
         let Some(resolved) = resolve_entry_url("open amazon", None, &ctx) else {

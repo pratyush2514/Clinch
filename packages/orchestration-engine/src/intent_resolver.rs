@@ -896,12 +896,18 @@ pub fn parse_grammar(prompt: &str, connected_origin: Option<&url::Url>) -> Parse
     // positional/temporal/month/numeric structure words out.
     let is_content = |token: &str| !STOPWORDS.contains(&token) && !is_non_identifying(token);
     let is_noun = |token: &String| is_content(token.as_str()) && !host_tokens.contains(token);
-    // Structural preconditions, shared by both patterns below. A verb head
-    // proves the prompt commands something; a clause marker proves it does
-    // so in more grammar than this parser models.
+    // Structural preconditions, shared by both patterns below. The verb
+    // must HEAD the clause — the confidence docs promise "a recognized
+    // verb heads the clause", and a buried verb ("i want you to open x
+    // for me") proves nothing about the sentence's shape, so it must not
+    // earn the fast path: wrapped phrasing defers to the parser seam
+    // instead of misparsing with high confidence. "please" is politeness
+    // filler, not structure, so it may precede the verb. A clause marker
+    // proves the prompt commands in more grammar than this parser models.
     let verb_led = words
         .iter()
-        .any(|token| ACTION_VERBS.contains(&token.as_str()));
+        .find(|token| token.as_str() != "please")
+        .is_some_and(|token| ACTION_VERBS.contains(&token.as_str()));
     let subordinated = words
         .iter()
         .any(|token| CLAUSE_MARKERS.contains(&token.as_str()));
@@ -2570,7 +2576,6 @@ mod tests {
             "open amazon",
             "open amazon for me",
             "please open amazon",
-            "kindly open amazon",
             "open amazon.in",
             "visit github",
             "launch amazon",
@@ -2580,6 +2585,12 @@ mod tests {
             assert!(grammar.confidence.is_high(), "{prompt}");
             assert!(is_direct_open(prompt, &grammar), "{prompt}");
         }
+        // Only "please" may precede the heading verb: "kindly open amazon"
+        // is not verb-headed, so it defers to the parser seam rather than
+        // taking the fast path.
+        let grammar = parse_grammar("kindly open amazon", None);
+        assert_eq!(grammar.confidence, Confidence::Low);
+        assert!(!is_direct_open("kindly open amazon", &grammar));
     }
 
     #[test]
