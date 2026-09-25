@@ -283,6 +283,10 @@ impl MenuBrowser for FakeMenuBrowser {
     }
 
     async fn menu_dismiss(&self) {}
+
+    async fn menu_screenshot(&self) -> Option<String> {
+        None
+    }
 }
 
 fn baseline_check() -> AxResyncCheck {
@@ -315,6 +319,7 @@ async fn menu_opens_on_first_click_with_new_actionable_controls() {
         },
         &mut clicked,
         3,
+        None,
     )
     .await
     else {
@@ -368,6 +373,7 @@ async fn menu_opens_on_second_click_after_first_went_stale() {
         },
         &mut clicked,
         3,
+        None,
     )
     .await
     else {
@@ -428,6 +434,7 @@ async fn menu_never_opens_misses_after_the_cap() {
         },
         &mut clicked,
         3,
+        None,
     )
     .await
     else {
@@ -479,6 +486,7 @@ async fn poll_returns_early_when_evidence_is_immediate() {
         },
         &mut clicked,
         3,
+        None,
     )
     .await
     else {
@@ -515,6 +523,7 @@ async fn aria_expanded_true_counts_as_open_evidence() {
         },
         &mut clicked,
         3,
+        None,
     )
     .await
     else {

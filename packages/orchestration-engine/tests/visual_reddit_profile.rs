@@ -143,7 +143,7 @@ async fn visual_open_my_reddit_profile() -> Result<(), Box<dyn std::error::Error
 
     // 5. The real pursuit loop: snapshot → find the "profile" control →
     //    click → observe the navigation. Deterministic phase only.
-    let outcome = pursue_page_goal(&browser, &home_url, "profile", None).await;
+    let outcome = pursue_page_goal(&browser, &home_url, "profile", None, None).await;
     println!("outcome: {outcome:?}");
 
     tokio::time::sleep(Duration::from_secs(1)).await;

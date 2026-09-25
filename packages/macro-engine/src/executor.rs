@@ -1021,6 +1021,7 @@ pub async fn pursue_page_goal(
     origin: &url::Url,
     noun: &str,
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+    escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
     let noun = noun.trim();
     if noun.is_empty() {
@@ -1036,7 +1037,16 @@ pub async fn pursue_page_goal(
     let Some(navigator) = navigator else {
         return Err(IntentError::NoMatch(deterministic_miss));
     };
-    pursue_with_model(browser, origin, noun, navigator, None, deterministic_miss).await
+    pursue_with_model(
+        browser,
+        origin,
+        noun,
+        navigator,
+        None,
+        deterministic_miss,
+        escalation,
+    )
+    .await
 }
 
 /// Stable identity for a control the worker already tried. Backend node
@@ -1082,8 +1092,11 @@ fn already_clicked(clicked: &[ClickedControl], element: &AxElement) -> bool {
 ///
 /// Playbook replay stays the dispatcher's first gear (the memory fast
 /// paths), so this starts at gear 1. The model phase runs only when
-/// `navigator` is `Some`. Gear 1 can return its deterministic success
-/// shapes unverified (e.g. the settings `Navigated` landing) — the
+/// `navigator` is `Some`; when the model phase's tail fails verification
+/// and `escalation` is `Some`, exactly one additional bounded model pass
+/// runs under the escalation navigator before the honest miss. Gear 1 can
+/// return its deterministic success shapes unverified (e.g. the settings
+/// `Navigated` landing) — the
 /// dispatcher must run the verb's verifier before treating them as
 /// COMPLETED, and maps a failed verifier to a workflow failure (hence
 /// FAILED/Take Control), never a completion. Gear 2's success shapes
@@ -1102,6 +1115,7 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
     origin: &url::Url,
     spec: &VerbSpec,
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+    escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
     let deterministic_miss = match pursue_chrome_action(browser, origin, spec).await {
         Ok(outcome) => return Ok(outcome),
@@ -1128,6 +1142,7 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
         navigator,
         Some(spec),
         deterministic_miss,
+        escalation,
     )
     .await
 }
@@ -1168,12 +1183,14 @@ pub async fn pursue_account_home(
     browser: &ManagedBrowser,
     origin: &url::Url,
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+    escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
     pursue_verb_goal(
         browser,
         origin,
         VerbSpec::for_kind(VerbKind::AccountHome),
         navigator,
+        escalation,
     )
     .await
 }
@@ -1361,10 +1378,15 @@ async fn select_revealed_target<'a, B: ChromeActionBrowser>(
 /// single call: its internal click → poll-for-evidence → re-rank loop
 /// supersedes the old one-attempt-per-iteration shape, and a Miss means
 /// its candidates are exhausted against fresh snapshots, so the worker
-/// stops instead of re-looping. Returns whether a menu opened.
+/// stops instead of re-looping. `preferred` is the ambiguity gate's
+/// chosen opener, clicked on the primitive's first attempt instead of
+/// the ranking's favorite. Returns whether a menu opened.
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
+// Eight parameters: the primitive's own inputs plus the gate's chosen
+// opener; bundling would only hide the data flow.
+#[allow(clippy::too_many_arguments)]
 async fn open_menu_within_budget<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
@@ -1373,6 +1395,7 @@ async fn open_menu_within_budget<B: ChromeActionBrowser>(
     clicked: &mut Vec<ClickedControl>,
     tried: &mut Vec<String>,
     clicks_used: &mut usize,
+    preferred: Option<&AxElement>,
 ) -> Result<bool, IntentError> {
     let baseline = MenuOpenBaseline { elements, check };
     let clicks_before = clicked.len();
@@ -1382,6 +1405,7 @@ async fn open_menu_within_budget<B: ChromeActionBrowser>(
         baseline,
         clicked,
         (CHROME_ACTION_MAX_CLICKS - *clicks_used).min(MENU_OPEN_MAX_TRIES),
+        preferred,
     )
     .await?
     {
@@ -1536,6 +1560,231 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
     Ok(None)
 }
 
+/// Run the spec's act lane on a revealed (or already-open-menu) target:
+/// the single dispatch behind the main loop's revealed step, the
+/// already-open-menu step (1a), and the semantic fallback — one
+/// implementation, three call sites. Returns `Some` on a decided outcome,
+/// `None` when the click produced no evidence and the hunt continues.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] on a path-token caller bug (never for
+/// the other verifiers), and [`IntentError::Browser`] on CDP failure.
+async fn act_on_verb_target<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    target: &AxElement,
+    spec: &VerbSpec,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    let label = revealed_label(target, spec);
+    match spec.verifier {
+        VerifierKind::IdentityEvidence => {
+            act_on_identity_target(browser, origin, target, &label, clicked, tried, clicks_used)
+                .await
+        }
+        VerifierKind::UrlPathTokens(_) => {
+            act_on_path_tokens_target(browser, origin, target, spec, clicked, tried, clicks_used)
+                .await
+        }
+        VerifierKind::AuthSignedOut => {
+            act_on_signed_out_target(browser, origin, target, &label, clicked, tried, clicks_used)
+                .await
+        }
+    }
+}
+
+/// Generic verb hint for the semantic matcher: the verb's plain words
+/// (`"log out"`, `"settings"`, `"account home"`) — never site names.
+/// [`crate::semantic::SemanticMatcher`] appends `" action"` itself.
+fn semantic_verb_hint(spec: &VerbSpec) -> String {
+    spec.kind.as_str().replace('_', " ")
+}
+
+/// Outcome of [`already_open_menu_step`]: whether the step ran, and
+/// whether the act lane decided the run.
+enum AlreadyOpenMenuOutcome {
+    /// Preconditions didn't hold; the hunt continues inline.
+    Skipped,
+    /// The step ran without deciding; the caller records the snapshot
+    /// ids and continues the hunt.
+    Ran,
+    /// The act lane decided the run.
+    Decided(PageGoalOutcome),
+}
+
+/// Worker step 1a: already-open menu. The worker hasn't clicked anything
+/// yet but the snapshot already shows a menu layer — the page opened the
+/// menu itself. Click the verb's destination directly through the spec's
+/// act lane; clicking an opener here would toggle the open menu shut.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] on a path-token caller bug (never for
+/// the other verifiers), and [`IntentError::Browser`] on CDP failure.
+async fn already_open_menu_step<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    elements: &[AxElement],
+    spec: &VerbSpec,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<AlreadyOpenMenuOutcome, IntentError> {
+    if !clicked.is_empty() {
+        return Ok(AlreadyOpenMenuOutcome::Skipped);
+    }
+    let Some(target) = select_already_open_menu_target(elements, spec) else {
+        return Ok(AlreadyOpenMenuOutcome::Skipped);
+    };
+    let name: String = target.name.chars().take(40).collect();
+    tried.push(format!(
+        "menu already open: clicked '{name}' directly (no opener)"
+    ));
+    if let Some(outcome) =
+        act_on_verb_target(browser, origin, target, spec, clicked, tried, clicks_used).await?
+    {
+        return Ok(AlreadyOpenMenuOutcome::Decided(outcome));
+    }
+    // The page's own menu may still be open: dismiss now (best-effort
+    // no-op when it already closed) so its light-dismiss can't swallow
+    // a later opener click.
+    browser.menu_dismiss().await;
+    tried.push("dismissed possibly-open menu after direct click".to_owned());
+    Ok(AlreadyOpenMenuOutcome::Ran)
+}
+
+/// Worker step 1b: opener ambiguity gate, before any opener click. The
+/// deterministic lane only spends a click when exactly one strong opener
+/// exists — an account-worded header button, or a blank-named in-strip
+/// button (the avatar case). On 2+ the semantic opener matcher gets one
+/// tiebreak attempt.
+///
+/// Returns the opener the deterministic lane must click — the single
+/// strong opener, or the semantic winner. The caller clicks exactly the
+/// returned opener (the menu primitive's `preferred` candidate): the
+/// primitive's independent ranking must not substitute a different
+/// candidate, so identifying the winner is not enough — the winner is
+/// what gets clicked.
+///
+/// Returns `Err(IntentError::NoMatch)` naming the deferral when zero or
+/// 2+ (untiebroken) strong openers exist — the worker clicked nothing
+/// and the model phase takes over with the tried journal intact.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when no unambiguous opener exists,
+/// and [`IntentError::Browser`] on CDP failure.
+async fn opener_gate_pick<'a, B: MenuBrowser>(
+    browser: &B,
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    opener_matcher: &mut crate::semantic::SemanticMatcher,
+    tried: &mut Vec<String>,
+    spec: &VerbSpec,
+) -> Result<&'a AxElement, IntentError> {
+    let strip_bottom = header_strip_bottom(browser).await;
+    let rects = header_button_rects(browser, elements, clicked).await;
+    let strong = strong_openers(elements, clicked, &rects, strip_bottom);
+    if let [only] = strong.as_slice() {
+        return Ok(*only);
+    }
+    if strong.len() >= 2
+        && let Some((winner, score)) = semantic_opener_winner(opener_matcher, &strong).await
+    {
+        let name: String = winner.name.chars().take(40).collect();
+        tried.push(format!(
+            "semantic opener '{name}' (score {score:.2}) disambiguated among {} candidates",
+            strong.len()
+        ));
+        return Ok(winner);
+    }
+    Err(IntentError::NoMatch(format!(
+        "no unambiguous account-menu opener ({} strong candidates); deferring to model phase; {}",
+        strong.len(),
+        chrome_action_miss_diagnostic(spec, tried)
+    )))
+}
+
+/// Worker step 1: revealed destination. A revealed destination ends the
+/// hunt — but only after the worker opened something (`clicked` is
+/// non-empty), and only when the candidate is genuinely new since the
+/// previous snapshot: the container-text rollup lets an opened menu's
+/// wording match every header button that was already on the page, so
+/// without the newness gate the worker clicks the header chrome itself
+/// as the destination and burns its click budget. When the closed
+/// vocabulary matcher finds nothing, the semantic fallback scores
+/// genuinely-new menu-layer candidates' accessible names against the
+/// verb (capped, menu-layer only, thresholded) — a blank-named link to
+/// a matching path still counts, which the name-driven vocabulary lane
+/// can never see.
+///
+/// Returns the candidate to click, or `None` when nothing revealed.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+// The eight parameters are the two callees' inputs concatenated
+// (`select_revealed_target` needs browser+origin for lazy href
+// resolution; the semantic fallback needs the matcher and the journal);
+// bundling them would only hide the data flow.
+#[allow(clippy::too_many_arguments)]
+async fn select_revealed_destination<'a, B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64>,
+    verb_matcher: &mut crate::semantic::SemanticMatcher,
+    tried: &mut Vec<String>,
+    spec: &VerbSpec,
+) -> Option<&'a AxElement> {
+    if let Some(target) =
+        select_revealed_target(browser, origin, elements, clicked, previously_seen, spec).await
+    {
+        return Some(target);
+    }
+    // Vocabulary found nothing: one semantic attempt over the
+    // genuinely-new menu-layer candidates, before the opener click.
+    semantic_revealed_target(verb_matcher, elements, clicked, previously_seen, tried).await
+}
+
+/// Worker step 0: per-verb pre-state strategies, before any click.
+/// Account-home short-circuits on a signed-out page (`SignedOut` — a
+/// guest landing has no identity chrome to pursue); log-out completes
+/// immediately when the page already reads signed out (`AlreadyThere`).
+///
+/// Returns `Ok(Some(outcome))` when the verb short-circuits without
+/// clicking, `Ok(None)` when the hunt proceeds.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn chrome_action_prestate<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    match spec.kind {
+        VerbKind::AccountHome => {
+            // Guest short-circuit: a signed-out page has no identity chrome,
+            // so the worker stops before any click.
+            if browser.chrome_auth_state().await == AuthState::LoggedOut {
+                return Ok(Some(PageGoalOutcome::SignedOut));
+            }
+        }
+        VerbKind::LogOut => {
+            // Already signed out: the goal is achieved; nothing to click.
+            if browser.chrome_auth_state().await == AuthState::LoggedOut {
+                let landed = browser
+                    .settings_current_url()
+                    .await
+                    .unwrap_or_else(|| origin.clone());
+                return Ok(Some(PageGoalOutcome::AlreadyThere { landed }));
+            }
+        }
+        VerbKind::Settings => {}
+    }
+    Ok(None)
+}
+
 /// Pursue a verb-spec action through the page's identity chrome: the single
 /// parameterized worker behind every in-page verb, collapsing the old
 /// per-goal workers. Deterministic — no model phase:
@@ -1547,16 +1796,30 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
 /// 2. **Untruncated AX snapshot** via [`MenuBrowser::menu_snapshot`] (a
 ///    revealed menu renders at the end of the document, past the
 ///    300-element head truncation).
-/// 3. **A revealed destination ends the hunt**: an actionable control
+/// 3. **Already-open menu**: when the worker hasn't clicked anything yet
+///    but the snapshot already shows a menu layer, the page opened the
+///    menu itself — the verb's destination is clicked directly through
+///    the spec's act lane, never via an opener (which would toggle the
+///    menu shut).
+/// 4. **A revealed destination ends the hunt**: an actionable control
 ///    matching the spec's vocabulary that appeared *after* the worker
 ///    opened something — `clicked` is non-empty and the candidate is
 ///    genuinely new since the previous snapshot, never pre-existing
-///    chrome. The control is clicked (the identity lane navigates a
-///    page-revealed, Rust-validated href directly instead), then the
-///    spec's verifier decides: [`PageGoalOutcome::Navigated`] for a
-///    path-token landing, [`PageGoalOutcome::Verified`] for identity
-///    evidence, a named disclosure surface, or a signed-out page.
-/// 4. **Otherwise the shared [`open_identity_menu`] primitive** spends the
+///    chrome. When the vocabulary matcher finds nothing, the semantic
+///    fallback scores genuinely-new menu-layer candidates' accessible
+///    names against the verb (capped, menu-layer only). The control is
+///    clicked (the identity lane navigates a page-revealed,
+///    Rust-validated href directly instead), then the spec's verifier
+///    decides: [`PageGoalOutcome::Navigated`] for a path-token landing,
+///    [`PageGoalOutcome::Verified`] for identity evidence, a named
+///    disclosure surface, or a signed-out page.
+/// 5. **Opener ambiguity gate**: the deterministic lane spends an opener
+///    click only when exactly one strong opener exists (account-worded,
+///    or blank-named in the header strip — the avatar case); on 2+ the
+///    semantic opener matcher gets one tiebreak attempt. Otherwise the
+///    worker clicks nothing and defers to the model phase with the tried
+///    journal intact.
+/// 6. **Otherwise the shared [`open_identity_menu`] primitive** spends the
 ///    remaining click budget opening the account menu — its internal
 ///    rank → click → poll loop is not reimplemented here, and a Miss ends
 ///    the worker instead of re-looping over candidates it exhausted.
@@ -1574,25 +1837,8 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     spec: &VerbSpec,
 ) -> Result<PageGoalOutcome, IntentError> {
     // Per-verb pre-state strategies, before any click.
-    match spec.kind {
-        VerbKind::AccountHome => {
-            // Guest short-circuit: a signed-out page has no identity chrome,
-            // so the worker stops before any click.
-            if browser.chrome_auth_state().await == AuthState::LoggedOut {
-                return Ok(PageGoalOutcome::SignedOut);
-            }
-        }
-        VerbKind::LogOut => {
-            // Already signed out: the goal is achieved; nothing to click.
-            if browser.chrome_auth_state().await == AuthState::LoggedOut {
-                let landed = browser
-                    .settings_current_url()
-                    .await
-                    .unwrap_or_else(|| origin.clone());
-                return Ok(PageGoalOutcome::AlreadyThere { landed });
-            }
-        }
-        VerbKind::Settings => {}
+    if let Some(outcome) = chrome_action_prestate(browser, origin, spec).await? {
+        return Ok(outcome);
     }
 
     let mut clicked: Vec<ClickedControl> = Vec::new();
@@ -1615,6 +1861,15 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // menu (or a false positive) and must be dismissed before the next
     // attempt clicks — otherwise its light-dismiss swallows that click.
     let mut menu_maybe_open = false;
+    // Per-run semantic matchers, created once: the verb's generic words
+    // score revealed items when the closed vocabulary is inconclusive,
+    // and "account menu" disambiguates the opener when several strong
+    // candidates compete. Cached per run, names only — volume discipline
+    // is enforced at the call sites (menu-layer candidates, ambiguity
+    // only). The classifier is a hint: any failure declines silently and
+    // the deterministic flow continues unchanged.
+    let mut verb_matcher = crate::semantic::SemanticMatcher::new(&semantic_verb_hint(spec));
+    let mut opener_matcher = crate::semantic::SemanticMatcher::new("account menu");
 
     while clicks_used < CHROME_ACTION_MAX_CLICKS {
         // Full snapshot, not the navigator slice: a revealed menu renders at
@@ -1625,53 +1880,54 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
         let currently_seen: std::collections::HashSet<i64> =
             elements.iter().map(|el| el.backend_node_id).collect();
 
+        // 0. Already-open menu (1a): the page opened the menu itself —
+        // click the destination directly, never an opener.
+        match already_open_menu_step(
+            browser,
+            origin,
+            &elements,
+            spec,
+            &mut clicked,
+            &mut tried,
+            &mut clicks_used,
+        )
+        .await?
+        {
+            AlreadyOpenMenuOutcome::Decided(outcome) => return Ok(outcome),
+            AlreadyOpenMenuOutcome::Ran => {
+                previously_seen = currently_seen;
+                continue;
+            }
+            AlreadyOpenMenuOutcome::Skipped => {}
+        }
+
         // 1. A revealed destination ends the hunt — but only after the worker
         // opened something, and only when the candidate actually appeared
-        // after that opening.
-        let target =
-            select_revealed_target(browser, origin, &elements, &clicked, &previously_seen, spec)
-                .await;
-        if let Some(target) = target {
-            let label = revealed_label(target, spec);
-            let outcome = match spec.verifier {
-                VerifierKind::IdentityEvidence => {
-                    act_on_identity_target(
-                        browser,
-                        origin,
-                        target,
-                        &label,
-                        &mut clicked,
-                        &mut tried,
-                        &mut clicks_used,
-                    )
-                    .await?
-                }
-                VerifierKind::UrlPathTokens(_) => {
-                    act_on_path_tokens_target(
-                        browser,
-                        origin,
-                        target,
-                        spec,
-                        &mut clicked,
-                        &mut tried,
-                        &mut clicks_used,
-                    )
-                    .await?
-                }
-                VerifierKind::AuthSignedOut => {
-                    act_on_signed_out_target(
-                        browser,
-                        origin,
-                        target,
-                        &label,
-                        &mut clicked,
-                        &mut tried,
-                        &mut clicks_used,
-                    )
-                    .await?
-                }
-            };
-            if let Some(outcome) = outcome {
+        // after that opening (vocabulary first, one semantic attempt over
+        // genuinely-new menu-layer candidates second).
+        if let Some(target) = select_revealed_destination(
+            browser,
+            origin,
+            &elements,
+            &clicked,
+            &previously_seen,
+            &mut verb_matcher,
+            &mut tried,
+            spec,
+        )
+        .await
+        {
+            if let Some(outcome) = act_on_verb_target(
+                browser,
+                origin,
+                target,
+                spec,
+                &mut clicked,
+                &mut tried,
+                &mut clicks_used,
+            )
+            .await?
+            {
                 return Ok(outcome);
             }
             previously_seen = currently_seen;
@@ -1683,11 +1939,26 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
         // by the previous attempt light-dismisses on the next click —
         // swallowing it instead of letting it reach the next candidate —
         // so Escape first (best-effort no-op when nothing is open).
-        if menu_maybe_open {
+        if std::mem::replace(&mut menu_maybe_open, false) {
             browser.menu_dismiss().await;
             tried.push("dismissed possibly-open menu before next attempt".to_owned());
-            menu_maybe_open = false;
         }
+        // 1b. Opener ambiguity gate, before any opener click: the
+        // deterministic lane only spends a click when exactly one strong
+        // opener exists. Zero or 2+ (untiebroken) defers to the model
+        // phase with the tried journal intact, which `pursue_verb_goal`
+        // feeds to gear 2 as "Already tried without success". The gate
+        // returns the opener to click — the primitive's first attempt
+        // clicks exactly it, never the ranking's independent favorite.
+        let chosen_opener = opener_gate_pick(
+            browser,
+            &elements,
+            &clicked,
+            &mut opener_matcher,
+            &mut tried,
+            spec,
+        )
+        .await?;
         let opened = open_menu_within_budget(
             browser,
             origin,
@@ -1696,6 +1967,7 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
             &mut clicked,
             &mut tried,
             &mut clicks_used,
+            Some(chosen_opener),
         )
         .await?;
         if !opened {
@@ -1768,6 +2040,90 @@ async fn select_revealed_action_href<'a, B: ChromeActionBrowser, S: std::hash::B
             .and_then(|href| validate_revealed_href(href, origin))
             .is_some_and(|url| url_path_has_tokens(&url, tokens));
         if is_target {
+            return Some(element);
+        }
+    }
+    None
+}
+
+/// Already-open menu target (worker step 0 / 1a): when the worker hasn't
+/// clicked anything yet but the snapshot already shows a menu layer
+/// (menu/menuitem/menuitemlink roles, or a dialog role), the page opened
+/// the menu itself — scan those menu-layer elements for the verb's
+/// vocabulary match. Requires actual menu-layer evidence, so a bare
+/// page's footer links never qualify (the existing revealed gate's
+/// intent); the caller clicks the match directly instead of an opener,
+/// which would toggle the open menu shut. Pure and unit-tested.
+///
+/// Dialog reconciliation: a `dialog` role counts as menu-layer evidence
+/// for the gate, but the direct target must itself be an actionable
+/// menu-layer control — the AX tree is flat (no parent pointers), so
+/// "controls inside the dialog" can't be identified structurally, and
+/// clicking a non-menu button merely because a dialog exists would be a
+/// guessed click. A `dialog` element itself is never the target (it is
+/// not actionable).
+#[must_use]
+pub fn select_already_open_menu_target<'a>(
+    elements: &'a [AxElement],
+    spec: &VerbSpec,
+) -> Option<&'a AxElement> {
+    if !elements
+        .iter()
+        .any(|element| is_menu_role(&element.role) || element.role == "dialog")
+    {
+        return None;
+    }
+    elements.iter().find(|element| {
+        (is_menu_role(&element.role) || element.role == "dialog")
+            && PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            && mentions_vocabulary(element, spec.vocabulary)
+    })
+}
+
+/// How many menu-layer candidates the semantic revealed fallback scores
+/// per turn: menu trees are short, and the classifier is a hint — six
+/// names per turn keeps the run far below quota even on pathological
+/// pages.
+const SEMANTIC_REVEALED_CAP: usize = 6;
+
+/// Semantic fallback for revealed items: when the vocabulary matcher
+/// found nothing but the worker did open something (`clicked` non-empty —
+/// the same gate as [`select_revealed_action`]), score the accessible
+/// names of genuinely-new actionable menu-layer candidates against the
+/// verb, capped at [`SEMANTIC_REVEALED_CAP`], and take the first at or
+/// above [`crate::semantic::SEMANTIC_ACCEPT`]. The pick is journaled as
+/// `semantic match '<name>' (score X)`. The classifier is a hint — any
+/// failure declines to `None` and the worker falls through to the opener
+/// hunt unchanged. Volume discipline: menu-layer only, ambiguity only,
+/// cached per run by the matcher, names only.
+pub async fn semantic_revealed_target<'a, S: std::hash::BuildHasher>(
+    matcher: &mut crate::semantic::SemanticMatcher,
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64, S>,
+    tried: &mut Vec<String>,
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    let mut scored = 0;
+    for element in elements {
+        if scored >= SEMANTIC_REVEALED_CAP {
+            break;
+        }
+        if !is_menu_role(&element.role)
+            || !PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            || already_clicked(clicked, element)
+            || previously_seen.contains(&element.backend_node_id)
+        {
+            continue;
+        }
+        scored += 1;
+        if let Some(score) = matcher.score(&element.name).await
+            && score >= crate::semantic::SEMANTIC_ACCEPT
+        {
+            let name: String = element.name.chars().take(40).collect();
+            tried.push(format!("semantic match '{name}' (score {score:.2})"));
             return Some(element);
         }
     }
@@ -2011,6 +2367,11 @@ pub trait MenuBrowser {
     /// the worker calls this before spending another menu-opening click.
     /// Best-effort: implementations must not fail when nothing is open.
     fn menu_dismiss(&self) -> impl std::future::Future<Output = ()> + Send;
+    /// Best-effort viewport screenshot as base64 JPEG with NO data-URI
+    /// prefix; `None` when capture fails. Feeds the model loop's visual
+    /// turn; a failed capture degrades to the text-only turn and must
+    /// never fail the run.
+    fn menu_screenshot(&self) -> impl std::future::Future<Output = Option<String>> + Send;
 }
 
 impl MenuBrowser for ManagedBrowser {
@@ -2038,6 +2399,12 @@ impl MenuBrowser for ManagedBrowser {
         // Best-effort Escape: a popup light-dismisses; with nothing open
         // the keypress is a harmless no-op. Failures never fail the run.
         let _ = self.press_escape().await;
+    }
+
+    async fn menu_screenshot(&self) -> Option<String> {
+        // Best-effort: the visual turn degrades to text-only when capture
+        // fails, and the failure must never fail the run.
+        self.viewport().await.map(|viewport| viewport.data).ok()
     }
 }
 
@@ -2142,6 +2509,76 @@ pub fn rank_menu_candidates<'a>(
         }
     }
     ranked
+}
+
+/// Strong opener candidates for the worker's ambiguity gate (1b): the
+/// same geometry inputs [`rank_menu_candidates`] takes, restricted to the
+/// header strip, keeping only unclicked buttons that are "strong" — an
+/// account-worded button ([`mentions_account_word`]) or a blank-named
+/// in-strip button (the avatar case). Exactly one strong opener means the
+/// deterministic lane may click; zero or 2+ defers to the model phase.
+/// Pure and unit-tested.
+#[must_use]
+pub fn strong_openers<'a>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    rects: &[(i64, f64, f64)],
+    strip_bottom: Option<f64>,
+) -> Vec<&'a AxElement> {
+    let in_strip: std::collections::HashSet<i64> = rects
+        .iter()
+        .filter(|(_, _, y)| strip_bottom.is_some_and(|bottom| *y <= bottom))
+        .map(|(id, _, _)| *id)
+        .collect();
+    elements
+        .iter()
+        .filter(|element| {
+            element.role == "button"
+                && !already_clicked(clicked, element)
+                && in_strip.contains(&element.backend_node_id)
+                && (mentions_account_word(element) || element.name.trim().is_empty())
+        })
+        .collect()
+}
+
+/// Semantic opener disambiguation for the 1b gate's 2+ case: score the
+/// ambiguous strong openers' accessible names against the "account menu"
+/// hint and return the single winner at or above
+/// [`crate::semantic::SEMANTIC_ACCEPT`], with its score for the journal.
+/// Two or more above threshold is still ambiguous — `None` — as is none
+/// above threshold. Blank names decline silently (no network), cached per
+/// run by the matcher, names only.
+pub async fn semantic_opener_winner<'a>(
+    matcher: &mut crate::semantic::SemanticMatcher,
+    openers: &[&'a AxElement],
+) -> Option<(&'a AxElement, f32)> {
+    let mut winner: Option<(&'a AxElement, f32)> = None;
+    for opener in openers {
+        let Some(score) = matcher.score(&opener.name).await else {
+            continue;
+        };
+        if score < crate::semantic::SEMANTIC_ACCEPT {
+            continue;
+        }
+        if winner.is_some() {
+            // Two above threshold: still ambiguous.
+            return None;
+        }
+        winner = Some((opener, score));
+    }
+    winner
+}
+
+/// Header-strip cutoff for opener geometry: the viewport-relative header
+/// boundary both [`open_identity_menu`] and the chrome worker's opener
+/// ambiguity gate derive — one definition, no drift. `None` when the
+/// viewport won't read: the strip pass stays empty and ranking fails
+/// closed, exactly like the primitive's inline version did.
+async fn header_strip_bottom<B: MenuBrowser>(browser: &B) -> Option<f64> {
+    browser
+        .menu_viewport_size()
+        .await
+        .map(|(_, height)| height * HEADER_STRIP_FRACTION)
 }
 
 /// Header-geometry rects at the CDP boundary: `(backend_node_id, x, y)`
@@ -2342,6 +2779,14 @@ async fn poll_for_menu_open<B: MenuBrowser>(
 /// every attempted click is recorded in `clicked` by stable identity so
 /// neither lane re-tries — or toggles shut — the same control.
 ///
+/// `preferred`, when `Some`, is clicked on the first attempt instead of
+/// the ranking's top candidate: a caller that already resolved which
+/// opener to click (the chrome worker's ambiguity gate) gets exactly
+/// that candidate, never the ranking's independent favorite. Later
+/// attempts rank normally — the preferred control is in `clicked` by
+/// then, so it can't be re-clicked (toggling the menu shut). `None`
+/// preserves the pure rank → click behavior.
+///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
 pub async fn open_identity_menu<B: MenuBrowser>(
@@ -2350,11 +2795,13 @@ pub async fn open_identity_menu<B: MenuBrowser>(
     baseline: MenuOpenBaseline<'_>,
     clicked: &mut Vec<ClickedControl>,
     max_tries: usize,
+    preferred: Option<&AxElement>,
 ) -> Result<OpenMenuOutcome, IntentError> {
     // Attempt baselines: the first attempt ranks the caller's snapshot
     // (no extra fetch); later attempts re-rank from the previous
     // attempt's final poll snapshot.
     let mut current: Option<(Vec<AxElement>, usize)> = None;
+    let mut preferred = preferred;
     let mut tried = Vec::new();
     for _ in 0..max_tries.min(MENU_OPEN_MAX_TRIES) {
         let (elements, raw_before) = match current.as_ref() {
@@ -2375,19 +2822,26 @@ pub async fn open_identity_menu<B: MenuBrowser>(
         // Geometry tiers at the CDP boundary; tiers (a) and (b) are pure.
         // An unreadable viewport fails the geometry tiers closed to empty —
         // tiers (a) and (b) are still tried.
-        let strip_bottom = browser
-            .menu_viewport_size()
-            .await
-            .map(|(_, height)| height * HEADER_STRIP_FRACTION);
+        let strip_bottom = header_strip_bottom(browser).await;
         let rects = header_button_rects(browser, elements, clicked).await;
-        let candidate = match rank_menu_candidates(elements, clicked, &rects, strip_bottom)
-            .into_iter()
-            .next()
-        {
-            Some(candidate) => candidate.clone(),
-            // Every candidate already tried: re-clicking would only
-            // toggle a menu shut.
-            None => break,
+        // A caller-resolved opener goes first, exactly once: the
+        // primitive's independent ranking must not substitute a
+        // different candidate for the caller's choice. Later attempts
+        // rank normally — the preferred control is in `clicked` by then,
+        // so it can't be re-clicked (toggling the menu shut).
+        let candidate = match preferred.take().filter(|p| !already_clicked(clicked, p)) {
+            Some(winner) => winner.clone(),
+            None => {
+                match rank_menu_candidates(elements, clicked, &rects, strip_bottom)
+                    .into_iter()
+                    .next()
+                {
+                    Some(candidate) => candidate.clone(),
+                    // Every candidate already tried: re-clicking would only
+                    // toggle a menu shut.
+                    None => break,
+                }
+            }
         };
 
         let tried_key = ClickedControl::of(&candidate);
@@ -2672,8 +3126,15 @@ async fn pursue_deterministic(
             elements: &elements,
             check: &check_before,
         };
-        match open_identity_menu(browser, origin, baseline, &mut clicked, MENU_OPEN_MAX_TRIES)
-            .await?
+        match open_identity_menu(
+            browser,
+            origin,
+            baseline,
+            &mut clicked,
+            MENU_OPEN_MAX_TRIES,
+            None,
+        )
+        .await?
         {
             OpenMenuOutcome::Opened { .. } => continue,
             OpenMenuOutcome::Miss { .. } => {}
@@ -2698,17 +3159,48 @@ async fn pursue_deterministic(
     )))
 }
 
+/// Escalation for gear 2's model loop: when the main pass's tail fails
+/// verification and this is `Some`, exactly one additional bounded model
+/// pass runs under `navigator` before the honest miss. A verified main
+/// tail never escalates; the escalation pass itself never escalates
+/// further. Built by the desktop service from
+/// [`orchestration_engine::LlmPageNavigator::escalation_from_env`]; unset
+/// keeps today's behavior.
+#[derive(Clone)]
+pub struct ModelEscalation {
+    /// The escalation navigator: a stronger model behind the same
+    /// [`crate::navigator::PageNavigator`] fence.
+    pub navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    /// Model label for the journal line (`escalated to <model>`).
+    pub model_name: String,
+}
+
+/// Mutable state accumulated across one [`pursue_with_model`] run's model
+/// passes: the click log, the tried journal, the last clicked label, and
+/// the page-revealed username candidate. Shared between the main pass
+/// and the escalation pass so the journal is one continuous record.
+#[derive(Default)]
+struct ModelLoopState {
+    clicked: Vec<ClickedControl>,
+    tried: Vec<String>,
+    last_label: Option<String>,
+    revealed_username: Option<String>,
+}
+
 /// Gear 2: the generalist agent loop — observe, propose, act.
 ///
 /// Per turn:
 /// 1. **Observe**: untruncated AX snapshot via [`MenuBrowser::menu_snapshot`]
 ///    (a revealed menu renders at document end, past the head truncation
 ///    the old phase-2 loop used — the pick is validated against the same
-///    full list the loop observes).
+///    full list the loop observes), plus a best-effort viewport screenshot
+///    for the visual turn (a failed capture degrades to the text-only
+///    turn, never fails the run).
 /// 2. **Propose**: the navigator picks exactly ONE [`PageAction`] from the
 ///    rendered head slice ([`MAX_NAVIGATOR_ELEMENTS`] lines, zones
-///    included). The optional `spec` adds the verb's closed vocabulary as
-///    a prompt hint — selection and execution stay deterministic.
+///    included) via [`crate::navigator::PageNavigator::next_action_visual`].
+///    The optional `spec` adds the verb's closed vocabulary as a prompt
+///    hint — selection and execution stay deterministic.
 /// 3. **Act**: deterministic Rust validates the picked id against the live
 ///    snapshot and clicks it. Unknown ids decline, never guess; an
 ///    already-clicked re-pick declines instead of toggling a menu shut.
@@ -2724,6 +3216,12 @@ async fn pursue_deterministic(
 /// so a navigation ends the loop as `Navigated`, like the old phase-2
 /// contract.
 ///
+/// Escalation: when the main pass's tail fails verification and
+/// `escalation` is `Some`, one additional bounded pass runs under the
+/// escalation navigator (journaled as `escalated to <model>`), then the
+/// run falls through to the honest miss carrying the journal. Exactly one
+/// escalation per run; a verified main tail never escalates.
+///
 /// [`IntentError::NoMatch`] with the loop's tried-click journal when the
 /// goal is not verified; [`IntentError::Browser`] on CDP failure.
 ///
@@ -2737,19 +3235,71 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
     navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
     spec: Option<&VerbSpec>,
     deterministic_miss: String,
+    escalation: Option<ModelEscalation>,
+) -> Result<PageGoalOutcome, IntentError> {
+    let mut state = ModelLoopState::default();
+    let main_miss = match model_loop_pass(
+        browser,
+        origin,
+        goal,
+        navigator,
+        spec,
+        &deterministic_miss,
+        &mut state,
+    )
+    .await
+    {
+        ok @ Ok(_) => return ok,
+        // Browser errors fail fast: escalating on a dead CDP session
+        // would just burn model calls.
+        Err(browser @ IntentError::Browser(_)) => return Err(browser),
+        Err(miss @ IntentError::NoMatch(_)) => miss,
+    };
+    let Some(escalation) = escalation else {
+        return Err(main_miss);
+    };
+    state
+        .tried
+        .push(format!("escalated to {}", escalation.model_name));
+    // The escalation pass shares the accumulated state, so the journal
+    // stays one continuous record; the tail renders it into the honest
+    // miss when verification fails again.
+    model_loop_pass(
+        browser,
+        origin,
+        goal,
+        escalation.navigator,
+        spec,
+        &deterministic_miss,
+        &mut state,
+    )
+    .await
+}
+
+/// One bounded model pass: the observe → propose → act loop shared by
+/// gear 2's main pass and the escalation pass, so the click/verify logic
+/// is not duplicated. `state` accumulates across passes; the pass ends in
+/// [`model_loop_tail`], whose [`IntentError::NoMatch`] carries the
+/// journal. Exactly one pass escalates — this helper never escalates
+/// itself.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the goal is not reached or not
+/// verified, and [`IntentError::Browser`] on CDP failure.
+async fn model_loop_pass<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    goal: &str,
+    navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    spec: Option<&VerbSpec>,
+    deterministic_miss: &str,
+    state: &mut ModelLoopState,
 ) -> Result<PageGoalOutcome, IntentError> {
     use crate::navigator::PageAction;
-    let mut clicked: Vec<ClickedControl> = Vec::new();
-    let mut tried: Vec<String> = Vec::new();
-    let mut last_label: Option<String> = None;
-    // Neutral acting state: the deterministic phase may have left a wrong
-    // menu open, whose light-dismiss would swallow the loop's first click.
+    // Neutral acting state: the previous phase may have left a wrong menu
+    // open, whose light-dismiss would swallow the pass's first click.
     // Best-effort no-op when nothing is open.
     browser.menu_dismiss().await;
-    // Page-revealed username candidate for the identity verifier: read from
-    // a clicked control's href or label BEFORE the click, never derived
-    // from the landed URL (that would make the check circular).
-    let mut revealed_username: Option<String> = None;
 
     for _ in 0..MODEL_GOAL_MAX_STEPS {
         // Untruncated: the pick is validated against the same full list
@@ -2765,12 +3315,16 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
             .cloned()
             .collect();
         let zones = model_zones(browser, &head).await;
+        // Phase 2: the visual turn — a best-effort viewport screenshot
+        // accompanies the element list. The capture must never fail the
+        // run: `None` degrades to the text-only turn.
+        let screenshot = browser.menu_screenshot().await;
         // The navigator is synchronous (one bounded HTTP call); the async
         // runtime never blocks on it. Everything the closure touches is
         // owned, so the future stays `'static`.
         let owned_navigator = navigator.clone();
         let action = tokio::task::spawn_blocking(move || {
-            owned_navigator.next_action_zoned(&prompt_goal, &head, &zones)
+            owned_navigator.next_action_visual(&prompt_goal, &head, &zones, screenshot.as_deref())
         })
         .await
         .map_err(|_| {
@@ -2778,8 +3332,9 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
         })?;
         // A decline stops the acting loop and falls through to the
         // verification tail — the verifier, never the model, decides
-        // completion. (A closure would borrow `tried`/`clicked` across the
-        // click arm's mutations, so each site calls the tail directly.)
+        // completion. (A closure would borrow the state's fields across
+        // the click arm's mutations, so each site calls the tail
+        // directly.)
         match action {
             None => {
                 return model_loop_tail(
@@ -2787,10 +3342,10 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
                     origin,
                     spec,
                     goal,
-                    &deterministic_miss,
-                    &tried,
-                    last_label.as_deref(),
-                    revealed_username.as_deref(),
+                    deterministic_miss,
+                    &state.tried,
+                    state.last_label.as_deref(),
+                    state.revealed_username.as_deref(),
                     "navigator declined",
                 )
                 .await;
@@ -2801,10 +3356,10 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
                     origin,
                     spec,
                     goal,
-                    &deterministic_miss,
-                    &tried,
-                    last_label.as_deref(),
-                    revealed_username.as_deref(),
+                    deterministic_miss,
+                    &state.tried,
+                    state.last_label.as_deref(),
+                    state.revealed_username.as_deref(),
                     &format!("navigator gave up ({reason})"),
                 )
                 .await;
@@ -2818,10 +3373,10 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
                     origin,
                     spec,
                     goal,
-                    &deterministic_miss,
-                    &tried,
-                    last_label.as_deref(),
-                    revealed_username.as_deref(),
+                    deterministic_miss,
+                    &state.tried,
+                    state.last_label.as_deref(),
+                    state.revealed_username.as_deref(),
                     "navigator done (treated as decline)",
                 )
                 .await;
@@ -2834,11 +3389,11 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
                     spec,
                     &elements,
                     target,
-                    &deterministic_miss,
-                    &mut clicked,
-                    &mut tried,
-                    &mut last_label,
-                    &mut revealed_username,
+                    deterministic_miss,
+                    &mut state.clicked,
+                    &mut state.tried,
+                    &mut state.last_label,
+                    &mut state.revealed_username,
                 )
                 .await?
                 {
@@ -2852,10 +3407,10 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
         origin,
         spec,
         goal,
-        &deterministic_miss,
-        &tried,
-        last_label.as_deref(),
-        revealed_username.as_deref(),
+        deterministic_miss,
+        &state.tried,
+        state.last_label.as_deref(),
+        state.revealed_username.as_deref(),
         &format!("navigator exhausted {MODEL_GOAL_MAX_STEPS} steps"),
     )
     .await

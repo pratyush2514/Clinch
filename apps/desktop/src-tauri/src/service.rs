@@ -3848,6 +3848,20 @@ impl AppService {
     /// the noun isn't directly visible). Settle — final frame plus
     /// challenge handling — runs in `settle_ephemeral_outcome` after this
     /// returns, exactly like every other ephemeral lane.
+    /// Build the gear-2 escalation navigator for one dispatch: opt-in via
+    /// `CLINCH_ESCALATION_MODEL` (and `CLINCH_ESCALATION_PROVIDER`,
+    /// defaulting to groq). Unset keeps today's behavior — the model phase
+    /// misses honestly with no escalation pass.
+    fn model_escalation() -> Option<macro_engine::ModelEscalation> {
+        orchestration_engine::LlmPageNavigator::escalation_from_env().map(|navigator| {
+            let model_name = navigator.model_name().to_owned();
+            macro_engine::ModelEscalation {
+                navigator: std::sync::Arc::new(navigator) as _,
+                model_name,
+            }
+        })
+    }
+
     async fn dispatch_in_page_goal(
         &self,
         portal: url::Url,
@@ -3881,6 +3895,21 @@ impl AppService {
                 }
             ))
             .await;
+        // Gear-2 escalation is opt-in separately: when armed, one
+        // additional bounded model pass runs under the escalation model
+        // after the main pass's tail fails verification.
+        let escalation = Self::model_escalation();
+        let _ = self
+            .record(&format!(
+                "in_page_goal_escalation: {}",
+                escalation
+                    .as_ref()
+                    .map_or("unset".to_owned(), |escalation| format!(
+                        "{} armed",
+                        escalation.model_name
+                    ))
+            ))
+            .await;
         // Verb-spec branch: the closed noun table maps the artifact noun to
         // its verb spec (vocabulary + verifier). Identity goals ("my
         // profile", "my account") get the chrome worker with memory and
@@ -3893,10 +3922,13 @@ impl AppService {
                 .record(&format!("in_page_goal_class: {}", spec.kind.as_str()))
                 .await;
             return self
-                .dispatch_verb_spec_goal(&browser, &portal, &name, spec, goal_line, navigator)
+                .dispatch_verb_spec_goal(
+                    &browser, &portal, &name, spec, goal_line, navigator, escalation,
+                )
                 .await;
         }
-        match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator).await {
+        match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator, escalation).await
+        {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
                 let _ = self
                     .record(&format!(
@@ -4079,19 +4111,26 @@ impl AppService {
         spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
         navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        escalation: Option<macro_engine::ModelEscalation>,
     ) -> Result<DispatchOutcome, AppError> {
         match spec.kind {
             orchestration_engine::VerbKind::AccountHome => {
-                self.dispatch_account_home_goal(browser, portal, name, spec, goal_line, navigator)
-                    .await
+                self.dispatch_account_home_goal(
+                    browser, portal, name, spec, goal_line, navigator, escalation,
+                )
+                .await
             }
             orchestration_engine::VerbKind::Settings => {
-                self.dispatch_settings_goal(browser, portal, name, spec, goal_line, navigator)
-                    .await
+                self.dispatch_settings_goal(
+                    browser, portal, name, spec, goal_line, navigator, escalation,
+                )
+                .await
             }
             orchestration_engine::VerbKind::LogOut => {
-                self.dispatch_log_out_goal(browser, portal, name, spec, goal_line, navigator)
-                    .await
+                self.dispatch_log_out_goal(
+                    browser, portal, name, spec, goal_line, navigator, escalation,
+                )
+                .await
             }
         }
     }
@@ -4221,8 +4260,22 @@ impl AppService {
                 }
             ))
             .await;
-        self.dispatch_verb_spec_goal(&browser, &portal, &name, spec, goal_line, navigator)
-            .await
+        let escalation = Self::model_escalation();
+        let _ = self
+            .record(&format!(
+                "in_page_goal_escalation: {}",
+                escalation
+                    .as_ref()
+                    .map_or("unset".to_owned(), |escalation| format!(
+                        "{} armed",
+                        escalation.model_name
+                    ))
+            ))
+            .await;
+        self.dispatch_verb_spec_goal(
+            &browser, &portal, &name, spec, goal_line, navigator, escalation,
+        )
+        .await
     }
 
     async fn dispatch_account_home_goal(
@@ -4233,6 +4286,7 @@ impl AppService {
         spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
         navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        escalation: Option<macro_engine::ModelEscalation>,
     ) -> Result<DispatchOutcome, AppError> {
         let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
         let class_key = spec.kind.as_str();
@@ -4251,7 +4305,8 @@ impl AppService {
         // loop, then the honest miss: one action engine, three gears. The
         // guest short-circuit lives inside the worker, so a signed-out
         // landing still returns `SignedOut` before the model phase.
-        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
+        {
             Ok(macro_engine::PageGoalOutcome::Verified {
                 label,
                 landed,
@@ -4410,6 +4465,7 @@ impl AppService {
         spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
         navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        escalation: Option<macro_engine::ModelEscalation>,
     ) -> Result<DispatchOutcome, AppError> {
         let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
 
@@ -4434,7 +4490,8 @@ impl AppService {
         // honest miss: one action engine, three gears. The verifier is the
         // only completion decider — an unverified `Navigated` is checked
         // against the live page here and becomes a miss when it fails.
-        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
+        {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
                 // The worker reached a token-named landing but could not
                 // verify it from the page itself. The run completes only
@@ -4532,8 +4589,10 @@ impl AppService {
         spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
         navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        escalation: Option<macro_engine::ModelEscalation>,
     ) -> Result<DispatchOutcome, AppError> {
-        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
+        {
             Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
                 let _ = self
                     .record(&format!(

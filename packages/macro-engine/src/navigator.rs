@@ -48,6 +48,10 @@ pub enum PageAction {
 ///
 /// Returns `None` on any failure (transport, timeout, malformed JSON):
 /// a stalled or confused model degrades to the honest miss, never a hang.
+///
+/// The model never sees credentials, cookies, or page HTML — only the
+/// goal string, the element list, and (when the caller supplies one) a
+/// single viewport screenshot.
 pub trait PageNavigator: Send + Sync {
     fn next_action(&self, goal: &str, elements: &[AxElement]) -> Option<PageAction>;
 
@@ -63,6 +67,24 @@ pub trait PageNavigator: Send + Sync {
     ) -> Option<PageAction> {
         let _ = zones;
         self.next_action(goal, elements)
+    }
+
+    /// Vision variant: like [`PageNavigator::next_action_zoned`] but with an
+    /// optional viewport screenshot accompanying the element list.
+    /// `screenshot_jpeg_b64` is base64 JPEG with NO data-URI prefix, or
+    /// `None` when capture failed. The default ignores the screenshot and
+    /// delegates to [`PageNavigator::next_action_zoned`], so existing
+    /// implementers keep working; navigators with a vision-capable model
+    /// override this to send the image alongside the element list.
+    fn next_action_visual(
+        &self,
+        goal: &str,
+        elements: &[AxElement],
+        zones: &[Option<PositionZone>],
+        screenshot_jpeg_b64: Option<&str>,
+    ) -> Option<PageAction> {
+        let _ = screenshot_jpeg_b64;
+        self.next_action_zoned(goal, elements, zones)
     }
 }
 

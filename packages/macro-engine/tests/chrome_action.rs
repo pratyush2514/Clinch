@@ -7,18 +7,53 @@
 //! navigation commits after the CDP click returns), scripted `node_href`
 //! answers, a scripted document title, and a scripted auth state — so the
 //! menu-open → revealed-click → verify flow is proven with no Chromium.
+//!
+//! Hermetic classifier: every `#[tokio::test]` pins
+//! `CLINCH_CLASSIFIER_BASE_URL` at a dead loopback port (see
+//! [`hermetic_classifier`]) so the worker's semantic paths decline
+//! deterministically instead of depending on the live classifier's
+//! nondeterministic scores. Edition 2024 marks `std::env::set_var`
+//! unsafe; the override is this file's hermeticity seam, so the `unsafe`
+//! is allowed for this file only — the module docs on
+//! [`hermetic_classifier`] carry the safety argument.
+#![allow(unsafe_code)]
 
 use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight};
+use macro_engine::semantic::SemanticMatcher;
 use macro_engine::{
     ChromeActionBrowser, ClickedControl, IntentError, MenuBrowser, PageGoalOutcome,
     SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic, pursue_chrome_action,
-    select_revealed_action,
+    select_already_open_menu_target, select_revealed_action, semantic_opener_winner,
+    strong_openers,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use url::Url;
+
+/// Hermetic classifier for the worker-flow tests: the worker builds its
+/// semantic matchers from `CLINCH_CLASSIFIER_BASE_URL`, and the live
+/// classifier's scores are nondeterministic across runs — a wrong-menu
+/// item can clear the accept threshold on one run and miss it on the
+/// next, which would make any test driving [`pursue_chrome_action`]
+/// flaky. Pointing the endpoint at a dead loopback port makes every
+/// semantic path decline deterministically (connection refused, no
+/// timeout wait), so these tests pin the deterministic lanes; the
+/// semantic paths themselves are covered against a loopback mock in
+/// `semantic_worker.rs`. The override is process-global and constant,
+/// so setting it in each test is idempotent. Edition 2024 marks
+/// `set_var` unsafe: the only shared state it touches is this same
+/// variable, always written with this same value, and no test in this
+/// binary depends on the live endpoint.
+fn hermetic_classifier() {
+    // SAFETY: process-global, but every test in this binary writes the
+    // same constant value and none depends on the live endpoint — no
+    // thread can observe a value that would change its behavior.
+    unsafe {
+        std::env::set_var("CLINCH_CLASSIFIER_BASE_URL", "http://127.0.0.1:9/");
+    }
+}
 
 fn origin() -> Url {
     Url::parse("https://www.example.com/")
@@ -225,6 +260,10 @@ impl MenuBrowser for FakeChromeActionBrowser {
     async fn menu_dismiss(&self) {
         *self.dismisses.lock().await += 1;
     }
+
+    async fn menu_screenshot(&self) -> Option<String> {
+        None
+    }
 }
 
 impl SettingsBrowser for FakeChromeActionBrowser {
@@ -375,6 +414,7 @@ fn chrome_action_miss_diagnostic_lists_tried_clicks() {
 
 #[tokio::test]
 async fn settings_flow_navigates_to_settings_path() {
+    hermetic_classifier();
     // Menu opens on the avatar click, revealing a "Settings" menuitem;
     // clicking it navigates to a settings path.
     let baseline = vec![avatar(), el(2, "link", "Home", None)];
@@ -398,6 +438,7 @@ async fn settings_flow_navigates_to_settings_path() {
 
 #[tokio::test]
 async fn settings_flow_verifies_disclosure_via_heading() {
+    hermetic_classifier();
     // Clicking the revealed "Preferences" item navigates nowhere; the
     // post-click page names settings in a heading instead. The title is
     // left unset so the heading — not the title — carries the verdict.
@@ -428,6 +469,7 @@ async fn settings_flow_verifies_disclosure_via_heading() {
 
 #[tokio::test]
 async fn settings_flow_selects_blank_link_by_settings_href() {
+    hermetic_classifier();
     // The revealed control is a blank-named link: the name half of the
     // matcher sees nothing, but its page-revealed href points at a
     // settings path (stemmed: "user-settings" → "setting").
@@ -451,6 +493,7 @@ async fn settings_flow_selects_blank_link_by_settings_href() {
 
 #[tokio::test]
 async fn settings_flow_misses_when_menu_has_no_candidates() {
+    hermetic_classifier();
     // No menu candidates at all: the primitive misses immediately with
     // an empty tried journal, and the worker reports the honest miss.
     let baseline = vec![el(2, "link", "Home", None), el(3, "link", "Docs", None)];
@@ -470,6 +513,7 @@ async fn settings_flow_misses_when_menu_has_no_candidates() {
 
 #[tokio::test]
 async fn settings_flow_never_clicks_wrong_revealed_item() {
+    hermetic_classifier();
     // The menu opens but reveals only a "Profile" item: it matches no
     // settings vocabulary, and the pre-existing footer "Settings" link is
     // stale chrome — neither is clicked.
@@ -500,12 +544,14 @@ async fn settings_flow_never_clicks_wrong_revealed_item() {
 }
 
 #[tokio::test]
-async fn logout_flow_dismisses_wrong_menu_before_next_attempt() {
+async fn logout_flow_dismisses_wrong_menu_then_defers_without_weak_clicks() {
+    hermetic_classifier();
     // Live Reddit logout shape: the first candidate opens a menu whose
-    // items carry no logout vocabulary. The worker must dismiss the open
-    // popup before spending its next menu-opening click — otherwise the
-    // popup's light-dismiss swallows that click instead of letting it
-    // reach the next candidate, and logout never executes.
+    // items carry no logout vocabulary. The worker dismisses the open
+    // popup (so its light-dismiss can't swallow a later click), then —
+    // with no strong opener left — defers to the model phase instead of
+    // blind-guessing the weak "Notifications" button. Gear 2 gets the
+    // tried journal and decides from there.
     let avatar = el(1, "button", "User Avatar Expand user menu", None);
     let baseline = vec![
         avatar,
@@ -525,16 +571,23 @@ async fn logout_flow_dismisses_wrong_menu_before_next_attempt() {
                 diagnostic.contains("dismissed possibly-open menu"),
                 "got: {diagnostic}"
             );
+            assert!(
+                diagnostic.contains("no unambiguous account-menu opener (0 strong candidates)"),
+                "ambiguity gate named: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("deferring to model phase"),
+                "deferral named: {diagnostic}"
+            );
         }
         other => panic!("expected NoMatch miss, got {other:?}"),
     }
-    // The account-worded header button was tried first (not the
-    // feed-content menu), the wrong menu was dismissed, and the next
-    // candidate got its click.
-    assert_eq!(fake.clicks().await, vec![1, 2]);
+    // Only the strong opener was clicked; the weak button was never
+    // touched, and the wrong menu was dismissed.
+    assert_eq!(fake.clicks().await, vec![1]);
     assert!(
         *fake.dismisses.lock().await >= 1,
-        "expected a dismiss between menu attempts"
+        "expected a dismiss after the wrong menu"
     );
 }
 
@@ -542,6 +595,7 @@ async fn logout_flow_dismisses_wrong_menu_before_next_attempt() {
 
 #[tokio::test]
 async fn account_home_flow_short_circuits_on_guest_landing() {
+    hermetic_classifier();
     // A signed-out page has no identity chrome: the worker stops before
     // any click.
     let fake = FakeChromeActionBrowser::new(vec![avatar(), el(2, "link", "Home", None)])
@@ -556,6 +610,7 @@ async fn account_home_flow_short_circuits_on_guest_landing() {
 
 #[tokio::test]
 async fn account_home_flow_navigates_revealed_href_and_verifies() {
+    hermetic_classifier();
     // Menu opens on the avatar click, revealing a "Profile" link whose
     // page-revealed href names the user; the worker navigates the href
     // directly and the verifier confirms the username in the landing.
@@ -588,6 +643,7 @@ async fn account_home_flow_navigates_revealed_href_and_verifies() {
 
 #[tokio::test]
 async fn logout_flow_completes_when_already_signed_out() {
+    hermetic_classifier();
     // The page already reads signed out: the goal is achieved with no clicks.
     let fake = FakeChromeActionBrowser::new(vec![avatar(), el(2, "link", "Home", None)])
         .with_auth(AuthState::LoggedOut);
@@ -603,6 +659,7 @@ async fn logout_flow_completes_when_already_signed_out() {
 
 #[tokio::test]
 async fn logout_flow_verifies_signed_out_after_click() {
+    hermetic_classifier();
     // Menu opens on the avatar click, revealing "Log out"; clicking it
     // navigates away and the page reads signed out — the verifier passes.
     let baseline = vec![avatar(), el(2, "link", "Home", None)];
@@ -631,6 +688,7 @@ async fn logout_flow_verifies_signed_out_after_click() {
 
 #[tokio::test]
 async fn logout_flow_misses_when_still_signed_in() {
+    hermetic_classifier();
     // The "Log out" click navigates but the page still reads signed in:
     // an honest miss, never a claimed success.
     let baseline = vec![avatar(), el(2, "link", "Home", None)];
@@ -648,4 +706,202 @@ async fn logout_flow_misses_when_still_signed_in() {
         other => panic!("expected NoMatch miss, got {other:?}"),
     }
     assert_eq!(fake.clicks().await, vec![1, 10]);
+}
+
+// ---- already-open menu (worker step 1a): pure selector ----
+
+#[test]
+fn already_open_menu_selects_vocabulary_match() {
+    // The page opened the menu itself: a menu layer is present and the
+    // worker hasn't clicked anything yet.
+    let elements = vec![
+        avatar(),
+        el(5, "menu", "", None),
+        el(10, "menuitem", "Settings", None),
+    ];
+    let selected = select_already_open_menu_target(&elements, settings_spec());
+    assert_eq!(selected.map(|el| el.backend_node_id), Some(10));
+}
+
+#[test]
+fn already_open_menu_ignores_page_without_menu_layer() {
+    // Vocabulary words in page chrome are not enough: without an actual
+    // menu layer the 1a step stays out, so a footer link never qualifies.
+    let elements = vec![avatar(), el(10, "link", "Settings", None)];
+    assert!(select_already_open_menu_target(&elements, settings_spec()).is_none());
+}
+
+#[test]
+fn already_open_menu_ignores_non_matching_menu() {
+    // A menu layer with no vocabulary match is not the verb's menu.
+    let elements = vec![
+        avatar(),
+        el(5, "menu", "", None),
+        el(10, "menuitem", "Copy link", None),
+    ];
+    assert!(select_already_open_menu_target(&elements, settings_spec()).is_none());
+}
+
+// ---- already-open menu (worker step 1a): full worker flow ----
+
+#[tokio::test]
+async fn already_open_menu_clicks_destination_directly() {
+    hermetic_classifier();
+    // The menu is already open in the first snapshot: the worker clicks
+    // the revealed Settings item itself — no opener click that would
+    // toggle the open menu shut.
+    let tree = vec![
+        avatar(),
+        el(5, "menu", "", None),
+        el(10, "menuitem", "Settings", None),
+    ];
+    let fake = FakeChromeActionBrowser::new(tree).with_navigate_on_click(10, url("/settings"));
+    match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
+        Ok(PageGoalOutcome::Navigated { label, landed }) => {
+            assert_eq!(label, "Settings");
+            assert_eq!(landed.path(), "/settings");
+        }
+        other => panic!("expected Navigated, got {other:?}"),
+    }
+    // Exactly one click: the menu item. The avatar opener was never touched.
+    assert_eq!(fake.clicks().await, vec![10]);
+}
+
+#[tokio::test]
+async fn already_open_menu_direct_click_is_journaled() {
+    hermetic_classifier();
+    // The direct click lands somewhere without settings evidence: the
+    // miss diagnostic names the already-open path, proving the journal
+    // records what the worker actually did.
+    let tree = vec![
+        el(2, "link", "Home", None),
+        el(5, "menu", "", None),
+        el(10, "menuitem", "Settings", None),
+    ];
+    let fake = FakeChromeActionBrowser::new(tree).with_navigate_on_click(10, url("/home"));
+    match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
+        Err(IntentError::NoMatch(diagnostic)) => {
+            assert!(
+                diagnostic.contains("menu already open: clicked 'Settings' directly (no opener)"),
+                "journal names the already-open path: {diagnostic}"
+            );
+        }
+        other => panic!("expected the honest miss, got {other:?}"),
+    }
+    assert_eq!(fake.clicks().await, vec![10]);
+}
+
+// ---- opener ambiguity gate (worker step 1b) ----
+
+#[test]
+fn strong_openers_keeps_account_worded_and_blank_in_strip() {
+    let elements = vec![
+        el(1, "button", "Open user actions", None),
+        el(2, "button", "", None),
+        el(3, "button", "Search", None),
+        el(4, "button", "", None),
+    ];
+    let rects = vec![
+        (1, 950.0, 50.0),
+        (2, 1000.0, 60.0),
+        (3, 100.0, 50.0),
+        (4, 100.0, 500.0),
+    ];
+    let strong = strong_openers(&elements, &[], &rects, Some(200.0));
+    let ids: Vec<i64> = strong.iter().map(|el| el.backend_node_id).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "account-worded and blank in-strip buttons are strong; named non-account and below-strip are not"
+    );
+}
+
+#[test]
+fn strong_openers_excludes_clicked() {
+    let elements = vec![
+        el(1, "button", "Open user actions", None),
+        el(2, "button", "", None),
+    ];
+    let rects = vec![(1, 950.0, 50.0), (2, 1000.0, 60.0)];
+    let clicked = vec![ClickedControl::of(&elements[0])];
+    let strong = strong_openers(&elements, &clicked, &rects, Some(200.0));
+    let ids: Vec<i64> = strong.iter().map(|el| el.backend_node_id).collect();
+    assert_eq!(ids, vec![2]);
+}
+
+#[tokio::test]
+async fn semantic_opener_winner_declines_blank_names_without_network() {
+    hermetic_classifier();
+    // Blank names decline silently: two blank openers can never
+    // disambiguate, and no classifier call leaves the machine.
+    let openers = [el(1, "button", "", None), el(2, "button", "", None)];
+    let refs: Vec<&AxElement> = openers.iter().collect();
+    let mut matcher = SemanticMatcher::new("account menu");
+    assert!(
+        semantic_opener_winner(&mut matcher, &refs).await.is_none(),
+        "blank names cannot win"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_openers_defer_to_model_phase_without_clicks() {
+    hermetic_classifier();
+    // Two blank-named header buttons: both strong, neither scores — the
+    // worker defers to the model phase having clicked nothing.
+    let tree = vec![
+        el(1, "button", "", None),
+        el(2, "button", "", None),
+        el(3, "link", "Home", None),
+    ];
+    let fake = FakeChromeActionBrowser::new(tree);
+    match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
+        Err(IntentError::NoMatch(diagnostic)) => {
+            assert!(
+                diagnostic.contains("no unambiguous account-menu opener (2 strong candidates)"),
+                "ambiguity named: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("deferring to model phase"),
+                "deferral named: {diagnostic}"
+            );
+        }
+        other => panic!("expected the honest miss, got {other:?}"),
+    }
+    assert!(
+        fake.clicks().await.is_empty(),
+        "the ambiguity gate clicks nothing"
+    );
+}
+
+#[tokio::test]
+async fn gate_choice_is_clicked_even_when_ranking_prefers_another() {
+    hermetic_classifier();
+    // The ambiguity gate resolves exactly one strong opener (the
+    // account-worded button, id 2), but the primitive's independent
+    // ranking prefers the landmarked navigation button (id 1 — tier (a)
+    // outranks tier (b)). The worker must click the gate's choice, id 2:
+    // identifying the winner is not enough, the winner is what gets
+    // clicked. Settings keeps the run an honest miss afterwards (the
+    // revealed Profile item matches nothing and the hermetic classifier
+    // declines), so the assertion is on the click itself.
+    let tree = vec![
+        el(1, "button", "Open navigation", Some("navigation")),
+        el(2, "button", "Open user actions", None),
+        el(3, "link", "Home", None),
+    ];
+    let mut menu_tree = tree.clone();
+    menu_tree.push(el(10, "menuitem", "Profile", None));
+    let fake = FakeChromeActionBrowser::new(tree)
+        .with_rect(1, 100.0, 50.0)
+        .with_rect(2, 950.0, 50.0)
+        .with_menu_on_click(2, menu_tree);
+    match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
+        Err(IntentError::NoMatch(_)) => {}
+        other => panic!("expected the honest miss, got {other:?}"),
+    }
+    assert_eq!(
+        fake.clicks().await,
+        vec![2],
+        "the gate's chosen opener is clicked, not the ranking's favorite"
+    );
 }

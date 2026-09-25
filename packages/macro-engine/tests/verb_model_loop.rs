@@ -10,8 +10,8 @@
 
 use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight};
 use macro_engine::{
-    ChromeActionBrowser, IntentError, MenuBrowser, PageAction, PageGoalOutcome, PageNavigator,
-    SettingsBrowser, VerbKind, VerbSpec, pursue_with_model,
+    ChromeActionBrowser, IntentError, MenuBrowser, ModelEscalation, PageAction, PageGoalOutcome,
+    PageNavigator, PositionZone, SettingsBrowser, VerbKind, VerbSpec, pursue_with_model,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,7 @@ struct LoopBrowser {
     url: Arc<AsyncMutex<Url>>,
     auth: AuthState,
     land_on_click: HashMap<i64, Url>,
+    screenshot: Option<String>,
 }
 
 impl LoopBrowser {
@@ -61,7 +62,13 @@ impl LoopBrowser {
             url: Arc::new(AsyncMutex::new(origin())),
             auth,
             land_on_click: HashMap::new(),
+            screenshot: None,
         }
+    }
+
+    fn with_screenshot(mut self, jpeg_b64: &str) -> Self {
+        self.screenshot = Some(jpeg_b64.to_owned());
+        self
     }
 
     fn with_landing_on_click(mut self, id: i64, url: &str) -> Self {
@@ -133,6 +140,10 @@ impl MenuBrowser for LoopBrowser {
     }
 
     async fn menu_dismiss(&self) {}
+
+    async fn menu_screenshot(&self) -> Option<String> {
+        self.screenshot.clone()
+    }
 }
 
 impl SettingsBrowser for LoopBrowser {
@@ -211,6 +222,7 @@ async fn eight_unverified_model_actions_exhaust_to_miss() {
         navigator.clone(),
         Some(settings_spec()),
         "deterministic: nothing found".to_owned(),
+        None,
     )
     .await;
     let diagnostic = match result {
@@ -243,6 +255,7 @@ async fn done_with_verifier_passing_completes_on_evidence() {
         navigator,
         Some(logout_spec()),
         "deterministic: nothing found".to_owned(),
+        None,
     )
     .await;
     match result {
@@ -264,6 +277,7 @@ async fn done_without_verification_is_miss_not_completion() {
         navigator,
         Some(logout_spec()),
         "deterministic: nothing found".to_owned(),
+        None,
     )
     .await;
     assert!(
@@ -289,6 +303,7 @@ async fn acted_but_unverified_is_miss_not_completion() {
         navigator,
         Some(settings_spec()),
         "deterministic: nothing found".to_owned(),
+        None,
     )
     .await;
     assert!(
@@ -314,6 +329,7 @@ async fn verified_landing_after_model_click_completes() {
         navigator,
         Some(settings_spec()),
         "deterministic: nothing found".to_owned(),
+        None,
     )
     .await;
     match result {
@@ -323,4 +339,202 @@ async fn verified_landing_after_model_click_completes() {
         }
         other => panic!("expected verifier-backed completion, got {other:?}"),
     }
+}
+
+// ---- phase 2: the visual turn ----
+
+/// Navigator spy for the visual turn: records whether a screenshot
+/// accompanied each proposal, then declines.
+struct VisualSpyNavigator {
+    seen_screenshot: Mutex<Vec<bool>>,
+}
+
+impl VisualSpyNavigator {
+    fn new() -> Self {
+        Self {
+            seen_screenshot: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<bool> {
+        self.seen_screenshot.lock().expect("spy lock").clone()
+    }
+}
+
+impl PageNavigator for VisualSpyNavigator {
+    fn next_action(&self, _goal: &str, _elements: &[AxElement]) -> Option<PageAction> {
+        None
+    }
+
+    fn next_action_visual(
+        &self,
+        goal: &str,
+        elements: &[AxElement],
+        _zones: &[Option<PositionZone>],
+        screenshot_jpeg_b64: Option<&str>,
+    ) -> Option<PageAction> {
+        self.seen_screenshot
+            .lock()
+            .expect("spy lock")
+            .push(screenshot_jpeg_b64.is_some());
+        self.next_action(goal, elements)
+    }
+}
+
+#[tokio::test]
+async fn visual_turn_carries_screenshot_when_captured() {
+    let browser = LoopBrowser::new(vec![button(1, "account")], AuthState::Authenticated)
+        .with_screenshot("fake-jpeg-bytes");
+    let navigator = Arc::new(VisualSpyNavigator::new());
+    let _ = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    let seen = navigator.seen();
+    assert!(!seen.is_empty(), "the navigator was consulted");
+    assert!(
+        seen.iter().all(|screenshot| *screenshot),
+        "every turn carried the captured screenshot: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn visual_turn_degrades_to_text_only_without_screenshot() {
+    // `menu_screenshot` returns `None`: the capture failure degrades to
+    // the text-only turn instead of failing the run.
+    let browser = LoopBrowser::new(vec![button(1, "account")], AuthState::Authenticated);
+    let navigator = Arc::new(VisualSpyNavigator::new());
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(IntentError::NoMatch(_))),
+        "the run still misses honestly: {result:?}"
+    );
+    let seen = navigator.seen();
+    assert!(!seen.is_empty(), "the navigator was consulted");
+    assert!(
+        seen.iter().all(|screenshot| !screenshot),
+        "no turn carried a screenshot: {seen:?}"
+    );
+}
+
+// ---- phase 3: escalation ----
+
+fn escalation_of(navigator: Arc<ScriptNavigator>, model_name: &str) -> ModelEscalation {
+    ModelEscalation {
+        navigator,
+        model_name: model_name.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn escalation_runs_once_after_main_miss_and_verifies() {
+    // The main pass declines at once; the escalation pass's click lands
+    // on a token-named URL and the verifier completes the goal.
+    let browser = LoopBrowser::new(vec![button(1, "settings")], AuthState::Authenticated)
+        .with_landing_on_click(1, "https://www.example.com/settings");
+    let main = Arc::new(ScriptNavigator::new(vec![None]));
+    let escalation_navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Click {
+        target: 1,
+    })]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        main.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+        Some(escalation_of(escalation_navigator.clone(), "big-model")),
+    )
+    .await;
+    match result {
+        Ok(PageGoalOutcome::Verified { landed, .. }) => {
+            assert_eq!(landed.path(), "/settings");
+        }
+        other => panic!("expected the escalation pass to verify, got {other:?}"),
+    }
+    assert_eq!(main.calls(), 1, "the main pass ran once");
+    assert_eq!(
+        escalation_navigator.calls(),
+        1,
+        "exactly one escalation pass ran"
+    );
+}
+
+#[tokio::test]
+async fn escalation_miss_journal_names_the_model() {
+    // Both passes decline: the honest miss carries the accumulated
+    // journal, including the escalation line.
+    let browser = LoopBrowser::new(vec![button(1, "harmless")], AuthState::Authenticated);
+    let main = Arc::new(ScriptNavigator::new(vec![None]));
+    let escalation_navigator = Arc::new(ScriptNavigator::new(vec![None]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        main.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+        Some(escalation_of(escalation_navigator.clone(), "big-model")),
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    assert!(
+        diagnostic.contains("escalated to big-model"),
+        "the journal names the escalation model: {diagnostic}"
+    );
+    assert_eq!(main.calls(), 1, "the main pass ran once");
+    assert_eq!(
+        escalation_navigator.calls(),
+        1,
+        "exactly one escalation pass ran"
+    );
+}
+
+#[tokio::test]
+async fn main_verification_never_escalates() {
+    // `Done` with the verifier passing (already signed out): the main
+    // tail completes on evidence — the escalation navigator stays
+    // untouched.
+    let browser = LoopBrowser::new(vec![button(1, "account")], AuthState::LoggedOut);
+    let main = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Done)]));
+    let escalation_navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Click {
+        target: 1,
+    })]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        main,
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+        Some(escalation_of(escalation_navigator.clone(), "big-model")),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(PageGoalOutcome::Verified { .. })),
+        "the main tail verifies on evidence: {result:?}"
+    );
+    assert_eq!(
+        escalation_navigator.calls(),
+        0,
+        "a verified main tail never escalates"
+    );
 }

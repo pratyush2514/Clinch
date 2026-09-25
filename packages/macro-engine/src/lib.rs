@@ -2,24 +2,27 @@
 //! Versioned native-CDP replay with bounded, localized selector healing.
 pub mod executor;
 pub mod navigator;
+pub mod semantic;
 use browser_driver::{
     Action, ActionOutput, BrowserError, Highlight, ManagedBrowser, SelectorIssue, WaitCondition,
 };
 pub use executor::{
     ChromeActionBrowser, ClickedControl, DriftDetail, ExecuteOutcome, FOLLOW_POLL_MS,
     FOLLOW_TIMEOUT_MS, FastReplayMetrics, FollowedResult, IntentError, IntentOutcome,
-    MAX_BATCH_CLICKS, MenuBrowser, MenuOpenBaseline, OpenMenuOutcome, PageGoalOutcome,
-    RESOLVE_COST_USD, ResolveOutcome, ResolvedIntent, SETTLE_POLL_MS, SETTLE_TIMEOUT_MS,
-    SemanticIntent, SettingsBrowser, VerbKind, VerbSpec, VerifierKind,
+    MAX_BATCH_CLICKS, MenuBrowser, MenuOpenBaseline, ModelEscalation, OpenMenuOutcome,
+    PageGoalOutcome, RESOLVE_COST_USD, ResolveOutcome, ResolvedIntent, SETTLE_POLL_MS,
+    SETTLE_TIMEOUT_MS, SemanticIntent, SettingsBrowser, VerbKind, VerbSpec, VerifierKind,
     chrome_action_miss_diagnostic, ensure_at_entry_url, entry_url_mismatched, execute_batch,
     execute_intent, follow_diagnostic, follow_search_result, grounding_diagnostic,
     label_names_profile, open_identity_menu, page_goal_diagnostic, path_names_account,
     pick_rightmost, preview_batch, pursue_account_home, pursue_chrome_action, pursue_page_goal,
     pursue_verb_goal, pursue_with_model, rank_menu_candidates, resolve_batch, resolve_fast,
-    resolve_intent, resolve_with_drift, same_site_host, search_follow_noun, select_menu_button,
-    select_page_control, select_revealed_action, select_search_result, settle_probe_text,
-    tried_label, username_from_href, username_from_menu_text, validate_revealed_href, verb_specs,
-    verify_account_landing, verify_verb, wait_for_settled_candidates,
+    resolve_intent, resolve_with_drift, same_site_host, search_follow_noun,
+    select_already_open_menu_target, select_menu_button, select_page_control,
+    select_revealed_action, select_search_result, semantic_opener_winner, semantic_revealed_target,
+    settle_probe_text, strong_openers, tried_label, username_from_href, username_from_menu_text,
+    validate_revealed_href, verb_specs, verify_account_landing, verify_verb,
+    wait_for_settled_candidates,
 };
 pub use navigator::{MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone, zone_for};
 use serde::{Deserialize, Serialize};

@@ -183,7 +183,7 @@ async fn live_account_home_proof() {
     //    menu opens -> "Profile" link clicked -> /user/kx7 verified via the
     //    account-word path segment and the profile-worded trigger label.
     goto(&browser, &origin, "/").await;
-    match pursue_account_home(&browser, &origin, None).await {
+    match pursue_account_home(&browser, &origin, None, None).await {
         Ok(PageGoalOutcome::Verified {
             label,
             landed,
@@ -199,7 +199,7 @@ async fn live_account_home_proof() {
     // 2. Strongest evidence: the menu reveals a u/ handle and the landing
     //    path carries it.
     goto(&browser, &origin, "/b").await;
-    match pursue_account_home(&browser, &origin, None).await {
+    match pursue_account_home(&browser, &origin, None, None).await {
         Ok(PageGoalOutcome::Verified {
             landed, username, ..
         }) => {
@@ -212,7 +212,7 @@ async fn live_account_home_proof() {
     // 3. The verifier has teeth: the menu claims u/other but the page
     //    landed on /user/kx7 — the username must reappear in the path.
     goto(&browser, &origin, "/c").await;
-    match pursue_account_home(&browser, &origin, None).await {
+    match pursue_account_home(&browser, &origin, None, None).await {
         Err(IntentError::NoMatch(diagnostic)) => {
             assert!(
                 diagnostic.contains("failed verification"),
@@ -226,7 +226,7 @@ async fn live_account_home_proof() {
     //    the probe classifies the guest landing first — zero clicks, the
     //    URL never moves.
     let guest_url = goto(&browser, &origin, "/guest").await;
-    match pursue_account_home(&browser, &origin, None).await {
+    match pursue_account_home(&browser, &origin, None, None).await {
         Ok(PageGoalOutcome::SignedOut) => {}
         other => panic!("signed-out path: expected SignedOut, got {other:?}"),
     }
@@ -240,7 +240,7 @@ async fn live_account_home_proof() {
     // 5. Honest miss: no identity chrome — the diagnostic names what was
     //    actually tried and what happened, never a control dump.
     goto(&browser, &origin, "/nochrome").await;
-    match pursue_account_home(&browser, &origin, None).await {
+    match pursue_account_home(&browser, &origin, None, None).await {
         Err(IntentError::NoMatch(diagnostic)) => {
             assert!(
                 diagnostic.contains("Tried:"),
