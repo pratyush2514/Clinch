@@ -1,6 +1,6 @@
 # Clinch product scope
 
-Owner: Pratyush. Reconciled 2026-09-24 against current code.
+Owner: Pratyush. Reconciled 2026-09-25 against current code.
 
 ## Product purpose
 
@@ -17,18 +17,20 @@ Clinch provides a local desktop workspace for repeatable browser actions, visibl
 7. Land on a bot-mitigation challenge (`open claude for me` hitting Turnstile): the run auto-escalates silently first (off-screen headed, ~30s), then offers a consent-gated session sync from the Companion extension in your daily browser, then hands you a headed managed window to solve it once (Take Control). Only the human fallback is ever visible.
 8. Land signed out on a site you normally use (`open reddit for me` while logged out in Clinch): instead of a bare "completed", the card offers a one-tap sync of your login from the daily browser. Sync once and Clinch keeps its own persistent copy in its profile — signing out in the daily browser does not sign Clinch out. "Forget this site" revokes Clinch's copy at any time.
 9. Enlarge any settled run's final frame with Open Preview: a near-fullscreen browser-chrome view (tab title, URL pill, live/final badge) for reading what the run saw.
+10. Reach your own profile page on the current site (`open my profile on reddit`): the prompt's identity noun takes a generic account-home lane — a bounded walk of the header identity chrome with an auth probe first (a signed-out page is never clicked, and the normal sync offer appears instead), a Rust verifier that confirms the landing from the live page, and identity memory so repeats go straight to the verified URL. Nothing about the site is hardcoded; if the worker cannot verify a destination, the card hands you the window (Take control) instead of guessing. "Forget this site" clears the remembered profile URL along with the cookies.
 
 The task form no longer collects first-run selectors. Backend script planning remains available, but a new workflow name in that form is not enough to record a macro.
 
 ## Implemented product contracts
 
 - Session import requires explicit consent; manual login remains available when import cannot proceed.
-- Session lending (challenge card or auth-sync card) is one-way, domain-scoped, and consent-gated: a tap syncs the site's cookies from the daily browser's Companion extension into Clinch's app-owned profile, preserving the server's exact expiry; the daily browser profile is never attached, copied, or written back. The card shows live bridge state and keeps Sync disabled until a companion attaches; with several companions connected the user picks the source browser. "Forget this site" deletes Clinch's copy of the site's cookies.
+- Session lending (challenge card or auth-sync card) is one-way, domain-scoped, and consent-gated: a tap syncs the site's cookies from the daily browser's Companion extension into Clinch's app-owned profile, preserving the server's exact expiry; the daily browser profile is never attached, copied, or written back. The card shows live bridge state and keeps Sync disabled until a companion attaches; with several companions connected the user picks the source browser. "Forget this site" deletes Clinch's copy of the site's cookies and any remembered identity row for the origin.
 - Browser execution happens locally in a separate managed Chromium process. The preview is an image surface, not an interactive embedded browser. Background work runs off-screen headed with no visible window; the human fallback (Take Control) is the only path that puts a window on screen.
 - Saved macro replay avoids planning calls when selectors resolve. Optional intent parsing and task selector repair may invoke configured adapters. Direct-open routing may invoke the fenced domain grounder (Groq/Ollama, env-configured); it returns only a bare domain, validated in Rust before navigation, and declines cleanly when unconfigured or offline.
 - Legacy click/fill/submit actions and semantic intents require approvals. There is no universal risk-classification engine.
 - Tasks persist checkpoints and stop on uncertainty; interrupted tasks are not automatically resumed.
 - Playbooks persist their step definitions in SQLite. Completed-run save keys are temporary session state, capped at 32 entries.
+- Identity memory is an automatically written observed fact (a profile URL the live page revealed on a successful account-home run), re-validated against the live landing on every recall — never a guessed destination — and revoked by "Forget this site".
 - Native task file actions resolve stored paths within the completed run's download directory.
 
 ## Measurement and acceptance

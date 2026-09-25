@@ -29,13 +29,6 @@ export type SessionStatus =
   | { state: "cookies_imported"; count: number }
   | { state: "manual_login"; reason: string | null };
 
-export type SyncRequest = {
-  browser: string;
-  profile: string;
-  portalUrl: string;
-  consent: boolean;
-};
-
 /** Portal address plus a `ReauthReason`; never a secret. */
 export type AuthPanelState = { portal: string; reason: string };
 
@@ -44,9 +37,7 @@ export type ContextStatus = { attached: boolean; headless: boolean };
 /** No `rename_all` on the Rust struct, so the id stays snake_case. */
 export type ScreencastFrame = { data: string; session_id: number };
 
-export type Viewport = { data: string; width: number; height: number };
-
-export type Highlight = {
+type Highlight = {
   selector: string;
   x: number;
   y: number;
@@ -72,7 +63,7 @@ export type PlaybookApproval = {
   candidates: CandidatePreview[];
 };
 
-export type SequencePhase = "started" | "running" | "completed" | "blocked";
+type SequencePhase = "started" | "running" | "completed" | "blocked";
 
 export type PlaybookEvent = {
   runId: number;
@@ -171,9 +162,9 @@ export type Action =
   | { type: "download_links"; selector: string }
   | { type: "fill"; selector: string; value: string };
 
-export type WaitCondition = { selector: string; timeoutMs: number } | null;
+type WaitCondition = { selector: string; timeoutMs: number } | null;
 
-export type TaskState =
+type TaskState =
   | "planned"
   | "running"
   | "needs_repair"
@@ -181,7 +172,7 @@ export type TaskState =
   | "failed"
   | "interrupted";
 
-export type StepState =
+type StepState =
   | "pending"
   | "running"
   | "completed"
@@ -189,7 +180,7 @@ export type StepState =
   | "failed"
   | "interrupted";
 
-export type DownloadedFile = { path: string; bytes: number };
+type DownloadedFile = { path: string; bytes: number };
 
 export type Task = {
   id: number;

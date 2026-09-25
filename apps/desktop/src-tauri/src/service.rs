@@ -1298,7 +1298,7 @@ impl AppService {
         {
             self.journal_line(format!("session_lend_failed: {host} · identity mismatch"))
                 .await;
-            return failed("The managed browser is no longer attached.");
+            return failed("The session could not be applied: browser identity mismatch.");
         }
         let count = session.cookies.len();
         // Persistent injection: the server's `expires` is preserved, so

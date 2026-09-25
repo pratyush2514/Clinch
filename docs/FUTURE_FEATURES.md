@@ -30,7 +30,7 @@ The generic download task and semantic executor are foundations, not completed v
 - Native-app automation through platform accessibility APIs.
 - Background notifications and proactive reminders. Messaging integrations require separate implementation and current provider review; no pricing or effort estimate is asserted here.
 - Household administration: warranty/receipt ingestion, renewal tracking, and subscription workflows. Email/bank connections would be new integrations with separate consent and data-handling contracts.
-- Long-running goals above playbooks, with their own state, scheduling, and review controls. There is no Goal model or check-in scheduler today.
+- Long-running goals above playbooks, with their own state, scheduling, and review controls. There is no Goal model or check-in scheduler today. (`GoalClass` in the orchestration engine is unrelated: it is a closed table of *in-page task kinds* — "profile"/"account" → account-home — used to dispatch in-page follow-ups, not a user-goal system.)
 - Mobile notifications or approval relay. Local approval remains the existing mechanism; remote authorization would require a separately designed trust boundary.
 
 These ideas must not be used to infer existing APIs, dependencies, guarantees, or implementation completeness.

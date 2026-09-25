@@ -415,12 +415,11 @@ fn groq_error_code(excerpt: &str) -> Option<String> {
 /// Extract the `domain` field from a grounder's strict-JSON response.
 ///
 /// Accepts `{"domain": "amazon.in"}` with optional surrounding whitespace or
-/// ```json fences (models wrap fenced output even when told not to); extra
+/// markdown fences (models wrap fenced output even when told not to); extra
 /// fields are ignored. Anything else — prose, a bare domain, a missing or
 /// non-string `domain` — is `None`, and the ladder degrades to its next
 /// rung. This parses only; [`crate::route_proposer::validate_grounded_domain`]
 /// decides whether the domain may be navigated.
-/// Pull the `domain` slot out of one JSON object string.
 fn parse_domain(object: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(object).ok()?;
     value.get("domain")?.as_str().map(str::to_owned)

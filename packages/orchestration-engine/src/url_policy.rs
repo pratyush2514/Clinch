@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn url_policy_allows_grounded_search_but_rejects_its_abuse() {
-        // Tier 5 template host passes; credentials and non-https fail even
+        // Tier 4 template host passes; credentials and non-https fail even
         // on the search host, and lookalikes never pass.
         assert!(
             validate_proposed_url("https://www.google.com/search?q=open+amazon+for+me").is_ok()

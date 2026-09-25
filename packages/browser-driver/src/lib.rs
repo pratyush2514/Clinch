@@ -590,10 +590,6 @@ impl ManagedBrowser {
     /// # Errors
     /// Reports rejected or timed-out commands; never marks partial import successful.
     pub async fn inject(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
-        self.inject_inner(cookies).await
-    }
-
-    async fn inject_inner(&self, cookies: &[Cookie]) -> Result<(), BrowserError> {
         for cookie in cookies {
             let params = cookie_params(cookie)?;
             // Current CDP returns an empty result on success and a protocol error on failure.

@@ -1,6 +1,6 @@
 # Clinch implementation status
 
-Reconciled on 2026-09-24 against the current working tree. Code is the source of truth. This file summarizes that code; it does not supersede it.
+Reconciled on 2026-09-25 against the current working tree. Code is the source of truth. This file summarizes that code; it does not supersede it.
 
 ## Implemented
 
@@ -21,6 +21,8 @@ Reconciled on 2026-09-24 against the current working tree. Code is the source of
 - Direct-open entry routing with no curated route table: explicit domain in the prompt → account directory (unwired) → LLM intent adapter (unwired) → direct-open grounding ladder **(saved site shortcut → structured site directory → fenced domain grounder)** → honest miss, with a grounded search fallback only for non-direct opens. The directory rung is composite: Brave Search API when `CLINCH_BRAVE_API_KEY` is set, keyless DuckDuckGo HTML as the zero-config fallback, ranked results parsed in memory — the browser never sees a search page. The domain grounder resolves a site name to a bare domain through Groq (`CLINCH_GROUNDER_PROVIDER=groq`, key from `GROQ_API_KEY`, zeroized on drop) or local Ollama (`CLINCH_GROUNDER_PROVIDER=ollama`); unset or offline configuration declines to the next rung. Only the site slot and region hint leave the machine, and the call is time-bounded (15s).
 - Post-landing consent-gated shortcut card: after a grounded navigation succeeds, the Action Thread offers to save `site → URL`. Saving persists a SQLite site shortcut that later runs resolve with zero model calls. Nothing is written without the explicit save; declining writes nothing.
 - Backend metrics for run status, task replay share, and session outcomes.
+- **In-page account-home goal.** Identity artifact nouns ("my profile", "my account") map to a generic `GoalClass::AccountHome` — a closed noun table, never site names, URL templates, or selectors. A follow-up on the live portal takes an already-on-origin fast path (the routing ladder is skipped and journaled); a cold prompt lands the grounded site first. `dispatch_in_page_goal` journals `in_page_goal_class: account_home`, then memory, then the chrome worker, then the verifier. Identity memory (`identity_memory` table, origin + goal class upsert) recalls a page-verified profile URL: www/case-normalized, https-only, credential-rejecting, same-site validated against the live landing (`in_page_goal_memory: hit/miss/stale` journal lines). The bounded 3-click chrome worker probes auth first — a signed-out page short-circuits and clicks nothing — opens the header identity control with an untruncated AX snapshot (a revealed menu renders past the 300-element head cap), and the Rust verifier demands same-site, non-root, and the revealed username when one was read (`in_page_goal_memory: write` on success). Stable click identity (normalized role + name, surviving backend-node-id churn) excludes retried controls in both pursue lanes; click-effect diagnostics (raw AX node counts, actionable before→after, newly revealed controls) and the deterministic tried-log ride along to the optional model fallback, which never verifies by itself. A miss yields FAILED with a "Take control" button on the card (gated on the `account-home:` journal prefix), handing the still-on-portal window to the user via the existing take-control command. "Forget this site" clears the remembered identity row alongside the profile's cookies; the daily browser is never touched.
+- **Origin www-folding.** `same_site_origin` treats `www.` as an alias in either direction (folded, not ignored), with scheme and port still strict and other subdomains (e.g. `mail.`) NOT folded. It governs the portal drift check, Navigate validation, `check_origin`, and `detect_auth_signal`; the identity memory and account-home verifier fold the same way. Previously, a grounded bare-domain route against a live www page blinded the worker, the auth probe, and the model fallback at once.
 - macOS CI in [.github/workflows/check.yml](../.github/workflows/check.yml).
 
 ## Important implementation distinctions
@@ -38,17 +40,19 @@ Reconciled on 2026-09-24 against the current working tree. Code is the source of
 
 ## Verification for this documentation reconciliation
 
-Executed on this Linux VM on 2026-09-24:
+Executed on this Linux VM on 2026-09-25 (code-verified, not live-run by this pass):
 
-- `cargo test --workspace`: 303 passed / 0 failed (one transient hit of the known pre-existing SQLite flake `test_persist_ephemeral_run_to_playbook_and_replay`, green on retry; it fails ~20% of runs with `SqliteError code 14` and is unrelated to recent features).
-- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- `cargo fmt --all --check`: clean.
-- `npx tsc --noEmit`: clean.
-- `npm run build`: clean.
-- `vitest`: 38 passed / 0 failed.
-- Local Markdown links and fenced code blocks: checked across the product documentation files; all local links resolve.
+- Code paths above were traced to source: `apps/desktop/src-tauri/src/service.rs` (`dispatch_in_page_goal`, `dispatch_account_home_goal`, `recall_account_home`, `navigate_remembered_identity`, `forget_site_session`), `packages/orchestration-engine/src/goal_class.rs`, `packages/macro-engine/src/executor.rs` (`pursue_account_home`, `pursue_identity_chrome`, `ClickedControl`, `same_site_host`, `verify_account_landing`), `packages/browser-driver/src/lib.rs` (`same_site_origin`), `packages/browser-driver/src/a11y.rs` (`ax_snapshot_untruncated`, `interactive_elements_all`), `packages/playbook-store/src/lib.rs` (`identity_memory` CRUD), `apps/desktop/src/components/ActionCard.tsx` + `apps/desktop/src/lib/errors.ts` (`isPursuitMiss` gate on the Take-control miss button).
 
-The earlier verification pass (2026-09-22) was executed locally on Windows and is kept for its Windows-specific coverage; the 2026-09-24 pass above ran on Linux. Neither pass ran real Chromium fixtures against live portals, live model calls, personal-profile import, rendered UI testing, authenticated portal flows, cargo audit, installer builds, or macOS runtime checks.
+The 2026-09-24 Linux verification pass (303 tests / clippy / fmt / tsc / build / 38 vitest, one transient hit of the known pre-existing SQLite flake `test_persist_ephemeral_run_to_playbook_and_replay`, green on retry) remains the most recent full-suite run executed by this reconciliation. The account-home implementation was separately reported (2026-09-25, Linux sandbox) as `cargo test --workspace` 403 passed / 0 failed (one flake hit, green on retry), clippy and fmt clean, plus `tsc --noEmit` and `vitest` 40/40 — reported by the implementation loop, not re-executed here. The earlier verification pass (2026-09-22) was executed locally on Windows and is kept for its Windows-specific coverage. No pass ran real Chromium fixtures against live portals, live model calls, personal-profile import, rendered UI testing, authenticated portal flows, cargo audit, installer builds, or macOS runtime checks.
+
+## Live-proven on native Windows, 2026-09-25
+
+- "open my profile on reddit" COMPLETED twice on build `10016872`: first run ~9s landing on the real profile (u/MangoTree-1233), second run ~4.9s — consistent with an identity-memory hit, but the write→hit is inferred from timing, not journal-confirmed.
+
+## Implemented, not yet live-proven
+
+- Signed-out zero-click short-circuit, the Take-control button on an account-home miss, Forget-site clearing the remembered identity row, multi-run identity-memory recall, and the generic noun-pursuit regression path have tests but no live Windows runs yet.
 
 Historical test counts, fixture timings, audit-warning totals, and earlier browser-tool failures have been removed rather than presented as current evidence.
 

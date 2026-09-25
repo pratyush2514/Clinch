@@ -274,8 +274,9 @@ fn is_noise_token(token: &str) -> bool {
         return true;
     }
     // Cents-only groups (`00` from `$4.00`) never identify alone: they let
-    // `$4` match `$4.00` and vice versa via the surviving `4` token.
-    if !token.is_empty() && token.chars().all(|c| c == '0') {
+    // `$4` match `$4.00` and vice versa via the surviving `4` token. Empty
+    // tokens already returned above, so no emptiness re-check is needed.
+    if token.chars().all(|c| c == '0') {
         return true;
     }
     false
@@ -1288,8 +1289,9 @@ pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
         PAGE_GOAL_ROLES.contains(&element.role.as_str())
             && !already_clicked(clicked, element)
             && !previously_seen.contains(&element.backend_node_id)
+            // `mentions_noun` expands "profile" to {"profile", "account"}
+            // via NOUN_SYNONYMS, so one call covers both words.
             && (mentions_noun(element, "profile")
-                || mentions_noun(element, "account")
                 || username_from_menu_text(&element.name).is_some())
     })
 }
@@ -1586,7 +1588,7 @@ async fn pursue_with_model(
         })
         .await
         .map_err(|_| {
-            IntentError::NoMatch("navigator task failed; {deterministic_miss}".to_string())
+            IntentError::NoMatch(format!("navigator task failed; {deterministic_miss}"))
         })?;
         match action {
             None => {
@@ -1664,7 +1666,7 @@ pub fn select_page_control<'a>(
 /// first: banner/navigation landmarks (avatars, user menus), then a closed
 /// class of account-menu words for headers that carry no landmark (avatar
 /// buttons named after the username, web-component headers), and — only in
-/// the async [`select_topmost_button`] — live geometry as a last resort.
+/// the async [`select_rightmost_button`] — live geometry as a last resort.
 /// Already-clicked nodes are skipped.
 #[must_use]
 pub fn select_menu_button<'a>(

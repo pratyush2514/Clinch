@@ -41,7 +41,7 @@ import {
 /** Remembers the last task so a relaunch can restore what it produced. */
 const LAST_TASK_KEY = "clinch-last-task";
 
-export type ThreadApi = {
+type ThreadApi = {
   entries: ThreadEntry[];
   /** True while any entry is still running or waiting on a decision. */
   running: boolean;

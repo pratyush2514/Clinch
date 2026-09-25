@@ -300,7 +300,6 @@ fn render_elements(
     elements: &[browser_driver::AxElement],
     zones: &[Option<PositionZone>],
 ) -> String {
-    let unzoned: Option<PositionZone> = None;
     elements
         .iter()
         .take(MAX_NAVIGATOR_ELEMENTS)
@@ -316,7 +315,6 @@ fn render_elements(
                 .get(index)
                 .copied()
                 .flatten()
-                .or(unzoned)
                 .map(|zone| format!(" [{zone}]"))
                 .unwrap_or_default();
             format!(

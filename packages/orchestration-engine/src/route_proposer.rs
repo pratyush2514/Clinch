@@ -17,12 +17,14 @@
 //! 4. LLM fallback, only with a configured adapter — and its output is
 //!    untrusted input, validated like every other tier.
 //! 5. Direct-open grounding ladder, only for high-confidence single-target
-//!    opens (`open amazon`): a user-saved site shortcut, then a fenced
-//!    domain grounder (site slot + region hint → bare domain, validated in
-//!    Rust), then a structured site directory (Brave Search API) when a key
-//!    is configured. An ungrounded site is a miss the UI can act on — it
-//!    never falls through to the search template, because a guessed SERP
-//!    click is worse than asking.
+//!    opens (`open amazon`): a user-saved site shortcut, then a structured
+//!    site directory (Brave Search API when keyed, keyless `DuckDuckGo`
+//!    otherwise), then a fenced domain grounder (site slot + region hint →
+//!    bare domain, validated in Rust). An ungrounded direct open is a miss
+//!    the UI can act on — it never falls through to the search template,
+//!    because a guessed SERP click is worse than asking. In-page goals
+//!    (site + artifact noun) ground only the site through the same ladder
+//!    and may fall through to tier 6 when no rung knows it.
 //! 6. Grounded search-and-follow — fixed `https://www.google.com/search?q=…`
 //!    template over the raw prompt. Never guesses TLDs; the dispatcher
 //!    navigates to the search page and grounds the destination host from a
@@ -34,16 +36,21 @@
 //! meaningful, and both of its jobs are now covered — proven routes by
 //! tier 1, unknown ones by tiers 2, 5, and 6.
 //!
-//! Every tier's output passes through URL validation. Tiers 2, 3, and 5
-//! propose URLs the machine invented, so they face the host allowlist
-//! ([`crate::url_policy::validate_proposed_url`]). Tier 4 is
-//! user-directed — the user named the destination or the site — so it
-//! faces structural validation only (https, no credentials, parseable):
-//! [`crate::url_policy::validate_user_directed_url`]. Any validation
-//! failure returns `None` immediately — a corrupt tier never falls through
-//! to a weaker one. The search tier only runs when no stronger tier
-//! proposed anything; an invalid stronger proposal still fails closed
-//! without falling through.
+//! Validation follows provenance, not tier order. User-directed targets —
+//! the typed domain (tier 2), saved shortcuts, and the site-directory and
+//! grounder hits (tier 5), where the user named the site and the machine
+//! only resolved the name — face structural validation only (absolute
+//! `https`, no credentials, parseable):
+//! [`crate::url_policy::validate_user_directed_url`]. Machine-invented
+//! targets — the account entity (tier 3), the LLM fallback (tier 4), and
+//! the grounded search template (tier 6) — face the host allowlist:
+//! [`crate::url_policy::validate_proposed_url`]. The grounder output
+//! additionally passes [`validate_grounded_domain`] first, so it is a
+//! Rust-checked bare domain before it becomes a URL at all. Any
+//! validation failure returns `None` immediately — a corrupt tier never
+//! falls through to a weaker one. The search tier only runs when no
+//! stronger tier proposed anything; an invalid stronger proposal still
+//! fails closed without falling through.
 //!
 //! # Slot resolution runs alongside URL resolution
 //!

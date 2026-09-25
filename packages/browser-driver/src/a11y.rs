@@ -49,7 +49,8 @@ const MAX_CONTAINER_ITEM_LEN: usize = 100;
 /// batch collection can tell page chrome apart from data rows. `None`
 /// otherwise. Single-intent grounding ignores it — nav links stay
 /// resolvable on their own.
-/// `LANDMARK_ROLES` is shared with `macro-engine`'s batch exclusion.
+/// `LANDMARK_ROLES` is mirrored (duplicated, not imported) by
+/// `macro-engine`'s batch exclusion, so each side's set can evolve alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AxElement {

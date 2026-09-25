@@ -15,7 +15,7 @@ import { message } from "../lib/errors";
 
 const DORMANT: ContextStatus = { attached: false, headless: true };
 
-export type Screencast = {
+type Screencast = {
   status: ContextStatus;
   /** Latest JPEG frame as base64, or `null` before the first one arrives. */
   frame: string | null;

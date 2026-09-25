@@ -17,11 +17,11 @@
 import type { Action, CandidatePreview, PlaybookApproval, TaskGate } from "./ipc";
 
 /** Which resolution tier answered, for the provenance pill. */
-export type Tier = "playbook" | "search";
+type Tier = "playbook" | "search";
 
-export type EntryStatus = "running" | "awaiting" | "completed" | "blocked" | "failed";
+type EntryStatus = "running" | "awaiting" | "completed" | "blocked" | "failed";
 
-export type Lane = "playbook" | "task";
+type Lane = "playbook" | "task";
 
 /**
  * A pending Sentinel Gate, normalized across lanes. `runId` is the playbook
@@ -73,7 +73,7 @@ export type EntryResult = {
   save: SaveTarget | null;
 };
 
-export type StepProgress = { index: number; phase: string };
+type StepProgress = { index: number; phase: string };
 
 export type ThreadEntry = {
   id: string;

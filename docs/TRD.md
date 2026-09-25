@@ -1,6 +1,6 @@
 # Clinch technical contracts
 
-Reconciled against working-tree code on 2026-09-24. Implementation references below take precedence over this summary.
+Reconciled against working-tree code on 2026-09-25. Implementation references below take precedence over this summary.
 
 ## Desktop and browser
 
@@ -33,7 +33,7 @@ Session lending is the consent-gated, one-way (daily browser → Clinch managed 
 - **Origin-aware verification:** `SessionLendOrigin::{Challenge, GuestLanding}` tags the lend. A challenge lend re-probes the gate after re-navigation (cleared → challenge done, else `persistent`); a guest-landing lend re-probes auth state (`synced (persisted)` on `AuthState::Authenticated`, else `not synced`). A later run whose probe sees a logged-out landing brings the sync offer back — self-healing.
 - **Identity:** the managed browser mirrors the source user-agent before injection; a mismatched UA aborts the lend.
 - **Failure semantics:** every exit journals exactly one `session_lent:`/`session_lend_failed:` line with host and cookie counts only. Zero cookies from the companion keeps the card with a "no usable cookies" reason (it does not prove the daily browser is logged out). Failure reasons map to static user-facing labels: extension not connected, extension timed out, no cookies for the portal, injection failure, re-navigation failure.
-- **Revocation:** `forget_site_session` deletes the host's cookies from Clinch's app-owned profile through CDP, journaling host and cookie count, and returns the card to the signed-out offer. It never touches the daily browser.
+- **Revocation:** `forget_site_session` deletes the host's cookies from Clinch's app-owned profile through CDP, journaling host and cookie count, and returns the card to the signed-out offer. It also deletes every remembered identity row for that origin (`identity_forgotten: <host> · <n> remembered profile(s) cleared`), matching www and bare forms, so a signed-out origin is never navigated from a stale profile. It never touches the daily browser.
 
 The manual `bridge_sync` path (user-named portal sync through the interactive lane) keeps its own contract: request first (a missing companion fails fast without opening a window), visible headed browser because the landing may need the user to finish a login or challenge, UA mirroring before injection.
 
@@ -65,6 +65,20 @@ Ephemeral command parsing separately supports `CLINCH_INTENT_PROVIDER` and `CLIN
 
 No provider executable is sandboxed by these contracts. The domain grounder is a built-in provider path rather than a subprocess adapter: `CLINCH_GROUNDER_PROVIDER=groq` uses Groq's chat API with the key from `GROQ_API_KEY` (zeroized on drop), `=ollama` talks to the local daemon; only the site slot and region hint leave the machine, and the call is time-bounded. There is no per-run egress dashboard.
 
+## Origin comparison contract
+
+`same_site_origin` (`browser-driver/src/lib.rs`) is the single origin-equality rule for the portal drift check (`is_anchored_drift`), `Action::Navigate` validation, `ManagedBrowser::check_origin`, and `detect_auth_signal`. A leading `www.` folds in either direction — `https://www.reddit.com` and `https://reddit.com` are the same site — while scheme and port compare strictly and every other subdomain stays distinct (`mail.example.com` ≠ `example.com`). Case is folded. The identity-memory keys and the account-home host comparisons fold the same way (a host-level variant, `same_site_host`, for the verifier and recall validation), so a grounded bare-domain route against a live www page no longer blinds the worker, the auth probe, and the model fallback at once.
+
+## Account-home identity contracts
+
+The account-home lane (`packages/macro-engine/src/executor.rs`, `goal_class.rs`; dispatch in `service.rs`) is the generic way identity artifact nouns reach the signed-in user's page on the current origin. It contains no site names, no URL templates, no selectors, and no usernames.
+
+- **Goal class:** `goal_class_for` is a closed mapping over artifact nouns: `profile` and `account` map to `GoalClass::AccountHome` (key `account_home`); every other noun keeps the generic noun-hunt path. `dispatch_in_page_goal` journals `in_page_goal_class: account_home` on the branch.
+- **Identity memory:** `identity_memory(origin, goal_class, username, href, source)` is an observed fact — a profile URL the live page revealed — upserted automatically on verifier success and announced in the journal (`in_page_goal_memory: write <origin> <class_key>`). Keys are www-stripped and lowercased (`normalize_identity_origin`); goal class and source are normalized the same way. Recall journals `in_page_goal_memory: hit <href>` / `miss` / `stale → rediscover`, and a stale row is deleted. A recalled href is navigation-only data: it must be an absolute `https` URL with a non-root path, must carry no embedded credentials, must be same-site with the portal host, and — when a username was recorded — the username segment must survive both the recall and the live landing, otherwise the row is treated as stale and the live worker runs. Remembered facts are never sent to model adapters; they only steer navigation.
+- **Pursuit:** `pursue_account_home` first probes auth — a `LoggedOut` page returns `SignedOut` with zero clicks (`in_page_goal_signed_out`), and the settle-time auth probe renders the normal lend card. The deterministic chrome worker is bounded to 3 clicks (`IDENTITY_MAX_CLICKS`): open the header identity control, quiet-wait for the revealed layer, take the page-revealed profile destination (Rust-validated href when the page offers one, else a click with an observed URL change). Revealed candidates must be genuinely new since the previous snapshot and require at least one opened control, so author links on a bare page never qualify. Retry exclusion uses `ClickedControl` — normalized role + trimmed lowercase name — in both the deterministic and model lanes; backend node ids churn on re-renders and are never the identity. Click effects journal as `<role> '<name>' → +N new […] (raw AX nodes N → M)` or `→ no new controls (actionable N → M; raw AX nodes N → M)`; the model lane keeps the truncated AX slice while the worker's re-snapshot uses `interactive_elements_all` / `ax_snapshot_untruncated`. The deterministic tried-log is appended to the model prompt when a navigator is armed.
+- **Verifier:** `verify_account_landing` re-reads the live URL after navigation. With a page-revealed username it requires same-site, non-root, and the username segment in the path; without one it requires same-site, non-root, and either an account-naming path or a profile/account-worded trigger control. A click alone never verifies; an unverifiable landing fails the run, never the page.
+- **Miss recovery:** the miss diagnostic names only what the worker actually tried (never a control dump). The FAILED card shows "Take control" gated on `isPursuitMiss` — the error code `workflow_failed` plus the `account-home:` journal prefix — calling the existing `take_control` command with no new IPC.
+
 ## Playbooks and semantic execution
 
 [Playbook schema](../packages/playbook-store/src/schema.rs) version 1 contains name, origin, steps, and optional description. Limits are 100 steps, 64 ASCII name bytes, and 280 UTF-8 description bytes. Steps are legacy_selector (action and wait) or semantic (intent). The database stores the envelope in steps_json and upserts by name; legacy descriptions are migrated additively.
@@ -81,7 +95,7 @@ Legacy click/fill/submit and semantic intent execution require explicit decision
 
 Task approvals write sentinel_decisions before execution. Playbook decisions use session_events text. The preview_approval/resolve_approval demo is separate from execution gates. No configurable risk tiers or ATS-specific submission feature exists.
 
-Database tables include session_events, playbooks, runs, signature_history, entry_urls, tasks, task_checkpoints, and sentinel_decisions. Tasks have durable step checkpoints; playbook runs have summary journaling, not equivalent restart/resume semantics. Some journal writes are best effort.
+Database tables include session_events, playbooks, runs, signature_history, entry_urls, identity_memory, tasks, task_checkpoints, and sentinel_decisions. Tasks have durable step checkpoints; playbook runs have summary journaling, not equivalent restart/resume semantics. Some journal writes are best effort.
 
 Completed command-bar save keys are held in memory (32-entry cap) and consumed by save_run_as_workflow. Playbook persistence is durable; the key registry is not. TaskWorkspace saves legacy steps through save_playbook instead.
 
