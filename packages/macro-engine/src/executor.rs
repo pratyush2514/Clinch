@@ -9,7 +9,9 @@
 //! here, and no candidate is ever vetoed for partial container text: weak
 //! evidence lowers a score, never disqualifies.
 
-use browser_driver::{AuthState, AxElement, Highlight, ManagedBrowser, Mark};
+use browser_driver::{
+    AuthState, AxElement, AxResyncCheck, BrowserError, Highlight, ManagedBrowser, Mark,
+};
 use serde::{Deserialize, Serialize};
 
 /// What a Playbook step wants, in words. Role and label are required: a bare
@@ -1133,8 +1135,16 @@ async fn pursue_identity_chrome(
     // already on the page, so without this the worker clicks the header
     // chrome itself as the profile destination and burns its click budget.
     let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Total click budget across both click kinds. The shared menu
+    // primitive retries internally now (up to MENU_OPEN_MAX_TRIES per
+    // call), so the loop counts every click it spends — menu-opening or
+    // revealed-destination — against IDENTITY_MAX_CLICKS instead of
+    // assuming one click per iteration. A menu Miss ends the worker: the
+    // primitive already re-snapshotted and re-ranked between attempts, so
+    // re-looping would only re-examine candidates it exhausted.
+    let mut clicks_used: usize = 0;
 
-    for _ in 0..IDENTITY_MAX_CLICKS {
+    while clicks_used < IDENTITY_MAX_CLICKS {
         // Full snapshot, not the navigator slice: a revealed menu renders
         // at the end of the document (React portal), past the 300-element
         // head truncation — the capped view reported "no new controls"
@@ -1166,6 +1176,7 @@ async fn pursue_identity_chrome(
             // No usable href: click the revealed control and watch the URL.
             click_element(browser, target).await?;
             clicked.push(ClickedControl::of(target));
+            clicks_used += 1;
             tried.push(tried_label(target, "clicked, watching URL"));
             if let Some(landed) = wait_for_url_change(browser).await {
                 let username = username_from_menu_text(&label);
@@ -1176,22 +1187,40 @@ async fn pursue_identity_chrome(
             continue;
         }
 
-        // 2. No revealed destination: open the next identity control via
-        // the shared menu primitive — one attempt per iteration so the
-        // IDENTITY_MAX_CLICKS budget keeps its per-click meaning — then
-        // loop and re-snapshot against the new tree.
+        // 2. No revealed destination: spend the remaining budget on the
+        // shared menu primitive in a single call — its internal
+        // click → poll-for-evidence → re-rank loop supersedes the old
+        // one-attempt-per-iteration shape, and a Miss means its
+        // candidates are exhausted against fresh snapshots, so the
+        // worker stops instead of re-looping.
         let baseline = MenuOpenBaseline {
             elements: &elements,
             check: &check_before,
         };
-        match open_identity_menu(browser, origin, baseline, &mut clicked, 1).await? {
-            OpenMenuOutcome::Opened { tried: line, .. } => tried.push(line),
-            OpenMenuOutcome::Miss { tried: lines } => {
-                if lines.is_empty() {
-                    break;
-                }
-                tried.extend(lines);
+        let clicks_before = clicked.len();
+        let opened = match open_identity_menu(
+            browser,
+            origin,
+            baseline,
+            &mut clicked,
+            (IDENTITY_MAX_CLICKS - clicks_used).min(MENU_OPEN_MAX_TRIES),
+        )
+        .await?
+        {
+            OpenMenuOutcome::Opened { tried: line, .. } => {
+                tried.push(line);
+                true
             }
+            OpenMenuOutcome::Miss { tried: lines } => {
+                tried.extend(lines);
+                false
+            }
+        };
+        // The primitive records every attempt in `clicked`: the spend
+        // counts whether or not a menu opened.
+        clicks_used += clicked.len() - clicks_before;
+        if !opened {
+            break;
         }
         previously_seen = currently_seen;
     }
@@ -1249,10 +1278,70 @@ pub struct MenuOpenBaseline<'a> {
     pub check: &'a browser_driver::AxResyncCheck,
 }
 
+/// Async browser seam for the shared identity-menu primitive
+/// ([`open_identity_menu`]): the CDP operations one menu-open attempt
+/// needs. [`ManagedBrowser`] is the production implementation; tests
+/// drive the click → poll → evidence loop against a scripted fake, so
+/// the retry and timing behavior is proven with no Chromium.
+pub trait MenuBrowser {
+    /// Viewport CSS dimensions `(width, height)`; `None` fails the
+    /// header-geometry candidate tiers closed.
+    fn menu_viewport_size(&self) -> impl std::future::Future<Output = Option<(f64, f64)>> + Send;
+    /// Viewport rectangle for a backend node id; errors (hidden or stale
+    /// nodes) exclude the control from the geometry tiers.
+    fn menu_node_rect(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Result<Highlight, BrowserError>> + Send;
+    /// Full interactive-element list without head truncation, plus the
+    /// resync check carrying the raw AX node count.
+    fn menu_snapshot(
+        &self,
+        origin: &url::Url,
+    ) -> impl std::future::Future<Output = (Vec<AxElement>, AxResyncCheck, u64)> + Send;
+    /// Best-effort `aria-expanded` of the clicked control; `None` means
+    /// unknown and is never evidence.
+    fn menu_node_expanded(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Option<bool>> + Send;
+    /// Click the control (rect resolve, mark, press).
+    ///
+    /// # Errors
+    /// Returns [`IntentError::Browser`] on CDP failure.
+    fn menu_click(
+        &self,
+        element: &AxElement,
+    ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send;
+}
+
+impl MenuBrowser for ManagedBrowser {
+    async fn menu_viewport_size(&self) -> Option<(f64, f64)> {
+        self.viewport_size().await
+    }
+
+    async fn menu_node_rect(&self, backend_node_id: i64) -> Result<Highlight, BrowserError> {
+        self.node_rect(backend_node_id).await
+    }
+
+    async fn menu_snapshot(&self, origin: &url::Url) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        self.ax_snapshot_untruncated(origin).await
+    }
+
+    async fn menu_node_expanded(&self, backend_node_id: i64) -> Option<bool> {
+        self.node_expanded(backend_node_id).await
+    }
+
+    async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
+        click_element(self, element).await.map(|_| ())
+    }
+}
+
 /// Per-invocation click cap for the shared menu primitive: one candidate
-/// per try, each effect-verified. Callers with their own per-iteration
-/// budgets (the identity lane) pass a smaller `max_tries`; the primitive
-/// never exceeds this cap, so a hostile header can't burn the run.
+/// per try, each effect-verified. Callers pass their own remaining
+/// budget (the identity lane passes its `IDENTITY_MAX_CLICKS` remainder);
+/// the primitive never exceeds this cap, so a hostile header can't burn
+/// the run.
 const MENU_OPEN_MAX_TRIES: usize = 3;
 
 /// Ordered menu-opening candidates, pure decision: (a) landmarked
@@ -1337,8 +1426,8 @@ pub fn rank_menu_candidates<'a>(
 /// for every unclicked button, feeding [`rank_menu_candidates`] tiers
 /// (c) and (d). `node_rect` rejects degenerate (hidden) boxes, so
 /// invisible controls never qualify.
-async fn header_button_rects(
-    browser: &ManagedBrowser,
+async fn header_button_rects<B: MenuBrowser>(
+    browser: &B,
     elements: &[AxElement],
     clicked: &[ClickedControl],
 ) -> Vec<(i64, f64, f64)> {
@@ -1347,7 +1436,7 @@ async fn header_button_rects(
         .iter()
         .filter(|element| element.role == "button" && !already_clicked(clicked, element))
     {
-        if let Ok(highlight) = browser.node_rect(element.backend_node_id).await {
+        if let Ok(highlight) = browser.menu_node_rect(element.backend_node_id).await {
             rects.push((element.backend_node_id, highlight.x, highlight.y));
         }
     }
@@ -1390,69 +1479,218 @@ fn menu_open_effect(
     (opened, effect)
 }
 
-/// Shared menu-opening primitive for both in-page lanes. Tries the
-/// ordered [`rank_menu_candidates`] (landmarked → account-worded →
-/// unlabeled-in-header → rightmost-in-header), one click per candidate,
-/// each followed by a quiet-wait and an untruncated re-snapshot; a
-/// candidate counts as opened only when its click-effect shows new
-/// controls (actionable count grew or new nodes appeared). Bounded by
-/// `max_tries` and the [`MENU_OPEN_MAX_TRIES`] cap. Browser errors
-/// propagate; every attempted click is recorded in `clicked` by stable
-/// identity so neither lane re-tries — or toggles shut — the same
-/// control.
+/// Evidence-poll cadence after a disclosure click: re-snapshot every
+/// 200ms and stop at the first tick that shows the menu opened, or give
+/// up after 3s with no evidence. A live feed (Reddit's infinite scroll)
+/// never settles, so `page_quiet` is not a signal here — the old
+/// quiet-wait burned a fixed ~2s and snapshotted at an arbitrary moment,
+/// which is exactly the race that flaked "open settings on reddit".
+const MENU_OPEN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const MENU_OPEN_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Roles that mark a revealed menu layer for the open-evidence check.
+fn is_menu_role(role: &str) -> bool {
+    matches!(role, "menu" | "menuitem" | "menuitemlink")
+}
+
+/// Per-tick opening evidence from a fresh snapshot, as the tried-journal
+/// effect line. Any one of: (a) the [`menu_open_effect`] verdict — new
+/// actionable controls vs the pre-click baseline (actionable count grew
+/// or genuinely new backend nodes appeared); (c) menu-layer roles the
+/// baseline lacked (a control that changes role keeps its backend node
+/// id, so this catches what the new-node check misses). `None` when the
+/// snapshot shows nothing. `aria-expanded` (b) needs a CDP read, so the
+/// poll checks it only when this returns `None`.
+fn menu_open_evidence(
+    before_ids: &std::collections::HashSet<i64>,
+    actionable_before: usize,
+    raw_before: usize,
+    menu_ids_before: &std::collections::HashSet<i64>,
+    after: &[AxElement],
+    raw_after: usize,
+) -> Option<String> {
+    let (opened, effect) =
+        menu_open_effect(before_ids, actionable_before, raw_before, after, raw_after);
+    if opened {
+        return Some(effect);
+    }
+    let fresh_menu: Vec<String> = after
+        .iter()
+        .filter(|element| {
+            is_menu_role(&element.role) && !menu_ids_before.contains(&element.backend_node_id)
+        })
+        .take(6)
+        .map(|element| format!("{} '{}'", element.role, element.name))
+        .collect();
+    if fresh_menu.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "menu layer revealed [{}] (actionable {actionable_before} → {}; raw AX nodes {raw_before} → {raw_after})",
+        fresh_menu.join(", "),
+        count_actionable(after),
+    ))
+}
+
+/// Outcome of one disclosure click's evidence poll: whether a menu
+/// opened, the tried-journal effect line, and the final fresh snapshot —
+/// reused as the next attempt's re-rank baseline so a miss never pays
+/// for a second fetch.
+struct MenuOpenPoll {
+    opened: bool,
+    effect: String,
+    after: Vec<AxElement>,
+    raw_after: usize,
+}
+
+/// Poll-until-open after a disclosure click: snapshot, test the three
+/// evidences, repeat every [`MENU_OPEN_POLL_INTERVAL`] until
+/// [`MENU_OPEN_POLL_TIMEOUT`]. Returns at the first tick showing
+/// evidence — a fast menu costs one snapshot, not the full bound — and
+/// never past the bound. Evidence beats the clock: a tick that fires at
+/// the deadline still counts as opened.
+async fn poll_for_menu_open<B: MenuBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    candidate: &AxElement,
+    before_ids: &std::collections::HashSet<i64>,
+    actionable_before: usize,
+    raw_before: usize,
+    menu_ids_before: &std::collections::HashSet<i64>,
+) -> MenuOpenPoll {
+    let deadline = std::time::Instant::now() + MENU_OPEN_POLL_TIMEOUT;
+    loop {
+        let (after, check_after, _) = browser.menu_snapshot(origin).await;
+        let raw_after = check_after.node_count;
+        if let Some(effect) = menu_open_evidence(
+            before_ids,
+            actionable_before,
+            raw_before,
+            menu_ids_before,
+            &after,
+            raw_after,
+        ) {
+            return MenuOpenPoll {
+                opened: true,
+                effect,
+                after,
+                raw_after,
+            };
+        }
+        // (b) aria-expanded on the clicked control: the only signal when
+        // the menu renders with no AX subtree of its own. Checked after
+        // the snapshot evidences so a fast menu costs no extra CDP call.
+        if browser.menu_node_expanded(candidate.backend_node_id).await == Some(true) {
+            let effect = format!(
+                "aria-expanded=true on the clicked control (actionable {actionable_before} → {}; raw AX nodes {raw_before} → {raw_after})",
+                count_actionable(&after),
+            );
+            return MenuOpenPoll {
+                opened: true,
+                effect,
+                after,
+                raw_after,
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            let (_, effect) =
+                menu_open_effect(before_ids, actionable_before, raw_before, &after, raw_after);
+            return MenuOpenPoll {
+                opened: false,
+                effect,
+                after,
+                raw_after,
+            };
+        }
+        tokio::time::sleep(MENU_OPEN_POLL_INTERVAL).await;
+    }
+}
+
+/// Shared menu-opening primitive for both in-page lanes. Each attempt:
+/// rank [`rank_menu_candidates`] (landmarked → account-worded →
+/// unlabeled-in-header → rightmost-in-header) against the live tree,
+/// click the top unclicked candidate, then poll for opening evidence
+/// ([`poll_for_menu_open`]) instead of a quiet-wait — a live feed never
+/// settles, so the wait is evidence-driven and returns the moment the
+/// menu shows. A miss re-ranks from the poll's final snapshot (the tree
+/// moves under us; backend ids churn, so retry exclusion keys on the
+/// stable [`ClickedControl`] identity) and tries the next candidate.
+/// Bounded by `max_tries` and the [`MENU_OPEN_MAX_TRIES`] cap; stops
+/// early when no unclicked candidate remains. Browser errors propagate;
+/// every attempted click is recorded in `clicked` by stable identity so
+/// neither lane re-tries — or toggles shut — the same control.
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
-pub async fn open_identity_menu(
-    browser: &ManagedBrowser,
+pub async fn open_identity_menu<B: MenuBrowser>(
+    browser: &B,
     origin: &url::Url,
     baseline: MenuOpenBaseline<'_>,
     clicked: &mut Vec<ClickedControl>,
     max_tries: usize,
 ) -> Result<OpenMenuOutcome, IntentError> {
-    let before = baseline.elements;
-    let actionable_before = count_actionable(before);
-    let before_ids: std::collections::HashSet<i64> = before
-        .iter()
-        .map(|element| element.backend_node_id)
-        .collect();
-    let raw_before = baseline.check.node_count;
-
-    // Geometry tiers at the CDP boundary; tiers (a) and (b) are pure.
-    // An unreadable viewport fails the geometry tiers closed to empty —
-    // tiers (a) and (b) are still tried.
-    let strip_bottom = browser
-        .viewport_size()
-        .await
-        .map(|(_, height)| height * HEADER_STRIP_FRACTION);
-    let rects = header_button_rects(browser, before, clicked).await;
-    let candidates = rank_menu_candidates(before, clicked, &rects, strip_bottom);
-
+    // Attempt baselines: the first attempt ranks the caller's snapshot
+    // (no extra fetch); later attempts re-rank from the previous
+    // attempt's final poll snapshot.
+    let mut current: Option<(Vec<AxElement>, usize)> = None;
     let mut tried = Vec::new();
-    for candidate in candidates
-        .into_iter()
-        .take(max_tries.min(MENU_OPEN_MAX_TRIES))
-    {
-        let tried_key = ClickedControl::of(candidate);
-        click_element(browser, candidate).await?;
+    for _ in 0..max_tries.min(MENU_OPEN_MAX_TRIES) {
+        let (elements, raw_before) = match current.as_ref() {
+            Some((elements, raw)) => (elements.as_slice(), *raw),
+            None => (baseline.elements, baseline.check.node_count),
+        };
+        let actionable_before = count_actionable(elements);
+        let before_ids: std::collections::HashSet<i64> = elements
+            .iter()
+            .map(|element| element.backend_node_id)
+            .collect();
+        let menu_ids_before: std::collections::HashSet<i64> = elements
+            .iter()
+            .filter(|element| is_menu_role(&element.role))
+            .map(|element| element.backend_node_id)
+            .collect();
+
+        // Geometry tiers at the CDP boundary; tiers (a) and (b) are pure.
+        // An unreadable viewport fails the geometry tiers closed to empty —
+        // tiers (a) and (b) are still tried.
+        let strip_bottom = browser
+            .menu_viewport_size()
+            .await
+            .map(|(_, height)| height * HEADER_STRIP_FRACTION);
+        let rects = header_button_rects(browser, elements, clicked).await;
+        let candidate = match rank_menu_candidates(elements, clicked, &rects, strip_bottom)
+            .into_iter()
+            .next()
+        {
+            Some(candidate) => candidate.clone(),
+            // Every candidate already tried: re-clicking would only
+            // toggle a menu shut.
+            None => break,
+        };
+
+        let tried_key = ClickedControl::of(&candidate);
+        browser.menu_click(&candidate).await?;
         clicked.push(tried_key.clone());
-        wait_for_menu(browser).await;
-        let (after, check_after, _) = browser.ax_snapshot_untruncated(origin).await;
-        let (opened, effect) = menu_open_effect(
+
+        let poll = poll_for_menu_open(
+            browser,
+            origin,
+            &candidate,
             &before_ids,
             actionable_before,
             raw_before,
-            &after,
-            check_after.node_count,
-        );
-        let line = tried_label(candidate, &effect);
+            &menu_ids_before,
+        )
+        .await;
+        let line = tried_label(&candidate, &poll.effect);
         tried.push(line.clone());
-        if opened {
+        if poll.opened {
             return Ok(OpenMenuOutcome::Opened {
                 control: tried_key,
                 tried: line,
             });
         }
+        current = Some((poll.after, poll.raw_after));
     }
     Ok(OpenMenuOutcome::Miss { tried })
 }
@@ -1491,20 +1729,6 @@ fn count_actionable(elements: &[AxElement]) -> usize {
         .iter()
         .filter(|element| PAGE_GOAL_ROLES.contains(&element.role.as_str()))
         .count()
-}
-
-/// Quiet-wait after a disclosure click: the first probe installs the
-/// observer (reads not-quiet), then poll until quiet or the deadline.
-/// A menu that renders instantly costs one extra poll, not two seconds.
-async fn wait_for_menu(browser: &ManagedBrowser) {
-    let _ = browser.page_quiet().await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if browser.page_quiet().await {
-            break;
-        }
-    }
 }
 
 /// Validate a page-revealed href in Rust before navigating: absolute

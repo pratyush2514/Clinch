@@ -7,7 +7,7 @@ use browser_driver::{
 };
 pub use executor::{
     ClickedControl, DriftDetail, ExecuteOutcome, FOLLOW_POLL_MS, FOLLOW_TIMEOUT_MS,
-    FastReplayMetrics, FollowedResult, IntentError, IntentOutcome, MAX_BATCH_CLICKS,
+    FastReplayMetrics, FollowedResult, IntentError, IntentOutcome, MAX_BATCH_CLICKS, MenuBrowser,
     MenuOpenBaseline, OpenMenuOutcome, PageGoalOutcome, RESOLVE_COST_USD, ResolveOutcome,
     ResolvedIntent, SETTLE_POLL_MS, SETTLE_TIMEOUT_MS, SemanticIntent, ensure_at_entry_url,
     entry_url_mismatched, execute_batch, execute_intent, follow_diagnostic, follow_search_result,

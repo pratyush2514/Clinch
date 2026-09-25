@@ -623,6 +623,16 @@ struct CompletedRun {
 /// first-in-first-out, so the registry can never grow with the session.
 const MAX_COMPLETED_RUNS: usize = 32;
 
+/// The resolved landing for a grounded funnel site: what the ladder (or
+/// the explicit domain) answered, kept together so the landing arm stays
+/// under the argument-count lint.
+struct FunnelLanding<'a> {
+    site: &'a str,
+    source: Option<orchestration_engine::RouteSource>,
+    entry: String,
+    route_log: Option<String>,
+}
+
 impl AppService {
     pub fn new(data: PathBuf, home: PathBuf) -> Self {
         Self {
@@ -679,6 +689,12 @@ impl AppService {
     /// shot, and anything unanswered degrades to ungrounded slots plus raw
     /// search. Shared by Stage 2 and its tests so both exercise the same
     /// cascade.
+    ///
+    /// Tier-2B lane split: this parser only names Stage 2's *follow noun*
+    /// on an already-searching page — it never decides routing. Routing
+    /// belongs to the funnel's Tier 2B call site
+    /// (`execute_funnel_ask_parser`), which asks the same fenced parser for
+    /// a *site slot* on the aside-cleaned prompt.
     fn follow_slots(&self, prompt: &str) -> orchestration_engine::ResolvedSlots {
         let ctx = orchestration_engine::ResolutionContext {
             account_dir: None,
@@ -2276,6 +2292,483 @@ impl AppService {
         Ok(outcome)
     }
 
+    /// The site-only grounding ladder for the funnel: the same three rungs
+    /// Tier 3 / Tier 3b share
+    /// ([`orchestration_engine::resolve_site_entry_url`]) — user shortcut,
+    /// composite directory with the plausibility veto, fenced domain
+    /// grounder — run over the funnel's site slot alone, on a blocking
+    /// thread like the proposal path. Returns the route plus whether the
+    /// grounder rung was env-configured, so the miss copy can name the
+    /// setup fix. A missing shortcut store degrades to an empty one: stale
+    /// data must not veto the rungs below it.
+    async fn resolve_site_via_ladder(
+        &self,
+        site: &str,
+    ) -> (Option<orchestration_engine::ResolvedRoute>, bool) {
+        let shortcuts = self.load_shortcut_map().await.unwrap_or_default();
+        let shortcut_store = orchestration_engine::InMemoryShortcuts::new(shortcuts);
+        // Composite directory rung: Brave's sanctioned search API when
+        // `CLINCH_BRAVE_API_KEY` is set, DuckDuckGo's keyless HTML endpoint
+        // as the zero-config fallback. Backend HTTP in memory only — the
+        // browser never sees a search page.
+        let site_search = orchestration_engine::ChainedSiteSearch::new();
+        // Fenced domain grounder: the live adapter when
+        // `CLINCH_GROUNDER_PROVIDER` selects one, the declining stub
+        // otherwise. Unconfigured or offline stays a normal outcome: the
+        // ladder degrades to the honest miss.
+        let live_grounder = orchestration_engine::LlmDomainGrounder::from_env();
+        let stub_grounder = orchestration_engine::StubDomainGrounder;
+        let region_hint = orchestration_engine::system_region_hint();
+        let grounder_configured = live_grounder.is_some();
+        // The directory rung is synchronous network I/O; it runs on a
+        // blocking thread so it can never stall the async runtime's
+        // workers, exactly like the proposal path.
+        let site_owned = site.to_owned();
+        let route = tokio::task::spawn_blocking(move || {
+            let domain_grounder: &dyn orchestration_engine::DomainGrounder = match &live_grounder {
+                Some(grounder) => grounder,
+                None => &stub_grounder,
+            };
+            let ctx = orchestration_engine::ResolutionContext {
+                account_dir: None,
+                llm: None,
+                parser: None,
+                shortcuts: Some(&shortcut_store),
+                site_search: Some(&site_search as &dyn orchestration_engine::SiteSearchClient),
+                domain_grounder: Some(domain_grounder),
+                region_hint: region_hint.as_str(),
+            };
+            orchestration_engine::resolve_site_entry_url(&site_owned, &ctx)
+        })
+        .await
+        .ok()
+        .flatten();
+        (route, grounder_configured)
+    }
+
+    /// Funnel entry for ad-hoc open-verb prompts (work item B). Claims only
+    /// non-plural prompts whose first content verb is an open-class verb —
+    /// the saved lane and the connected batch lane never reach here.
+    /// Returns `None` when the funnel declines so the caller keeps the
+    /// existing dispatch untouched; `Some` carries the terminal outcome or
+    /// error once claimed. `portal` is the portal the caller knows (the
+    /// connected portal, or the just-attached live one); `None` keeps the
+    /// portal-independent decisions and reports the portal-dependent ones
+    /// against the unknown.
+    pub async fn dispatch_funnel(
+        &self,
+        prompt: String,
+        intent: &macro_engine::SemanticIntent,
+        portal: Option<url::Url>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Option<Result<DispatchOutcome, AppError>> {
+        let host = portal
+            .as_ref()
+            .and_then(|portal| portal.host_str())
+            .map(str::to_owned);
+        let plan = orchestration_engine::funnel_plan(&prompt, intent.is_plural, host.as_deref());
+        if matches!(
+            plan.decision,
+            orchestration_engine::FunnelDecision::Declined
+        ) {
+            return None;
+        }
+        for line in &plan.journal_lines {
+            let _ = self.record(line).await;
+        }
+        Some(self.execute_funnel_plan(prompt, plan, portal, emit).await)
+    }
+
+    /// Execute a claimed funnel plan. Every arm journals its route; a
+    /// claimed prompt is goal-shaped, so the funnel never touches
+    /// `SiteSearch` — search is not its answer.
+    async fn execute_funnel_plan(
+        &self,
+        prompt: String,
+        plan: orchestration_engine::FunnelPlan,
+        portal: Option<url::Url>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        // Tier-2B lane split: the funnel's parser decides *routing* (the
+        // `AskParser` arm below); `follow_slots`' parser only names Stage
+        // 2's *follow noun* on an already-searching page and never routes.
+        match plan.decision {
+            orchestration_engine::FunnelDecision::Declined => Err(AppError::Internal),
+            orchestration_engine::FunnelDecision::AlreadyOnOrigin { site, object } => {
+                let portal = portal.ok_or(AppError::Internal)?;
+                self.execute_funnel_already_on_origin(prompt, &site, object, portal, emit)
+                    .await
+            }
+            orchestration_engine::FunnelDecision::GroundSite { site, object } => {
+                self.execute_funnel_ground_site(prompt, site, object, &plan.cleaned, portal, emit)
+                    .await
+            }
+            orchestration_engine::FunnelDecision::ImplicitSite { object } => {
+                let portal = portal.ok_or(AppError::Internal)?;
+                let noun = orchestration_engine::object_noun(object).to_owned();
+                self.execute_funnel_in_page_goal(
+                    prompt,
+                    noun,
+                    portal.clone(),
+                    format!(
+                        "funnel_route: implicit site {} · SiteSearch skipped",
+                        portal.host_str().unwrap_or("?")
+                    ),
+                    emit,
+                )
+                .await
+            }
+            orchestration_engine::FunnelDecision::AskParser => {
+                self.execute_funnel_ask_parser(prompt, plan, portal, emit)
+                    .await
+            }
+        }
+    }
+
+    /// Already-on-origin arm: the site slot matches the live portal through
+    /// the shared alias-aware host check. An object is pursued in-page;
+    /// with no object the portal is already the answer and the run
+    /// completes without pursuing anything — and without consulting
+    /// `SiteSearch` either way.
+    async fn execute_funnel_already_on_origin(
+        &self,
+        prompt: String,
+        site: &str,
+        object: Option<orchestration_engine::ObjectClass>,
+        portal: url::Url,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        let route_line = format!(
+            "funnel_route: already_on_origin '{site}' ({}) · SiteSearch skipped",
+            portal.host_str().unwrap_or("?")
+        );
+        if let Some(class) = object {
+            self.execute_funnel_in_page_goal(
+                prompt,
+                orchestration_engine::object_noun(class).to_owned(),
+                portal,
+                route_line,
+                emit,
+            )
+            .await
+        } else {
+            let _ = self.record(&route_line).await;
+            let name = orchestration_engine::ephemeral_name(&prompt);
+            let mut outcome = DispatchOutcome {
+                kind: "ephemeral",
+                name,
+                result: orchestration_engine::SequenceOutcome {
+                    completed_steps: 0,
+                    total_steps: 0,
+                    status: orchestration_engine::SequenceStatus::Completed,
+                    stopped_at: None,
+                },
+                steps: Vec::new(),
+                run_id: None,
+                lend_id: None,
+                route_log: None,
+                telemetry_log: None,
+                final_frame: None,
+                challenge: None,
+                auth_url: None,
+                final_url: None,
+                page_title: None,
+            };
+            self.settle_ephemeral_outcome(&mut outcome).await;
+            Ok(outcome)
+        }
+    }
+
+    /// Shared in-page arm: journal the route line, pursue the canonical
+    /// object noun on the live portal, then settle. The noun comes from
+    /// the funnel's closed object vocabulary — never a raw prompt
+    /// fragment.
+    async fn execute_funnel_in_page_goal(
+        &self,
+        prompt: String,
+        noun: String,
+        portal: url::Url,
+        route_line: String,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        let _ = self.record(&route_line).await;
+        let mut outcome = self
+            .dispatch_in_page_goal(portal, prompt, noun, &mut *emit)
+            .await?;
+        self.settle_ephemeral_outcome(&mut outcome).await;
+        Ok(outcome)
+    }
+
+    /// Ground-site arm: the site slot is not the live portal. A typed
+    /// domain in the prompt is ground truth and lands directly (Tier 0 is
+    /// preserved: `"open amazon.in"` never becomes a ladder query for
+    /// `"amazon"`). Otherwise the site slot alone runs the shared
+    /// site-only ladder — never a search. A ladder miss with an object and
+    /// a live portal falls back to pursuing the object in-page (the
+    /// live-page-fallback behavior, kept inside the funnel); with no
+    /// object or no portal it is the honest miss.
+    async fn execute_funnel_ground_site(
+        &self,
+        prompt: String,
+        site: String,
+        object: Option<orchestration_engine::ObjectClass>,
+        cleaned: &str,
+        portal: Option<url::Url>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        if let Some(entry) = orchestration_engine::explicit_url_in_prompt(cleaned) {
+            let route_log =
+                format!("route_proposed: funnel '{site}' → {entry} · source: ExplicitDomain");
+            let _ = self.record(&route_log).await;
+            return self
+                .execute_funnel_land(
+                    prompt,
+                    FunnelLanding {
+                        site: &site,
+                        source: Some(orchestration_engine::RouteSource::ExplicitDomain),
+                        entry,
+                        route_log: Some(route_log),
+                    },
+                    object,
+                    emit,
+                )
+                .await;
+        }
+        let (route, grounder_configured) = self.resolve_site_via_ladder(&site).await;
+        let Some(route) = route else {
+            let _ = self
+                .record(&format!("funnel_miss: site='{site}' ungrounded"))
+                .await;
+            if let (Some(class), Some(portal)) = (object, portal) {
+                let noun = orchestration_engine::object_noun(class).to_owned();
+                return self
+                    .execute_funnel_in_page_goal(
+                        prompt,
+                        noun.clone(),
+                        portal,
+                        format!(
+                            "funnel_route: ladder miss for '{site}' · pursuing '{noun}' in-page · SiteSearch skipped"
+                        ),
+                        emit,
+                    )
+                    .await;
+            }
+            let proposed = ProposedEntry {
+                direct_open_miss: true,
+                grounder_configured,
+                ..ProposedEntry::default()
+            };
+            return Err(
+                Self::direct_open_miss_error(&proposed).unwrap_or(AppError::InvalidInput(
+                    "The derived intent is not runnable.",
+                )),
+            );
+        };
+        let mut route_log = format!(
+            "route_proposed: funnel '{site}' → {}{} · source: {:?}",
+            route.url.host_str().unwrap_or("?"),
+            route.url.path(),
+            route.source,
+        );
+        if let Some(backend) = route.directory_backend {
+            route_log.push_str(" · via ");
+            route_log.push_str(backend);
+        }
+        if let Some(veto) = route.directory_veto.as_deref() {
+            route_log.push_str(" · ");
+            route_log.push_str(veto);
+        }
+        let _ = self.record(&route_log).await;
+        self.execute_funnel_land(
+            prompt,
+            FunnelLanding {
+                site: &site,
+                source: Some(route.source),
+                entry: route.url.as_str().to_owned(),
+                route_log: Some(route_log),
+            },
+            object,
+            emit,
+        )
+        .await
+    }
+
+    /// Land a grounded funnel site. With an object, the existing cold-goal
+    /// machinery lands the resolved entry and pursues the canonical noun
+    /// on the live page — the entry is the ladder's answer, `SiteSearch` is
+    /// never re-entered for the site, and the site slot threads into the
+    /// settle contract. Without an object the landing itself is the goal: a
+    /// direct site open completes without semantic noun pursuit.
+    async fn execute_funnel_land(
+        &self,
+        prompt: String,
+        landing: FunnelLanding<'_>,
+        object: Option<orchestration_engine::ObjectClass>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        match object {
+            Some(class) => {
+                self.dispatch_cold_in_page_goal(
+                    prompt,
+                    landing.source,
+                    Some(landing.entry),
+                    orchestration_engine::object_noun(class).to_owned(),
+                    landing.route_log,
+                    Some(landing.site),
+                    &mut *emit,
+                )
+                .await
+            }
+            None => {
+                self.dispatch_funnel_site_open(prompt, landing.site, landing.source, landing.entry)
+                    .await
+            }
+        }
+    }
+
+    /// Pure site open: no object, so the landing is the goal. Validates the
+    /// entry like any user-directed destination, records the session
+    /// origin, lands, then runs the settle contract BEFORE settle: the
+    /// observed landing must belong to the site slot — a search-shaped or
+    /// mismatched landing is FAILED, never Completed.
+    async fn dispatch_funnel_site_open(
+        &self,
+        prompt: String,
+        site: &str,
+        source: Option<orchestration_engine::RouteSource>,
+        entry: String,
+    ) -> Result<DispatchOutcome, AppError> {
+        if !orchestration_engine::entry_url_valid(source, entry.as_str()) {
+            return Err(AppError::InvalidInput(
+                "The derived intent is not runnable.",
+            ));
+        }
+        let site_url = url::Url::parse(&entry)
+            .map_err(|_| AppError::InvalidInput("The derived intent is not runnable."))?;
+        let mut portal = site_url.clone();
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
+        let browser = self.browser(BrowserIntent::Background).await?;
+        macro_engine::ensure_at_entry_url(&browser, &site_url)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        let _ = self
+            .record(&format!(
+                "funnel_site_open: '{site}' → {}",
+                portal.host_str().unwrap_or("?")
+            ))
+            .await;
+        // Settle contract (D.1) before settle: the observed landing must
+        // belong to the site slot.
+        self.verify_funnel_landing(site).await?;
+        let name = orchestration_engine::ephemeral_name(&prompt);
+        let mut outcome = DispatchOutcome {
+            kind: "ephemeral",
+            name,
+            result: orchestration_engine::SequenceOutcome {
+                completed_steps: 0,
+                total_steps: 0,
+                status: orchestration_engine::SequenceStatus::Completed,
+                stopped_at: None,
+            },
+            steps: Vec::new(),
+            run_id: None,
+            lend_id: None,
+            route_log: None,
+            telemetry_log: None,
+            final_frame: None,
+            challenge: None,
+            auth_url: None,
+            final_url: None,
+            page_title: None,
+        };
+        self.settle_ephemeral_outcome(&mut outcome).await;
+        Ok(outcome)
+    }
+
+    /// Funnel settle contract (D.1): after the funnel lands, COMPLETED
+    /// requires the observed landing to belong to the resolved site slot
+    /// (alias-aware). A search-shaped landing on a non-matching domain —
+    /// or any domain mismatch — is FAILED with an honest journal line
+    /// naming the site, never a quiet COMPLETED. In-page object goals keep
+    /// their existing verifier semantics; this fires only where the funnel
+    /// threaded a site slot.
+    async fn verify_funnel_landing(&self, site: &str) -> Result<(), AppError> {
+        let browser = self
+            .browser(BrowserIntent::Background)
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?;
+        let landed = browser
+            .current_url()
+            .await
+            .map_err(|_| AppError::BrowserUnavailable)?
+            .ok_or(AppError::BrowserUnavailable)?;
+        if orchestration_engine::funnel_landing_matches(site, &landed) {
+            return Ok(());
+        }
+        let _ = self
+            .record(&format!(
+                "funnel_settle_miss: did not reach '{site}' · landed {}",
+                landed.host_str().unwrap_or("?")
+            ))
+            .await;
+        Err(AppError::WorkflowFailed(self.recent_journal(16).await))
+    }
+
+    /// Tier 2B, routing lane: the fenced parser gets one bounded shot at
+    /// the aside-cleaned prompt — asides never reach it. Only a
+    /// `site_context` slot routes; anything else is the honest miss, never
+    /// a search fallback. (The Stage-2 `follow_slots` parser is the other
+    /// Tier 2B call site: it names the follow noun on an already-searching
+    /// page and never decides routing.)
+    async fn execute_funnel_ask_parser(
+        &self,
+        prompt: String,
+        plan: orchestration_engine::FunnelPlan,
+        portal: Option<url::Url>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        let parsed = orchestration_engine::parse_prompt_bounded(&self.intent_parser, &plan.cleaned);
+        let Some(site) = parsed.and_then(|slots| slots.site_context) else {
+            let _ = self
+                .record("funnel_tier2b: parser declined · honest miss")
+                .await;
+            return Err(AppError::InvalidInput(
+                "Which site should I open? I couldn't tell from that prompt — try the full domain (for example 'open amazon.in'), or save a site shortcut and try again.",
+            ));
+        };
+        let _ = self.record(&format!("funnel_tier2b: site='{site}'")).await;
+        // The parser's site re-enters the ladder: already-on-origin first,
+        // then the site-only ladder — never a search fallback.
+        let on_origin = portal
+            .as_ref()
+            .and_then(|portal| portal.host_str())
+            .is_some_and(|host| orchestration_engine::site_matches_host(&site, host));
+        if on_origin {
+            let portal = portal.ok_or(AppError::Internal)?;
+            return self
+                .execute_funnel_already_on_origin(
+                    prompt,
+                    &site,
+                    plan.slots.object_slot,
+                    portal,
+                    emit,
+                )
+                .await;
+        }
+        self.execute_funnel_ground_site(
+            prompt,
+            site,
+            plan.slots.object_slot,
+            &plan.cleaned,
+            portal,
+            emit,
+        )
+        .await
+    }
+
     /// Cold-start in-page goal: the prompt names a site and carries an
     /// artifact noun ("open my profile on the reddit"), and the ladder
     /// grounded the site itself — never a search page. Land the site, then
@@ -2286,6 +2779,12 @@ impl AppService {
     /// checks the noun first, so this always handles the goal.
     /// Extracted to keep `dispatch_adhoc_auto_acquire` within the line
     /// budget.
+    ///
+    /// `site_slot` carries the funnel's resolved site for the settle
+    /// contract (D.1): `Some` when the funnel threaded a site through the
+    /// ladder — the observed landing must belong to it, checked
+    /// immediately after the final-page capture and before challenge/auth
+    /// handling. `None` (the old cold path) keeps the existing behavior.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_cold_in_page_goal(
         &self,
@@ -2294,6 +2793,7 @@ impl AppService {
         entry: Option<String>,
         noun: String,
         route_log: Option<String>,
+        site_slot: Option<&str>,
         emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
         let entry = entry.ok_or(AppError::InvalidInput(
@@ -2342,7 +2842,15 @@ impl AppService {
             });
         }
         // Settle (final frame + challenge/auth branching) runs here,
-        // exactly like the normal path.
+        // exactly like the normal path. The funnel's settle contract (D.1)
+        // fires first when a site slot was threaded: the observed landing
+        // must belong to the resolved site — a search-shaped or mismatched
+        // landing is FAILED here, before challenge/auth success handling
+        // can report a quiet success. In-page object goals keep their
+        // existing verifier semantics; only the site-domain check is added.
+        if let Some(site) = site_slot {
+            self.verify_funnel_landing(site).await?;
+        }
         self.settle_ephemeral_outcome(&mut outcome).await;
         Ok(outcome)
     }
@@ -2351,8 +2859,22 @@ impl AppService {
         &self,
         prompt: String,
         mut intent: macro_engine::SemanticIntent,
-        emit: impl FnMut(PlaybookEvent) + Send,
+        mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Funnel first: open-verb-led, non-plural prompts route through the
+        // funnel before the old follow-up / proposal / search machinery.
+        // The gate is pure (no browser): only a claimed prompt attaches
+        // the live portal. The funnel declines anything it does not claim,
+        // so unclaimed prompts keep the existing pipeline untouched.
+        if !intent.is_plural && orchestration_engine::funnel_claims(&prompt) {
+            let portal = self.live_portal().await;
+            if let Some(outcome) = self
+                .dispatch_funnel(prompt.clone(), &intent, portal, &mut emit)
+                .await
+            {
+                return outcome;
+            }
+        }
         // Fast path: already on the named origin → pursue the artifact in-page.
         if !intent.is_plural
             && let Some((portal, noun)) = self.follow_up_in_page_goal(&prompt).await
@@ -2417,6 +2939,7 @@ impl AppService {
                     intent.entry_url.clone(),
                     noun,
                     route_log,
+                    None,
                     emit,
                 )
                 .await;
@@ -2707,11 +3230,23 @@ impl AppService {
         // `intent.entry_url` still names the search template the dispatcher
         // itself navigated to (it is overwritten below); the shape check
         // derives from that URL, so no search engine is hardcoded.
-        let direct_open = orchestration_engine::is_direct_open(
-            &intent.raw_prompt,
-            &orchestration_engine::parse_grammar(&intent.raw_prompt, None),
-        );
-        if direct_open
+        //
+        // The guard is wider than pure direct opens on purpose: a
+        // funnel-claimed prompt (open-verb-led, non-plural, with a site
+        // slot) is goal-shaped, and so is any prompt whose grammar names a
+        // destination noun — a follow that never left the results page is a
+        // miss for all of them. Legitimate follows land off the search
+        // host and never trip the shape check, so widening cannot weaken
+        // them.
+        let grammar = orchestration_engine::parse_grammar(&intent.raw_prompt, None);
+        let direct_open = orchestration_engine::is_direct_open(&intent.raw_prompt, &grammar);
+        let funnel_claimed = !intent.is_plural
+            && orchestration_engine::funnel_claims(&intent.raw_prompt)
+            && orchestration_engine::split_slots(&intent.raw_prompt)
+                .site_slot
+                .is_some();
+        let names_destination = grammar.target_noun.is_some();
+        if (direct_open || funnel_claimed || names_destination)
             && let Some(entry) = intent
                 .entry_url
                 .as_deref()
@@ -3281,8 +3816,22 @@ impl AppService {
         portal: url::Url,
         prompt: String,
         mut intent: macro_engine::SemanticIntent,
-        emit: impl FnMut(PlaybookEvent) + Send,
+        mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Funnel first: open-verb-led, non-plural prompts claim the funnel
+        // before the old connected in-page detector, so claiming and
+        // journaling are never bypassed (e.g. "open settings on reddit").
+        // The connected portal is already known, so no extra browser
+        // attach. The funnel declines anything it does not claim, so
+        // unclaimed prompts keep the existing pipeline untouched.
+        if !intent.is_plural
+            && orchestration_engine::funnel_claims(&prompt)
+            && let Some(outcome) = self
+                .dispatch_funnel(prompt.clone(), &intent, Some(portal.clone()), &mut emit)
+                .await
+        {
+            return outcome;
+        }
         // Muse-style follow-up: the prompt explicitly names the connected
         // portal as its site and carries an artifact noun ("open my profile
         // in reddit" while on reddit.com). Pursue it on the live page — no

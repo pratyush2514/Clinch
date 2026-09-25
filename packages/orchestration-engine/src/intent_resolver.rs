@@ -16,7 +16,7 @@ use playbook_store::PlaybookSummary;
 /// Closed English stopword set for command matching. Verbs stay: they drive
 /// ephemeral role inference below. Cue words (`for`, `id`, `with`, …) stay
 /// out: they introduce identifiers, which `extract_identifier` handles.
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "my", "the", "a", "an", "please", "kindly", "now", "latest", "new", "here", "this", "that",
     "me", "for", "to", "on", "and", "or", "of", "in", "is", "it", "id", "with", "named", "called",
 ];
@@ -710,7 +710,7 @@ fn label_keywords(prompt: &str) -> Vec<String> {
 /// harmless downstream because matching is substring-based (`analytic`
 /// still sits inside `Analytics`), while under-stripping would miss
 /// (`invoices` never contains `invoice`).
-fn singular_stem(token: &str) -> String {
+pub(crate) fn singular_stem(token: &str) -> String {
     if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
         token[..token.len() - 1].to_owned()
     } else {
@@ -1147,7 +1147,20 @@ pub fn resolve_app_command(prompt: &str) -> Option<AppCommand> {
 /// Verbs that phrase a direct site open. Closed vocabulary: everything
 /// else (`download`, `find`, `check`) keeps the search-grounded path, so a
 /// retrieval verb can never silently become a navigation.
-const OPEN_VERBS: &[&str] = &["open", "go", "navigate", "launch", "visit"];
+pub(crate) const OPEN_VERBS: &[&str] = &["open", "go", "navigate", "launch", "visit"];
+
+/// Whether the prompt's first content verb is an open-class verb
+/// ([`OPEN_VERBS`]): the funnel's claim gate. Content tokens drop stopwords
+/// first, so leading politeness (`"please open …"`) still reads as
+/// open-led — the same first-verb rule [`is_direct_open`] applies, minus
+/// its confidence/target/shape requirements, so irregular phrasing the
+/// grammar cannot read confidently still routes through the funnel.
+#[must_use]
+pub fn open_verb_leads(prompt: &str) -> bool {
+    content_tokens(prompt)
+        .first()
+        .is_some_and(|verb| OPEN_VERBS.contains(&verb.as_str()))
+}
 
 /// Whether the grammar describes a direct site open: high confidence, one
 /// target noun, no artifact (no prepositional complement), an open-class

@@ -585,6 +585,32 @@ fn registrable_label(host: &str) -> &str {
 /// veto, never alias.
 const SITE_HOST_ALIASES: [(&str, &str); 1] = [("gmail", "mail.google.com")];
 
+/// Site↔host plausibility as a pure predicate: the alias-aware containment
+/// rule the directory veto applies. `true` when the registrable label of
+/// `host` contains the site name or vice versa (`reddit` ↔ `reddit.com`),
+/// with the single blessed alias checked first (`gmail` ↔
+/// `mail.google.com`). Shared by the directory veto, the funnel's
+/// already-on-origin check, and the settle contract — one rule, three
+/// readers, so they can never drift.
+#[must_use]
+pub fn site_matches_host(site_name: &str, host: &str) -> bool {
+    let name = site_name.trim().to_lowercase();
+    let host = host.trim().to_lowercase();
+    if name.is_empty() || host.is_empty() {
+        return false;
+    }
+    // Alias check first: exact normalized-name match, registrable-domain
+    // equality on the returned host. Strict on purpose — `gmail` → a
+    // `gmail.com` hit still fails; only the blessed host is accepted.
+    for (alias_name, alias_host) in SITE_HOST_ALIASES {
+        if name == alias_name {
+            return registrable_label(&host) == registrable_label(alias_host);
+        }
+    }
+    let label = registrable_label(&host);
+    label.contains(&name) || name.contains(label)
+}
+
 /// Plausibility veto for one directory hit: `None` when the hit may serve
 /// the queried site name, `Some(note)` carrying a `route_vetoed: …`
 /// journal line when it may not. The name is normalized (lowercase,
@@ -607,19 +633,7 @@ fn directory_veto_note(site_name: &str, hit: &SiteHit) -> Option<String> {
     else {
         return Some(note("?", "unparseable URL"));
     };
-    // Alias check first: exact normalized-name match, registrable-domain
-    // equality on the returned host. Strict on purpose — `gmail` → a
-    // `gmail.com` hit still vetoes; only the blessed host is accepted.
-    for (alias_name, alias_host) in SITE_HOST_ALIASES {
-        if name == alias_name {
-            if registrable_label(&host) == registrable_label(alias_host) {
-                return None;
-            }
-            return Some(note(&host, "host mismatch"));
-        }
-    }
-    let label = registrable_label(&host);
-    if label.contains(&name) || name.contains(label) {
+    if site_matches_host(&name, &host) {
         None
     } else {
         Some(note(&host, "host mismatch"))
@@ -642,6 +656,84 @@ fn directory_step(
         return (None, Some(note));
     }
     (accept_site_search(&hit), None)
+}
+
+/// The site-only grounding ladder, shared by Tier 3 (direct opens), Tier 3b
+/// (in-page goals), and the funnel: a user-saved site shortcut, then the
+/// structured site directory with the plausibility veto, then the fenced
+/// domain grounder. One ladder, three callers — never forked, so a rung
+/// fix lands everywhere at once.
+///
+/// Takes the already-parsed site slot alone (never the raw prompt): the
+/// artifact noun is the dispatcher's business, pursued on the live page.
+/// A vetoed directory hit rides the grounder's route on
+/// [`ResolvedRoute::directory_veto`] so the journal reads as a veto, not a
+/// silent miss. `None` when no rung knows the site — the caller owns the
+/// honest miss or the Tier 4 search fallback, this function never searches.
+#[must_use]
+pub fn resolve_site_entry_url(site: &str, ctx: &ResolutionContext<'_>) -> Option<ResolvedRoute> {
+    // User-saved site shortcut. A corrupt saved URL is skipped — stale
+    // data must not veto the rung below it.
+    if let Some(store) = ctx.shortcuts
+        && let Some(url) = store.shortcut_url(site)
+        && let Some(route) = accept_user_directed(&url, RouteSource::Shortcut)
+    {
+        return Some(route);
+    }
+    // Structured site directory, composite: Brave's sanctioned API when
+    // `CLINCH_BRAVE_API_KEY` is set, DuckDuckGo's keyless HTML endpoint as
+    // the zero-config fallback (`ChainedSiteSearch`). Either way the rung
+    // is never unconfigured — DDG works out of the box. This rung runs
+    // BEFORE the LLM grounder: a search backend returns ranked results as
+    // data, and ranking is the ground truth of what a site name means — it
+    // cannot hallucinate the way a generative model can (`claude` →
+    // `open.com`). The call is backend HTTP in memory; the browser never
+    // sees a search page.
+    //
+    // Trust note: the directory resolves a *name the user typed*, the same
+    // way asking an assistant to "open amazon" does — it is name
+    // resolution, not a machine-invented destination. The structural bar
+    // (absolute https, real host, no credentials) stays the honest one, but
+    // a structurally-valid URL can still be the WRONG site — a support
+    // article once shipped as a confident navigation. So every hit passes
+    // a plausibility veto first ([`directory_veto_note`]): the host's
+    // registrable label must contain the queried name or vice versa, with
+    // exactly one blessed alias (`gmail` → `mail.google.com`). A vetoed
+    // hit is never navigated — the ladder falls through to the grounder
+    // rung and the veto rides the journal line. The veto is a heuristic,
+    // not a security boundary: `amazon-phishing.com` still contains
+    // `amazon`, so phishing-shaped hosts pass it the way they pass any
+    // name check.
+    let mut directory_veto: Option<String> = None;
+    if let Some(client) = ctx.site_search {
+        let (route, veto) = directory_step(client, site);
+        directory_veto = veto;
+        if let Some(route) = route {
+            return Some(route);
+        }
+    }
+    // Fenced domain grounder: site slot + region hint → bare domain.
+    // Fallback when the directory finds nothing, is throttled, or had its
+    // hit vetoed (both backends degrade to `None`, never a guess). The
+    // grounder sees only the normalized site name and the region code,
+    // never the raw prompt. Its output is validated in Rust (https, valid
+    // TLD, no credentials, no raw IP) before navigation. A malformed
+    // response degrades to the next rung, never to a guessed
+    // `www.{noun}.com`.
+    if let Some(grounder) = ctx.domain_grounder
+        && let Some(domain) = grounder.ground_domain(site, ctx.region_hint)
+        && let Some(url) = validate_grounded_domain(&domain)
+        && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
+    {
+        return Some(ResolvedRoute {
+            directory_veto,
+            ..route
+        });
+    }
+    // Ungrounded and no directory: a miss. The caller surfaces "try a full
+    // domain or save a site shortcut" — asking once beats a scraped SERP
+    // that may be a challenge page or an ad.
+    None
 }
 
 /// A fenced domain grounder: a site name in, a bare domain out.
@@ -985,92 +1077,33 @@ pub fn resolve_entry_url(
     {
         return accept(&url, RouteSource::LlmFallback);
     }
-    // Tier 3: direct-open grounding ladder. High-confidence single-target
-    // opens never touch the search template: the destination comes from
-    // the user's own data, a structured directory, a fenced grounder, or
-    // nowhere.
+    // Tier 3: direct-open grounding ladder — the shared site-only ladder
+    // ([`resolve_site_entry_url`]) over the target noun. High-confidence
+    // single-target opens never touch the search template: the destination
+    // comes from the user's own data, a structured directory, a fenced
+    // grounder, or nowhere. An ungrounded site returns `None` so the caller
+    // can ask the user instead of scraping a search page.
     let grammar = parse_grammar(prompt, connected_origin);
     if is_direct_open(prompt, &grammar) {
-        let target = grammar.target_noun.as_deref();
-        // 3a. User-saved site shortcut. A corrupt saved URL is skipped —
-        // stale data must not veto the rung below it.
-        if let Some(store) = ctx.shortcuts
-            && let Some(name) = target
-            && let Some(url) = store.shortcut_url(name)
-            && let Some(route) = accept_user_directed(&url, RouteSource::Shortcut)
+        if let Some(target) = grammar.target_noun.as_deref()
+            && let Some(route) = resolve_site_entry_url(target, ctx)
         {
             return Some(route);
         }
-        // 3b. Structured site directory, composite: Brave's sanctioned API
-        // when `CLINCH_BRAVE_API_KEY` is set, DuckDuckGo's keyless HTML
-        // endpoint as the zero-config fallback (`ChainedSiteSearch`). Either
-        // way the rung is never unconfigured — DDG works out of the box.
-        // This rung runs BEFORE the LLM grounder: a search backend returns
-        // ranked results as data, and ranking is the ground truth of what
-        // a site name means — it cannot hallucinate the way a generative
-        // model can (`claude` → `open.com`). The call is backend HTTP in
-        // memory; the browser never sees a search page.
-        // Trust note: the directory resolves a *name the user typed*, the
-        // same way asking an assistant to "open amazon" does — it is name
-        // resolution, not a machine-invented destination. The structural
-        // bar (absolute https, real host, no credentials) stays the honest
-        // one, but a structurally-valid URL can still be the WRONG site —
-        // a support article once shipped as a confident navigation. So
-        // every hit passes a plausibility veto first
-        // ([`directory_veto_note`]): the host's registrable label must
-        // contain the queried name or vice versa, with exactly one blessed
-        // alias (`gmail` → `mail.google.com`). A vetoed hit is never
-        // navigated — the ladder falls through to the grounder rung and
-        // the veto rides the journal line. The veto is a heuristic, not a
-        // security boundary: `amazon-phishing.com` still contains `amazon`,
-        // so phishing-shaped hosts pass it the way they pass any
-        // name check. The residual wrong-site risk is handled where the
-        // search fallback already handles it — the browser is visible,
-        // submits and downloads keep their approval gates, and the portal
-        // re-anchors to the landed origin instead of trusting a prediction.
-        let mut directory_veto: Option<String> = None;
-        if let Some(client) = ctx.site_search
-            && let Some(name) = target
-        {
-            let (route, veto) = directory_step(client, name);
-            directory_veto = veto;
-            if let Some(route) = route {
-                return Some(route);
-            }
-        }
-        // 3c. Fenced domain grounder: site slot + region hint → bare domain.
-        // Fallback when the directory finds nothing, is throttled, or had
-        // its hit vetoed (both backends degrade to `None`, never a guess).
-        // The grounder sees only the normalized site name and the region
-        // code, never the raw prompt. Its output is validated in Rust
-        // (https, valid TLD, no credentials, no raw IP) before navigation.
-        // A malformed response degrades to the next rung, never to a
-        // guessed `www.{noun}.com`.
-        if let Some(grounder) = ctx.domain_grounder
-            && let Some(name) = target
-            && let Some(domain) = grounder.ground_domain(name, ctx.region_hint)
-            && let Some(url) = validate_grounded_domain(&domain)
-            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
-        {
-            return Some(ResolvedRoute {
-                directory_veto,
-                ..route
-            });
-        }
-        // 3d. Ungrounded and no directory: a miss. The caller surfaces
-        // "try a full domain or save a site shortcut" — asking once beats
-        // a scraped SERP that may be a challenge page or an ad.
+        // Ungrounded: a miss. The caller surfaces "try a full domain or
+        // save a site shortcut" — asking once beats a scraped SERP that may
+        // be a challenge page or an ad.
         return None;
     }
     // Tier 3b: in-page goal — the prompt names a site and carries an
     // artifact noun ("open my profile on the reddit"), so it is not a
     // direct open and must never become a search query when the site
-    // grounds. Ground ONLY the site through the ladder; the artifact is
-    // pursued on the live page by the dispatcher, never searched. When no
-    // rung knows the site, fall through to Tier 4: with nothing to
-    // navigate to, the grounded search template is the designed last
-    // resort (and in production the directory rung below is always live,
-    // so this corner is theoretical).
+    // grounds. Ground ONLY the site through the shared site-only ladder
+    // ([`resolve_site_entry_url`]); the artifact is pursued on the live
+    // page by the dispatcher, never searched. When no rung knows the site,
+    // fall through to Tier 4: with nothing to navigate to, the grounded
+    // search template is the designed last resort (and in production the
+    // directory rung below is always live, so this corner is theoretical).
     //
     // Coordinator veto mirrors `is_direct_open`: "open my profile on
     // reddit and twitter" is a multi-target prompt and must not silently
@@ -1083,38 +1116,12 @@ pub fn resolve_entry_url(
             grammar.site_context.as_deref(),
             grammar.artifact_noun.as_deref(),
         )
+        && let Some(route) = resolve_site_entry_url(site, ctx)
     {
-        // 3a. User-saved site shortcut.
-        if let Some(store) = ctx.shortcuts
-            && let Some(url) = store.shortcut_url(site)
-            && let Some(route) = accept_user_directed(&url, RouteSource::Shortcut)
-        {
-            return Some(route);
-        }
-        // 3b. Structured site directory (Brave API / keyless DDG), with the
-        // plausibility veto: a host-mismatched hit falls through to the
-        // grounder instead of navigating confidently.
-        let mut directory_veto: Option<String> = None;
-        if let Some(client) = ctx.site_search {
-            let (route, veto) = directory_step(client, site);
-            directory_veto = veto;
-            if let Some(route) = route {
-                return Some(route);
-            }
-        }
-        // 3c. Fenced domain grounder.
-        if let Some(grounder) = ctx.domain_grounder
-            && let Some(domain) = grounder.ground_domain(site, ctx.region_hint)
-            && let Some(url) = validate_grounded_domain(&domain)
-            && let Some(route) = accept_user_directed(&url, RouteSource::DomainGrounded)
-        {
-            return Some(ResolvedRoute {
-                directory_veto,
-                ..route
-            });
-        }
-        // 3d. Site ungrounded: fall through to the Tier 4 search template.
+        return Some(route);
     }
+    // 3d. Site ungrounded (or coordinator, or no artifact): fall through
+    // to the Tier 4 search template below.
     // Tier 4: grounded search fallback — fixed template, no TLD guessing.
     // Only runs when no stronger tier proposed anything and the prompt is
     // not a direct open; invalid stronger proposals already returned `None`

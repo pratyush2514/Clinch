@@ -2,11 +2,14 @@
 mod auth;
 mod service;
 mod ws_server;
+// Narrow public seam for external integration tests (`tests/`): the funnel
+// dispatcher and its outcome/error types. Everything else in `service`
+// stays crate-private.
 use auth::AuthPanel;
+pub use service::{AppError, AppService, DispatchOutcome, PlaybookEvent};
 use service::{
-    AppError, AppService, ApprovalPreview, BridgeStatus, ContextStatus, DispatchOutcome,
-    IntentPreview, LendOutcome, LendRequest, PickerStatus, PocMetrics, SessionStatus,
-    StorageStatus,
+    ApprovalPreview, BridgeStatus, ContextStatus, IntentPreview, LendOutcome, LendRequest,
+    PickerStatus, PocMetrics, SessionStatus, StorageStatus,
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;

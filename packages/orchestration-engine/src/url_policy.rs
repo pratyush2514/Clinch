@@ -122,6 +122,19 @@ pub fn still_on_search_page(entry_url: &url::Url, landed_url: &url::Url) -> bool
     })
 }
 
+/// The funnel's settle contract (pure): the observed landing belongs to the
+/// resolved site slot, alias-aware ([`crate::site_matches_host`]). A search
+/// landing on a non-matching domain (`google.com/search?...` for site
+/// `x`) is NOT a match — search-shaped and mismatched is the honest miss,
+/// not a quiet success. Match means same-site as the slot; path and query
+/// are the site's business, not the verdict's.
+#[must_use]
+pub fn funnel_landing_matches(site_slot: &str, landed: &url::Url) -> bool {
+    landed
+        .host_str()
+        .is_some_and(|host| crate::site_matches_host(site_slot, host))
+}
+
 /// Validation bar for a proposed entry URL, by route provenance.
 /// User-directed destinations — a typed domain, a saved shortcut, a site
 /// the directory resolved, a site the domain grounder resolved — were named

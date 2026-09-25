@@ -2,6 +2,7 @@
 //! Task → Plan → Step execution with durable boundaries and typed progress.
 mod domain_grounder;
 mod entity_resolver;
+mod funnel_slots;
 mod goal_class;
 mod intent_parser;
 mod intent_resolver;
@@ -15,6 +16,10 @@ mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
+pub use funnel_slots::{
+    AsideInfo, FunnelDecision, FunnelPlan, FunnelSlots, ObjectClass, funnel_claims, funnel_plan,
+    object_noun, split_slots, strip_asides,
+};
 pub use goal_class::{GoalClass, goal_class_for};
 pub use intent_parser::{
     IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,
@@ -24,7 +29,8 @@ pub use intent_resolver::{
     AppCommand, CommandMatch, Confidence, ExtractedVariable, ParsedGrammar, ParsedIntent,
     VariableExtraction, VariableKind, decompose_command, detect_in_page_goal, ephemeral_name,
     extract_dynamic_variables, extract_identifier, follow_up_on_origin, is_direct_open,
-    parse_grammar, parse_intent_structured, prompt_key, resolve_app_command, resolve_command,
+    open_verb_leads, parse_grammar, parse_intent_structured, prompt_key, resolve_app_command,
+    resolve_command,
 };
 pub use llm_intent_parser::LlmIntentParser;
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
@@ -33,8 +39,9 @@ pub use route_proposer::{
     BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,
     LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,
     SiteHit, SiteSearchClient, SlotSource, StubDomainGrounder, explicit_url_in_prompt,
-    region_hint_from_timezone, resolve_entry_url, resolve_slots, sanitize_search_query,
-    search_fallback_url, system_region_hint, validate_grounded_domain,
+    region_hint_from_timezone, resolve_entry_url, resolve_site_entry_url, resolve_slots,
+    sanitize_search_query, search_fallback_url, site_matches_host, system_region_hint,
+    validate_grounded_domain,
 };
 pub use runner::{
     IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,
@@ -46,8 +53,8 @@ use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
 pub use url_policy::{
-    UrlRejected, entry_url_valid, still_on_search_page, validate_proposed_url,
-    validate_user_directed_url,
+    UrlRejected, entry_url_valid, funnel_landing_matches, still_on_search_page,
+    validate_proposed_url, validate_user_directed_url,
 };
 
 #[derive(Debug, thiserror::Error)]

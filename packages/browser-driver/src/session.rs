@@ -233,6 +233,23 @@ pub fn href_from_attributes(attributes: Option<&[String]>) -> Option<String> {
     None
 }
 
+/// Pure attribute scan behind [`ManagedBrowser::node_expanded`]: CDP
+/// flattens a node's attributes into alternating name/value strings.
+/// Only an explicit `aria-expanded="true"` counts as expanded — a
+/// missing attribute, or any other value, yields `None`, so an unknown
+/// state is never mistaken for evidence.
+#[must_use]
+pub fn expanded_from_attributes(attributes: Option<&[String]>) -> Option<bool> {
+    let attrs = attributes?;
+    let (pairs, _remainder) = attrs.as_chunks::<2>();
+    for pair in pairs {
+        if pair[0].eq_ignore_ascii_case("aria-expanded") {
+            return Some(pair[1].trim().eq_ignore_ascii_case("true"));
+        }
+    }
+    None
+}
+
 fn challenge_kind(title: &str, url: &Url, body_text: &str) -> Option<ChallengeKind> {
     // Interactive markers are the more specific signal: check them first
     // so a gate page is never misrouted through L1. Existing markers keep
@@ -424,6 +441,27 @@ impl ManagedBrowser {
             .result
             .node;
         href_from_attributes(node.attributes.as_deref())
+    }
+
+    /// Best-effort `aria-expanded` state of the DOM node behind a backend
+    /// node id, for disclosure controls whose expanded state the page
+    /// manages (a menu that renders before its AX subtree arrives, or
+    /// one that never surfaces AX nodes at all). Resolved lazily per
+    /// candidate — never for the whole snapshot. `None` on any CDP
+    /// failure, timeout, or missing/unparseable attribute: unknown is
+    /// never evidence, only `Some(true)` is.
+    pub async fn node_expanded(&self, backend_node_id: i64) -> Option<bool> {
+        use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams};
+        let params = DescribeNodeParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .build();
+        let node = tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
+            .await
+            .ok()?
+            .ok()?
+            .result
+            .node;
+        expanded_from_attributes(node.attributes.as_deref())
     }
 
     /// Viewport CSS dimensions `(width, height)`, for geometry heuristics

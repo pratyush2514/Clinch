@@ -1,15 +1,29 @@
-//! Shared menu-opening primitive: pure candidate ranking.
+//! Shared menu-opening primitive: pure candidate ranking plus the async
+//! click → poll-for-evidence → retry loop.
 //!
 //! `rank_menu_candidates` orders (a) landmarked banner/navigation
 //! buttons, (b) account-worded buttons, (c) blank-named buttons inside
 //! the header strip (rightmost first), (d) remaining in-strip buttons
-//! (rightmost first). The click/verify loop itself needs a live browser
-//! and is covered by native validation, like the other pursuit loops —
-//! no Chromium is available in this environment, so there is no live
-//! integration test here.
+//! (rightmost first). The loop itself is driven against a scripted
+//! [`MenuBrowser`] fake — no Chromium needed: the fake serves one steady
+//! snapshot tree (a poll that outlasts the script sees a steady tree
+//! instead of hanging), records clicks, and flips scripted page state,
+//! proving the retry order, the evidence poll, and the timing bounds.
 
-use browser_driver::AxElement;
-use macro_engine::{ClickedControl, rank_menu_candidates};
+use browser_driver::{AxElement, AxResyncCheck, BrowserError, Highlight};
+use macro_engine::{
+    ClickedControl, IntentError, MenuBrowser, MenuOpenBaseline, OpenMenuOutcome,
+    open_identity_menu, rank_menu_candidates,
+};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use url::Url;
+
+fn origin() -> Url {
+    Url::parse("https://www.example.com/")
+        .unwrap_or_else(|error| panic!("test origin parses: {error}"))
+}
 
 fn el(id: i64, role: &str, name: &str, landmark: Option<&str>) -> AxElement {
     AxElement {
@@ -140,4 +154,364 @@ fn whitespace_only_name_counts_as_blank() {
 fn empty_snapshot_ranks_nothing() {
     let ranked = rank_menu_candidates(&[], &[], &[(1, 100.0, 50.0)], Some(200.0));
     assert!(ranked.is_empty());
+}
+
+// ---- scripted MenuBrowser fake ----
+
+/// Hermetic stand-in for a live page behind [`open_identity_menu`]:
+/// serves one steady snapshot tree (a poll that outlasts the script
+/// sees a steady tree instead of hanging), records clicks, and switches
+/// to a scripted menu tree once a chosen control is clicked.
+/// `aria-expanded` answers come from a map. Every snapshot served is
+/// timestamped for early-return assertions.
+struct FakeMenuBrowser {
+    tree: Vec<AxElement>,
+    raw_nodes: usize,
+    clicks: Mutex<Vec<i64>>,
+    expanded: HashMap<i64, bool>,
+    opens_menu_on_click: Option<i64>,
+    menu_tree: Vec<AxElement>,
+    viewport: Option<(f64, f64)>,
+    rects: HashMap<i64, (f64, f64)>,
+    snapshot_at: Mutex<Vec<Instant>>,
+}
+
+impl FakeMenuBrowser {
+    fn new(tree: Vec<AxElement>) -> Self {
+        Self {
+            tree,
+            raw_nodes: 10,
+            clicks: Mutex::new(Vec::new()),
+            expanded: HashMap::new(),
+            opens_menu_on_click: None,
+            menu_tree: Vec::new(),
+            viewport: Some((1200.0, 800.0)),
+            rects: HashMap::new(),
+            snapshot_at: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_rect(mut self, id: i64, x: f64, y: f64) -> Self {
+        self.rects.insert(id, (x, y));
+        self
+    }
+
+    fn with_menu_on_click(mut self, id: i64, menu_tree: Vec<AxElement>) -> Self {
+        self.opens_menu_on_click = Some(id);
+        self.menu_tree = menu_tree;
+        self
+    }
+
+    fn with_expanded(mut self, id: i64, expanded: bool) -> Self {
+        self.expanded.insert(id, expanded);
+        self
+    }
+
+    async fn clicks(&self) -> Vec<i64> {
+        self.clicks.lock().await.clone()
+    }
+
+    async fn snapshot_count(&self) -> usize {
+        self.snapshot_at.lock().await.len()
+    }
+}
+
+impl MenuBrowser for FakeMenuBrowser {
+    fn menu_viewport_size(&self) -> impl std::future::Future<Output = Option<(f64, f64)>> + Send {
+        std::future::ready(self.viewport)
+    }
+
+    fn menu_node_rect(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Result<Highlight, BrowserError>> + Send {
+        let (x, y) = self
+            .rects
+            .get(&backend_node_id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        std::future::ready(Ok(Highlight {
+            selector: format!("ax:{backend_node_id}"),
+            x,
+            y,
+            width: 40.0,
+            height: 40.0,
+            matches: 1,
+        }))
+    }
+
+    async fn menu_snapshot(&self, _origin: &Url) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        self.snapshot_at.lock().await.push(Instant::now());
+        let clicks = self.clicks.lock().await;
+        let tree = if self
+            .opens_menu_on_click
+            .is_some_and(|id| clicks.contains(&id))
+        {
+            self.menu_tree.clone()
+        } else {
+            self.tree.clone()
+        };
+        (tree, AxResyncCheck::new(self.raw_nodes, None), 0)
+    }
+
+    fn menu_node_expanded(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Option<bool>> + Send {
+        std::future::ready(self.expanded.get(&backend_node_id).copied())
+    }
+
+    async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
+        self.clicks.lock().await.push(element.backend_node_id);
+        Ok(())
+    }
+}
+
+fn baseline_check() -> AxResyncCheck {
+    AxResyncCheck::new(10, None)
+}
+
+// ---- open_identity_menu loop ----
+
+#[tokio::test]
+async fn menu_opens_on_first_click_with_new_actionable_controls() {
+    // Baseline header: account-worded button, blank avatar button, link.
+    let baseline = vec![
+        el(1, "button", "Open user actions", None),
+        el(2, "button", "", None),
+        el(3, "link", "Home", None),
+    ];
+    let mut menu_tree = baseline.clone();
+    menu_tree.push(el(10, "menuitem", "Profile", None));
+    menu_tree.push(el(11, "menuitem", "Settings", None));
+    let fake = FakeMenuBrowser::new(menu_tree).with_rect(2, 950.0, 50.0);
+    let check = baseline_check();
+
+    let mut clicked = Vec::new();
+    let Ok(outcome) = open_identity_menu(
+        &fake,
+        &origin(),
+        MenuOpenBaseline {
+            elements: &baseline,
+            check: &check,
+        },
+        &mut clicked,
+        3,
+    )
+    .await
+    else {
+        panic!("fake browser never fails")
+    };
+
+    match outcome {
+        OpenMenuOutcome::Opened { control, tried } => {
+            assert_eq!(control, ClickedControl::of(&baseline[0]));
+            assert!(
+                tried.contains("menuitem 'Profile'"),
+                "tried line names the revealed control, got: {tried}"
+            );
+        }
+        OpenMenuOutcome::Miss { tried } => panic!("expected Opened, got Miss: {tried:?}"),
+    }
+    assert_eq!(fake.clicks().await, vec![1]);
+    assert_eq!(clicked, vec![ClickedControl::of(&baseline[0])]);
+    // Evidence was on the first tick: exactly one snapshot served, far
+    // short of the 3s bound — no fixed sleep is burned.
+    assert_eq!(fake.snapshot_count().await, 1);
+}
+
+#[tokio::test]
+async fn menu_opens_on_second_click_after_first_went_stale() {
+    let baseline = vec![
+        el(1, "button", "Open user actions", None),
+        el(2, "button", "", None),
+        el(3, "link", "Home", None),
+    ];
+    let mut menu_tree = baseline.clone();
+    menu_tree.push(el(10, "menuitem", "Profile", None));
+    // Clicking id 1 lands but nothing opens: every poll tick sees the
+    // unchanged tree, so the first attempt burns its full bound. The
+    // re-rank must skip id 1 (already clicked, by stable identity) and
+    // try the next candidate, id 2, whose click reveals the menu.
+    let fake = FakeMenuBrowser::new(baseline.clone())
+        .with_rect(1, 900.0, 50.0)
+        .with_rect(2, 950.0, 50.0)
+        .with_menu_on_click(2, menu_tree);
+    let check = baseline_check();
+
+    let start = Instant::now();
+    let mut clicked = Vec::new();
+    let Ok(outcome) = open_identity_menu(
+        &fake,
+        &origin(),
+        MenuOpenBaseline {
+            elements: &baseline,
+            check: &check,
+        },
+        &mut clicked,
+        3,
+    )
+    .await
+    else {
+        panic!("fake browser never fails")
+    };
+    let elapsed = start.elapsed();
+
+    match outcome {
+        OpenMenuOutcome::Opened { control, tried } => {
+            assert_eq!(control, ClickedControl::of(&baseline[1]));
+            assert!(
+                tried.contains("menuitem 'Profile'"),
+                "tried line names the revealed control, got: {tried}"
+            );
+        }
+        OpenMenuOutcome::Miss { tried } => panic!("expected Opened, got Miss: {tried:?}"),
+    }
+    // Rank order, each clicked once: id 1 is never re-clicked even
+    // though the re-rank snapshot still offers it.
+    assert_eq!(fake.clicks().await, vec![1, 2]);
+    assert_eq!(
+        clicked,
+        vec![
+            ClickedControl::of(&baseline[0]),
+            ClickedControl::of(&baseline[1]),
+        ]
+    );
+    // The stale first attempt waited out its poll bound instead of
+    // bailing instantly.
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "first attempt should burn its bound, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn menu_never_opens_misses_after_the_cap() {
+    // Three tier-(d) candidates: named in-strip buttons, rightmost first.
+    let baseline = vec![
+        el(1, "button", "Chat", None),
+        el(2, "button", "Search", None),
+        el(3, "button", "Mail", None),
+    ];
+    let fake = FakeMenuBrowser::new(baseline.clone())
+        .with_rect(1, 100.0, 50.0)
+        .with_rect(2, 200.0, 50.0)
+        .with_rect(3, 300.0, 50.0);
+    let check = baseline_check();
+
+    let start = Instant::now();
+    let mut clicked = Vec::new();
+    let Ok(outcome) = open_identity_menu(
+        &fake,
+        &origin(),
+        MenuOpenBaseline {
+            elements: &baseline,
+            check: &check,
+        },
+        &mut clicked,
+        3,
+    )
+    .await
+    else {
+        panic!("fake browser never fails")
+    };
+    let elapsed = start.elapsed();
+
+    match outcome {
+        OpenMenuOutcome::Miss { tried } => {
+            assert_eq!(tried.len(), 3, "one tried line per attempt: {tried:?}");
+            assert!(
+                tried.iter().all(|line| line.contains("no new controls")),
+                "every attempt reports no evidence: {tried:?}"
+            );
+        }
+        OpenMenuOutcome::Opened { tried, .. } => panic!("expected Miss, got Opened: {tried}"),
+    }
+    assert_eq!(fake.clicks().await, vec![3, 2, 1]);
+    assert_eq!(clicked.len(), 3);
+    // Bounded: three attempts times the ~3s poll bound — never hangs,
+    // never bails before the bound either.
+    assert!(
+        elapsed >= Duration::from_secs(8),
+        "each attempt waits the full bound, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "bounded, doesn't hang: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn poll_returns_early_when_evidence_is_immediate() {
+    let baseline = vec![el(1, "button", "Open user actions", None)];
+    let mut menu_tree = baseline.clone();
+    menu_tree.push(el(10, "menuitem", "Profile", None));
+    // The menu is already open on the first poll tick.
+    let fake = FakeMenuBrowser::new(menu_tree);
+    let check = baseline_check();
+
+    let start = Instant::now();
+    let mut clicked = Vec::new();
+    let Ok(outcome) = open_identity_menu(
+        &fake,
+        &origin(),
+        MenuOpenBaseline {
+            elements: &baseline,
+            check: &check,
+        },
+        &mut clicked,
+        3,
+    )
+    .await
+    else {
+        panic!("fake browser never fails")
+    };
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(outcome, OpenMenuOutcome::Opened { .. }),
+        "expected Opened, got {outcome:?}"
+    );
+    assert_eq!(fake.snapshot_count().await, 1);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "returned at the first tick, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn aria_expanded_true_counts_as_open_evidence() {
+    let baseline = vec![el(1, "button", "Open user actions", None)];
+    // The snapshot never changes — no new controls, no menu roles — but
+    // the clicked control reports aria-expanded=true.
+    let fake = FakeMenuBrowser::new(baseline.clone()).with_expanded(1, true);
+    let check = baseline_check();
+
+    let mut clicked = Vec::new();
+    let Ok(outcome) = open_identity_menu(
+        &fake,
+        &origin(),
+        MenuOpenBaseline {
+            elements: &baseline,
+            check: &check,
+        },
+        &mut clicked,
+        3,
+    )
+    .await
+    else {
+        panic!("fake browser never fails")
+    };
+
+    match outcome {
+        OpenMenuOutcome::Opened { tried, .. } => {
+            assert!(
+                tried.contains("aria-expanded=true"),
+                "tried line names the evidence, got: {tried}"
+            );
+        }
+        OpenMenuOutcome::Miss { tried } => panic!("expected Opened, got Miss: {tried:?}"),
+    }
+    assert_eq!(fake.clicks().await, vec![1]);
+    assert_eq!(fake.snapshot_count().await, 1);
 }
