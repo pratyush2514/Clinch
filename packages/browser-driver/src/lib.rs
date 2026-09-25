@@ -198,13 +198,39 @@ fn anchor_origin(entry: &Url) -> Url {
     anchor
 }
 
+/// Same-site origin comparison for portal confinement: equivalent to
+/// `Url::origin()` equality except a leading `www.` on the host is ignored
+/// (`https://www.reddit.com` and `https://reddit.com` are the same site).
+/// Strict origin equality breaks the moment a grounded route and the live
+/// page disagree on the `www.` prefix — the site redirects bare→www (or
+/// vice versa), every snapshot then reads as drifted and comes back empty,
+/// and the worker, the auth probe, and the model fallback all go blind at
+/// once (caught live: grounder returned bare `reddit.com` while the tab sat
+/// on `www.reddit.com`). Scheme and port still compare strictly, and only
+/// the `www.` alias is folded — `mail.example.com` is not `example.com`.
+/// This mirrors the `www.`-folding the identity memory and the
+/// account-home verifier already apply.
+#[must_use]
+pub fn same_site_origin(a: &Url, b: &Url) -> bool {
+    fn normalized_host(url: &Url) -> Option<String> {
+        url.host_str().map(|host| {
+            let lower = host.to_lowercase();
+            lower.strip_prefix("www.").unwrap_or(&lower).to_owned()
+        })
+    }
+    a.scheme() == b.scheme()
+        && a.port_or_known_default() == b.port_or_known_default()
+        && normalized_host(a) == normalized_host(b)
+}
+
 /// Anchored confinement verdict: drift holds only when the live page
 /// origin matches neither the call's requested origin nor the active
 /// anchor. The anchor is set solely by intentional navigation, so with no
-/// anchor this is exactly the legacy strict check.
+/// anchor this is exactly the legacy strict check. Host comparison folds
+/// the `www.` alias (see [`same_site_origin`]).
 fn is_anchored_drift(live: &Url, requested: &Url, anchor: Option<&Url>) -> bool {
-    live.origin() != requested.origin()
-        && anchor.is_none_or(|pinned| live.origin() != pinned.origin())
+    !same_site_origin(live, requested)
+        && anchor.is_none_or(|pinned| !same_site_origin(live, pinned))
 }
 
 /// Drift error text naming the active anchor and the live page, e.g.

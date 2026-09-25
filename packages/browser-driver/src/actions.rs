@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 //! Small typed CDP vocabulary. No arbitrary JavaScript or credentials in macros.
-use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
+use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser, same_site_origin};
 use chromiumoxide::cdp::browser_protocol::browser::{
     DownloadProgressState, EventDownloadProgress, EventDownloadWillBegin,
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
@@ -123,7 +123,7 @@ impl Action {
         }
         match self {
             Self::Navigate { url }
-                if url.origin() != origin.origin()
+                if !same_site_origin(url, origin)
                     || !matches!(url.scheme(), "https" | "http")
                     || !url.username().is_empty()
                     || url.password().is_some() =>
@@ -166,7 +166,7 @@ impl ManagedBrowser {
         let current = current
             .and_then(|s| Url::parse(&s).ok())
             .ok_or(BrowserError::WrongOrigin)?;
-        if current.origin() != origin.origin() {
+        if !same_site_origin(&current, origin) {
             return Err(BrowserError::WrongOrigin);
         }
         Ok(())

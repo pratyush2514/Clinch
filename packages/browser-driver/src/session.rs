@@ -5,7 +5,7 @@
 //! Secrets never leave this module's call path: cookies are injected straight
 //! into the CDP target and only counts/origins are reported outward.
 
-use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
+use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser, same_site_origin};
 use url::Url;
 
 /// Machine-readable result of opening a portal after cookie injection.
@@ -60,7 +60,7 @@ fn is_known_sso(candidate: &str, portal: &str) -> bool {
 /// case-insensitive on the path only.
 #[must_use]
 pub fn detect_auth_signal(current: &Url, portal: &Url) -> AuthSignal {
-    if current.origin() != portal.origin() {
+    if !same_site_origin(current, portal) {
         let url = current.as_str().to_owned();
         let sso = match (current.host_str(), portal.host_str()) {
             (Some(current_host), Some(portal_host)) => is_known_sso(current_host, portal_host),
