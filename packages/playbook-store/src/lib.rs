@@ -51,6 +51,35 @@ pub struct IdentityMemory {
     pub source: String,
 }
 
+/// One remembered settings destination per origin: the settings URL a run
+/// verified on the live page for this origin, never guessed. Lets a
+/// repeat "open settings" become a single validated navigation instead
+/// of another menu hunt. No cookies, no credentials.
+///
+/// Stored in the same `identity_memory` table as [`IdentityMemory`] under
+/// the `"settings"` goal class — the table is already keyed by
+/// (`origin`, `goal_class`), so settings rows share the origin normalization
+/// and the forget-site scope for free, without ever touching the profile
+/// (`account_home`) row for the same origin.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettingsDestination {
+    pub origin: String,
+    pub href: String,
+    pub source: String,
+}
+
+/// Goal class key for remembered settings destinations. Mirrors the key
+/// the settings worker resolves through `GoalClass::Settings.as_str()` —
+/// both name the same row, so the worker can recall through this API or
+/// through `recall_identity` with the class key interchangeably.
+const SETTINGS_GOAL_CLASS: &str = "settings";
+
+/// Provenance stamped on every settings row: the row is an observed
+/// verified landing, never a guess. The writer takes the verified
+/// destination itself, so this source is a contract of the write path,
+/// not a caller-chosen parameter.
+const SETTINGS_SOURCE: &str = "verified_landing";
+
 /// Normalize an origin into the memory keyspace: lowercase, trimmed.
 /// Origins never carry interior whitespace, so no collapsing is needed.
 /// Normalize an identity-memory origin key: lowercase, trimmed, and with
@@ -443,7 +472,10 @@ impl PlaybookStore {
     /// "Forget this site" flow alongside cookie revocation, so a signed-out
     /// origin can never be navigated from a stale remembered profile.
     /// Matches the host with or without a `www.` prefix, since the row may
-    /// have been keyed by either form. Returns the number of rows removed.
+    /// have been keyed by either form. The identity table is keyed by
+    /// (origin, goal class), so this covers settings destinations too —
+    /// [`PlaybookStore::forget_site`] is the same operation under the
+    /// forget-site name. Returns the number of rows removed.
     ///
     /// # Errors
     /// Returns database errors.
@@ -459,6 +491,131 @@ impl PlaybookStore {
                 .execute(&self.pool)
                 .await?;
         Ok(done.rows_affected())
+    }
+
+    /// Forget every remembered identity fact for an origin *and* goal
+    /// class. Used when a stale row is evicted: a stale `account_home`
+    /// row must not drop the origin's `settings` row (or vice versa) —
+    /// the rows are independent discoveries from different goal lanes.
+    /// Same www-prefix matching as [`PlaybookStore::forget_identity_for_origin`].
+    /// Returns the number of rows removed.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn forget_identity_for_origin_and_class(
+        &self,
+        origin: &str,
+        goal_class: &str,
+    ) -> Result<u64, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        let goal_class = goal_class.trim().to_lowercase();
+        let bare = origin.strip_prefix("www.").unwrap_or(&origin);
+        let done = sqlx::query(
+            "DELETE FROM identity_memory WHERE goal_class = ? AND (origin = ? OR origin = 'www.' || ?)",
+        )
+        .bind(&goal_class)
+        .bind(bare)
+        .bind(bare)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Remember a verified settings landing: the settings URL a run
+    /// verified on the live page for this origin. Call only from the
+    /// verified outcome — the writer takes the verified destination
+    /// itself, so there is no write path from a miss, an unverified guess,
+    /// or a stale hint; the stored row is stamped `"verified_landing"` as
+    /// provenance. Upserted per (origin, `"settings"`): a fresh discovery
+    /// replaces a stale one, never appends, and never touches the
+    /// identity (`account_home`) row for the same origin. The href must be
+    /// an absolute `https` URL with no embedded credentials; anything else
+    /// is rejected so a malformed read can never poison future runs.
+    ///
+    /// # Errors
+    /// Returns validation or database errors.
+    pub async fn remember_settings_destination(
+        &self,
+        origin: &str,
+        href: &str,
+    ) -> Result<SettingsDestination, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        if origin.is_empty() {
+            return Err(StoreError::Shortcut(
+                "settings origin must be non-empty".to_owned(),
+            ));
+        }
+        // Same structural bar as the identity href, plus credential
+        // rejection: a destination that embeds `user@` or `user:pass@`
+        // would leak secrets into the store and into later navigations.
+        let parsed = url::Url::parse(href).ok().filter(|parsed| {
+            parsed.scheme() == "https"
+                && parsed.has_host()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        });
+        let Some(parsed) = parsed else {
+            return Err(StoreError::Shortcut(
+                "settings destination must be an absolute https URL without credentials".to_owned(),
+            ));
+        };
+        sqlx::query(
+            "INSERT INTO identity_memory(origin, goal_class, username, href, source, seen_at) VALUES(?, ?, NULL, ?, ?, CURRENT_TIMESTAMP) \
+             ON CONFLICT(origin, goal_class) DO UPDATE SET username=excluded.username, href=excluded.href, source=excluded.source, seen_at=CURRENT_TIMESTAMP",
+        )
+        .bind(&origin)
+        .bind(SETTINGS_GOAL_CLASS)
+        .bind(parsed.as_str())
+        .bind(SETTINGS_SOURCE)
+        .execute(&self.pool)
+        .await?;
+        Ok(SettingsDestination {
+            origin,
+            href: parsed.as_str().to_owned(),
+            source: SETTINGS_SOURCE.to_owned(),
+        })
+    }
+
+    /// Recall the remembered settings destination for an origin. Unknown
+    /// origins read back as unset rather than erroring: the settings
+    /// worker falls back to the live menu hunt, exactly as before memory
+    /// existed.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn recall_settings_destination(
+        &self,
+        origin: &str,
+    ) -> Result<Option<SettingsDestination>, StoreError> {
+        let origin = normalize_identity_origin(origin);
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT origin, href, source FROM identity_memory WHERE origin = ? AND goal_class = ?",
+        )
+        .bind(&origin)
+        .bind(SETTINGS_GOAL_CLASS)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(origin, href, source)| SettingsDestination {
+            origin,
+            href,
+            source,
+        }))
+    }
+
+    /// Forget every remembered fact for an origin — settings destinations
+    /// alongside identity facts, one site scope. Called by the "Forget
+    /// this site" flow alongside cookie revocation (the source browser is
+    /// untouched here — that is the caller's job), so a signed-out origin
+    /// can never be navigated from a stale remembered destination.
+    /// Returns the number of rows removed.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn forget_site(&self, origin: &str) -> Result<u64, StoreError> {
+        // Settings rows share the (origin, goal_class) identity table, so
+        // one origin-scoped delete covers both — with the same
+        // www-prefix matching as `forget_identity_for_origin`.
+        self.forget_identity_for_origin(origin).await
     }
 
     /// Newest-first summaries for the workflow list. A single corrupt row

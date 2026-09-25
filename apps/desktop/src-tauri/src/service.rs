@@ -2855,6 +2855,17 @@ impl AppService {
         Ok(outcome)
     }
 
+    /// Whether the funnel owns this prompt's dispatch: open-verb-led and
+    /// non-plural. This is the single source of truth for the preemption
+    /// gates in both dispatch lanes ([`Self::dispatch_adhoc_auto_acquire`]
+    /// and [`Self::dispatch_single_ephemeral`]); `dispatch_funnel`
+    /// re-derives the same decision from the plan, so a claimed prompt
+    /// always takes the funnel and never reaches the old proposal
+    /// machinery below either gate.
+    fn funnel_owns_prompt(prompt: &str, is_plural: bool) -> bool {
+        !is_plural && orchestration_engine::funnel_claims(prompt)
+    }
+
     async fn dispatch_adhoc_auto_acquire(
         &self,
         prompt: String,
@@ -2865,8 +2876,10 @@ impl AppService {
         // funnel before the old follow-up / proposal / search machinery.
         // The gate is pure (no browser): only a claimed prompt attaches
         // the live portal. The funnel declines anything it does not claim,
-        // so unclaimed prompts keep the existing pipeline untouched.
-        if !intent.is_plural && orchestration_engine::funnel_claims(&prompt) {
+        // so unclaimed prompts keep the existing pipeline untouched. The
+        // return inside makes the preemption terminal: a claimed prompt
+        // can never fall through to the machinery below.
+        if Self::funnel_owns_prompt(&prompt, intent.is_plural) {
             let portal = self.live_portal().await;
             if let Some(outcome) = self
                 .dispatch_funnel(prompt.clone(), &intent, portal, &mut emit)
@@ -3823,9 +3836,10 @@ impl AppService {
         // journaling are never bypassed (e.g. "open settings on reddit").
         // The connected portal is already known, so no extra browser
         // attach. The funnel declines anything it does not claim, so
-        // unclaimed prompts keep the existing pipeline untouched.
-        if !intent.is_plural
-            && orchestration_engine::funnel_claims(&prompt)
+        // unclaimed prompts keep the existing pipeline untouched. The
+        // return inside makes the preemption terminal: a claimed prompt
+        // can never fall through to the machinery below.
+        if Self::funnel_owns_prompt(&prompt, intent.is_plural)
             && let Some(outcome) = self
                 .dispatch_funnel(prompt.clone(), &intent, Some(portal.clone()), &mut emit)
                 .await
@@ -3997,17 +4011,26 @@ impl AppService {
             ))
             .await;
         // Goal-class branch: identity goals ("my profile", "my account")
-        // get the chrome worker with memory and verification; every other
-        // artifact keeps the generic noun-hunt path below.
+        // get the chrome worker with memory and verification; settings
+        // goals ("settings", "preferences") get the settings worker with
+        // the same memory shape; every other artifact keeps the generic
+        // noun-hunt path below.
         if let Some(goal_class) = orchestration_engine::goal_class_for(&noun) {
             let _ = self
                 .record(&format!("in_page_goal_class: {}", goal_class.as_str()))
                 .await;
-            return self
-                .dispatch_account_home_goal(
-                    &browser, &portal, &name, goal_class, navigator, goal_line,
-                )
-                .await;
+            return match goal_class {
+                orchestration_engine::GoalClass::AccountHome => {
+                    self.dispatch_account_home_goal(
+                        &browser, &portal, &name, goal_class, navigator, goal_line,
+                    )
+                    .await
+                }
+                orchestration_engine::GoalClass::Settings => {
+                    self.dispatch_settings_goal(&browser, &portal, &name, goal_line)
+                        .await
+                }
+            };
         }
         match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
@@ -4144,11 +4167,13 @@ impl AppService {
                 Some(landed.as_str().to_owned()),
             )));
         }
-        // Stale: drop the row and fall through to the live chrome read.
+        // Stale: drop only this goal class's row and fall through to the
+        // live chrome read. A stale profile row must not evict the
+        // origin's settings row — the rows are independent discoveries.
         let _ = self
             .playbooks()
             .await?
-            .forget_identity_for_origin(origin_host)
+            .forget_identity_for_origin_and_class(origin_host, class_key)
             .await;
         let _ = self.record("in_page_goal_memory: stale → rediscover").await;
         Ok(None)
@@ -4257,16 +4282,179 @@ impl AppService {
         }
     }
 
-    /// Navigate a remembered identity href after Rust-side validation, then
-    /// confirm the live page agrees. Returns the live URL on agreement,
-    /// `None` when anything disagrees (stale row, redirect to login, …).
-    async fn navigate_remembered_identity(
+    /// Memory fast path for `settings`: recall the remembered settings
+    /// destination, validate and navigate it. Returns `Some(outcome)` on
+    /// a live hit, `None` on miss or stale (stale rows are deleted here,
+    /// scoped to the settings goal class so the origin's identity row
+    /// survives). Extracted so `dispatch_settings_goal` stays within the
+    /// line budget.
+    async fn recall_settings_destination_fast_path(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
-        remembered: &playbook_store::IdentityMemory,
+        origin_host: &str,
+        name: &str,
+        goal_line: String,
+    ) -> Result<Option<DispatchOutcome>, AppError> {
+        let remembered = self
+            .playbooks()
+            .await?
+            .recall_settings_destination(origin_host)
+            .await
+            .map_err(|_| AppError::StorageUnavailable)?;
+        let Some(destination) = remembered else {
+            let _ = self.record("in_page_goal_memory: miss").await;
+            return Ok(None);
+        };
+        let _ = self
+            .record(&format!("in_page_goal_memory: hit {}", destination.href))
+            .await;
+        if let Some(landed) = self
+            .navigate_remembered_href(browser, portal, &destination.href, None)
+            .await
+        {
+            let _ = self
+                .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                .await;
+            return Ok(Some(Self::in_page_goal_outcome(
+                name,
+                goal_line,
+                Some(landed.as_str().to_owned()),
+            )));
+        }
+        // Stale: drop only the settings row and fall through to the live
+        // settings worker — the origin's identity row (if any) is a
+        // different goal class and survives.
+        let _ = self
+            .playbooks()
+            .await?
+            .forget_identity_for_origin_and_class(
+                origin_host,
+                orchestration_engine::GoalClass::Settings.as_str(),
+            )
+            .await;
+        let _ = self.record("in_page_goal_memory: stale → rediscover").await;
+        Ok(None)
+    }
+
+    /// `settings` dispatch: memory fast path first, live settings chrome
+    /// worker second, verifier-gated memory write, honest miss. Mirrors
+    /// `dispatch_account_home_goal`'s shape: the memory row is an observed
+    /// fact from the user's own run — written automatically from a
+    /// verified landing only, announced in the journal, revoked by
+    /// "Forget this site". An unverified navigation completes the run
+    /// but never becomes memory.
+    async fn dispatch_settings_goal(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        name: &str,
+        goal_line: String,
+    ) -> Result<DispatchOutcome, AppError> {
+        let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
+
+        // 1. Memory: a previous run verified this origin's settings URL. A
+        // live hit completes here; miss or stale falls through to the
+        // settings worker.
+        if let Some(outcome) = self
+            .recall_settings_destination_fast_path(
+                browser,
+                portal,
+                &origin_host,
+                name,
+                goal_line.clone(),
+            )
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        // 2. Live settings worker: menu hunt through the shared identity
+        // menu, verified landing only.
+        match macro_engine::pursue_settings_chrome(browser, portal).await {
+            Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
+                // Reached a settings destination, but the worker could not
+                // verify it from the page itself — the run completes, and
+                // memory stays untouched. Memory rows are verified landings
+                // only.
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: '{label}' → {} (unverified · no memory write)",
+                        landed.host_str().unwrap_or("?")
+                    ))
+                    .await;
+                Ok(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                ))
+            }
+            Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: verified '{label}' → {}",
+                        landed.as_str()
+                    ))
+                    .await;
+                match self
+                    .playbooks()
+                    .await?
+                    .remember_settings_destination(&origin_host, landed.as_str())
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = self
+                            .record(&format!(
+                                "in_page_goal_memory: write {origin_host} settings"
+                            ))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .record(&format!("in_page_goal_memory: write failed ({error})"))
+                            .await;
+                    }
+                }
+                Ok(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                ))
+            }
+            Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
+                let _ = self
+                    .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                let journal = self.recent_journal(16).await;
+                Err(AppError::WorkflowFailed(journal))
+            }
+            Err(macro_engine::IntentError::Browser(_)) => {
+                let _ = self.record("in_page_goal_miss: browser error").await;
+                Err(AppError::BrowserUnavailable)
+            }
+            Ok(
+                macro_engine::PageGoalOutcome::AlreadyThere { .. }
+                | macro_engine::PageGoalOutcome::SignedOut,
+            ) => {
+                // `pursue_settings_chrome` never yields these; defensive.
+                Err(AppError::Internal)
+            }
+        }
+    }
+
+    /// Validate a remembered href before navigating: absolute `https`,
+    /// no embedded credentials, same site as the portal (modulo `www.`),
+    /// non-root path. Identity rows additionally require the path to
+    /// still carry the remembered username; settings destinations carry
+    /// none. Pure — unit-provable without a browser;
+    /// `navigate_remembered_href` runs the same check before touching
+    /// the browser.
+    fn validate_remembered_href(
+        href: &str,
+        portal: &url::Url,
+        username: Option<&str>,
     ) -> Option<url::Url> {
-        let url = url::Url::parse(&remembered.href).ok()?;
+        let url = url::Url::parse(href).ok()?;
         if url.scheme() != "https" || url.path() == "/" || url.path().is_empty() {
             return None;
         }
@@ -4281,11 +4469,27 @@ impl AppService {
         ) {
             return None;
         }
-        if let Some(username) = remembered.username.as_deref()
+        if let Some(username) = username
             && !url.path().to_lowercase().contains(&username.to_lowercase())
         {
             return None;
         }
+        Some(url)
+    }
+
+    /// Navigate a validated remembered href, then confirm the live page
+    /// agrees. Returns the live URL on agreement, `None` when anything
+    /// disagrees (stale row, redirect to login, …). Shared by the
+    /// account-home and settings memory fast paths — the same navigation
+    /// and live-page checks, never reimplemented per goal class.
+    async fn navigate_remembered_href(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        href: &str,
+        username: Option<&str>,
+    ) -> Option<url::Url> {
+        let url = Self::validate_remembered_href(href, portal, username)?;
         browser.navigate(&url).await.ok()?;
         let current = browser.current_url().await.ok().flatten()?;
         // The live page is the truth: a logout or account switch redirects
@@ -4299,7 +4503,7 @@ impl AppService {
         if current.path() == "/" || current.path().is_empty() {
             return None;
         }
-        if let Some(username) = remembered.username.as_deref()
+        if let Some(username) = username
             && !current
                 .path()
                 .to_lowercase()
@@ -4308,6 +4512,24 @@ impl AppService {
             return None;
         }
         Some(current)
+    }
+
+    /// Navigate a remembered identity href after Rust-side validation, then
+    /// confirm the live page agrees. Returns the live URL on agreement,
+    /// `None` when anything disagrees (stale row, redirect to login, …).
+    async fn navigate_remembered_identity(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        remembered: &playbook_store::IdentityMemory,
+    ) -> Option<url::Url> {
+        self.navigate_remembered_href(
+            browser,
+            portal,
+            &remembered.href,
+            remembered.username.as_deref(),
+        )
+        .await
     }
 
     /// Run a plural intent across every matching control: snapshot once for
@@ -5154,13 +5376,14 @@ impl AppService {
         ))
         .await;
         // Identity memory dies with the session: a signed-out origin must
-        // never be navigated from a stale remembered profile.
+        // never be navigated from a stale remembered destination. The
+        // full clear covers identity and settings rows alike.
         if let Ok(store) = self.playbooks().await
-            && let Ok(rows) = store.forget_identity_for_origin(&host).await
+            && let Ok(rows) = store.forget_site(&host).await
             && rows > 0
         {
             self.journal_line(format!(
-                "identity_forgotten: {host} · {rows} remembered profile(s) cleared"
+                "identity_forgotten: {host} · {rows} remembered destination(s) cleared"
             ))
             .await;
         }
@@ -5395,6 +5618,85 @@ fn default_chromium() -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn remembered_href_validation_bars_bad_destinations() {
+        // The settings memory fast path navigates without pursuit, so the
+        // validation gate is the only thing standing between a remembered
+        // row and the browser. It is pure — proven here, no browser.
+        let portal = url::Url::parse("https://www.reddit.com/").unwrap();
+        // Happy path: same-site settings URL; a `www.` portal folds to
+        // the bare remembered host the same way the account-home path
+        // already did.
+        assert!(
+            AppService::validate_remembered_href("https://www.reddit.com/settings/", &portal, None)
+                .is_some()
+        );
+        let bare_portal = url::Url::parse("https://reddit.com/").unwrap();
+        assert!(
+            AppService::validate_remembered_href(
+                "https://www.reddit.com/settings/",
+                &bare_portal,
+                None
+            )
+            .is_some()
+        );
+        // Scheme bar: http and non-navigable schemes are rejected.
+        for href in [
+            "http://www.reddit.com/settings/",
+            "javascript:void(0)",
+            "/settings",
+            "not a url",
+        ] {
+            assert!(
+                AppService::validate_remembered_href(href, &portal, None).is_none(),
+                "rejected: {href}"
+            );
+        }
+        // Credentials embedded in a remembered href are rejected, never
+        // sent.
+        for href in [
+            "https://user@www.reddit.com/settings/",
+            "https://user:secret@www.reddit.com/settings/",
+        ] {
+            assert!(
+                AppService::validate_remembered_href(href, &portal, None).is_none(),
+                "rejected: {href}"
+            );
+        }
+        // Cross-site and root-path destinations are rejected: a
+        // remembered settings URL is never a fresh portal open, and
+        // never the site root.
+        assert!(
+            AppService::validate_remembered_href(
+                "https://www.microsoft.com/settings/",
+                &portal,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            AppService::validate_remembered_href("https://www.reddit.com/", &portal, None)
+                .is_none()
+        );
+        // Identity rows still require the remembered username in the
+        // path — the account-home fast path keeps its stricter check.
+        assert!(
+            AppService::validate_remembered_href(
+                "https://www.reddit.com/user/someone/",
+                &portal,
+                Some("MangoTree-1233")
+            )
+            .is_none()
+        );
+        assert!(
+            AppService::validate_remembered_href(
+                "https://www.reddit.com/user/mangotree-1233/",
+                &portal,
+                Some("MangoTree-1233")
+            )
+            .is_some()
+        );
+    }
     #[test]
     fn final_frame_failure_labels_are_static_and_sanitized() {
         use browser_driver::BrowserError;

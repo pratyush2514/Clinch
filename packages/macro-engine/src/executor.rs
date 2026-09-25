@@ -965,10 +965,10 @@ pub enum PageGoalOutcome {
     Navigated { label: String, landed: url::Url },
     /// The goal was already achieved on the current page; nothing to click.
     AlreadyThere { landed: url::Url },
-    /// Verified account-home landing: the label that got us there, the
-    /// landed URL, and the username the live page revealed (if any). Only
-    /// produced by the account-home worker's verifier — a click alone
-    /// never yields this.
+    /// Verified goal landing: the label that got us there, the landed URL,
+    /// and the username the live page revealed (if any — only the
+    /// account-home worker fills this in). Only produced by a goal
+    /// worker's verifier — a click alone never yields this.
     Verified {
         label: String,
         landed: url::Url,
@@ -1722,6 +1722,367 @@ pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
     })
 }
 
+/// Settings vocabulary for the revealed-settings matcher. `NOUN_SYNONYMS`
+/// carries no "setting" expansion, so the matcher uses this closed word
+/// list instead. General words only — never site procedures. Substring
+/// matching means "setting" also covers "settings" and "preference"
+/// covers "preferences"; the longer forms are listed for readability.
+const SETTINGS_WORDS: &[&str] = &["setting", "settings", "preference", "preferences"];
+
+/// Whether `text` mentions a settings word, in [`normalize`]d form.
+fn text_mentions_settings(text: &str) -> bool {
+    let haystack = normalize(text);
+    SETTINGS_WORDS.iter().any(|word| haystack.contains(word))
+}
+
+/// Whether the element's name, description, or container rollup mentions
+/// a settings word — the name half of the revealed-settings matcher.
+fn mentions_settings_words(element: &AxElement) -> bool {
+    text_mentions_settings(&element.name)
+        || text_mentions_settings(&element.description)
+        || text_mentions_settings(&joined_container(element))
+}
+
+/// Whether a URL path segment names a settings destination, stemmed:
+/// "settings" and "preferences" reduce to the roots the word list uses,
+/// and compound segments ("user-settings", `account_preferences`) match
+/// on their tokens. Generic path vocabulary — no site routes.
+fn settings_path_token(segment: &str) -> bool {
+    segment
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|token| {
+            let stem = token.strip_suffix('s').unwrap_or(token);
+            stem == "setting" || stem == "preference"
+        })
+}
+
+/// Whether the URL's path carries a settings segment (stemmed match).
+fn url_path_mentions_settings(url: &url::Url) -> bool {
+    match url.path_segments() {
+        Some(mut segments) => segments.any(settings_path_token),
+        None => false,
+    }
+}
+
+/// A revealed settings destination: an actionable control mentioning
+/// settings/preferences words, not yet clicked, and genuinely new since
+/// the previous snapshot — the same "revealed" gating as
+/// [`select_revealed_profile`]: the container-text rollup shares an
+/// opened menu's wording with header buttons that were already there,
+/// so "new" is what makes it revealed. Gated on `clicked` being
+/// non-empty so a bare page's "settings" footer link never qualifies —
+/// the worker must have opened something first.
+/// The href half of the matcher (a blank-named link to a settings path)
+/// lives in the settings worker: [`AxElement`] carries no href, so a
+/// pure selector cannot see it — the worker resolves `node_href` lazily
+/// per genuinely-new candidate instead.
+#[must_use]
+// `&HashSet<i64>` (not a hasher-generic) is the prescribed contract for
+// this selector, matching the call sites' concrete sets.
+#[allow(clippy::implicit_hasher)]
+pub fn select_revealed_settings<'a>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64>,
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    elements.iter().find(|element| {
+        PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            && !already_clicked(clicked, element)
+            && !previously_seen.contains(&element.backend_node_id)
+            && mentions_settings_words(element)
+    })
+}
+
+/// Miss diagnostic for the settings worker: what it actually tried,
+/// never a dump of the controls it evaluated.
+#[must_use]
+pub fn settings_miss_diagnostic(tried: &[String]) -> String {
+    if tried.is_empty() {
+        "settings: no settings control revealed from the account menu".to_owned()
+    } else {
+        format!(
+            "settings: settings destination not reached. Tried: [{}]",
+            tried.join("; ")
+        )
+    }
+}
+
+/// Async browser seam for the settings worker
+/// ([`pursue_settings_chrome`]): the CDP operations the shared menu
+/// primitive ([`MenuBrowser`]) does not cover — reading the live URL to
+/// detect post-click navigation, page-revealed hrefs for the
+/// blank-named-link case, and the document title for the
+/// disclosure-without-navigation check. [`ManagedBrowser`] is the
+/// production implementation; tests drive the worker against a scripted
+/// fake, so the whole flow is proven with no Chromium.
+pub trait SettingsBrowser: MenuBrowser {
+    /// Current document URL; `None` fails the navigation check closed.
+    fn settings_current_url(&self) -> impl std::future::Future<Output = Option<url::Url>> + Send;
+    /// Best-effort `href` of the DOM node behind a backend node id;
+    /// `None` on any failure or missing/empty href.
+    fn settings_node_href(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Option<String>> + Send;
+    /// Best-effort document title; `None` fails the title check closed.
+    fn settings_page_title(&self) -> impl std::future::Future<Output = Option<String>> + Send;
+}
+
+impl SettingsBrowser for ManagedBrowser {
+    async fn settings_current_url(&self) -> Option<url::Url> {
+        self.current_url().await.ok().flatten()
+    }
+
+    async fn settings_node_href(&self, backend_node_id: i64) -> Option<String> {
+        self.node_href(backend_node_id).await
+    }
+
+    async fn settings_page_title(&self) -> Option<String> {
+        self.page_title().await
+    }
+}
+
+/// Per-invocation click budget for the settings worker, mirroring
+/// [`IDENTITY_MAX_CLICKS`]: the shared menu primitive retries internally,
+/// so the loop counts every click — menu-opening or revealed-destination
+/// — against one budget. A menu Miss ends the worker: the primitive
+/// already re-snapshotted and re-ranked between attempts, so re-looping
+/// would only re-examine candidates it exhausted.
+const SETTINGS_MAX_CLICKS: usize = 3;
+
+/// The href half of the revealed-settings matcher: a genuinely-new
+/// actionable control whose page-revealed href resolves (via
+/// [`validate_revealed_href`]) to a settings path. Same "revealed"
+/// gating as [`select_revealed_settings`]; hrefs resolve lazily per
+/// candidate — never for the whole snapshot.
+async fn select_revealed_settings_href<'a, B: SettingsBrowser>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64>,
+    browser: &B,
+    origin: &url::Url,
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    for element in elements {
+        if !PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            || already_clicked(clicked, element)
+            || previously_seen.contains(&element.backend_node_id)
+        {
+            continue;
+        }
+        let is_settings = browser
+            .settings_node_href(element.backend_node_id)
+            .await
+            .as_deref()
+            .and_then(|href| validate_revealed_href(href, origin))
+            .is_some_and(|url| url_path_mentions_settings(&url));
+        if is_settings {
+            return Some(element);
+        }
+    }
+    None
+}
+
+/// Post-click disclosure check: with no navigation, the click only
+/// counts when the fresh page names settings in its title or a heading.
+/// Generic words only — the same [`SETTINGS_WORDS`] vocabulary.
+fn settings_surface_visible(elements: &[AxElement], title: Option<&str>) -> bool {
+    if title.is_some_and(text_mentions_settings) {
+        return true;
+    }
+    elements
+        .iter()
+        .any(|element| element.role == "heading" && mentions_settings_words(element))
+}
+
+/// Settings landing verifier: a navigation only counts when the landed
+/// URL's path names a settings destination (stemmed segment match). A
+/// click alone never yields success — an irrelevant landing is an honest
+/// miss carrying the tried-lines journal.
+fn verify_settings_landing(
+    label: &str,
+    landed: &url::Url,
+    tried: &[String],
+) -> Result<PageGoalOutcome, IntentError> {
+    if url_path_mentions_settings(landed) {
+        Ok(PageGoalOutcome::Navigated {
+            label: label.to_owned(),
+            landed: landed.clone(),
+        })
+    } else {
+        Err(IntentError::NoMatch(settings_miss_diagnostic(tried)))
+    }
+}
+
+/// First-class settings worker, generic over [`SettingsBrowser`] so the
+/// flow is provable against a scripted fake; [`pursue_settings_chrome`]
+/// fixes this to [`ManagedBrowser`] for the wiring worker. Modeled on
+/// [`pursue_identity_chrome`].
+///
+/// Deterministic only — no model phase:
+///
+/// 1. Untruncated AX snapshot via [`MenuBrowser::menu_snapshot`] (for
+///    [`ManagedBrowser`] this is `ax_snapshot_untruncated`: a revealed
+///    menu renders at the end of the document, past the 300-element head
+///    truncation).
+/// 2. A revealed settings destination ends the hunt — name-worded first,
+///    then the blank-named link whose page-revealed href points at a
+///    settings path. The control is clicked and the URL watched: a
+///    navigation to a settings path is [`PageGoalOutcome::Navigated`]; a
+///    disclosure with no navigation is [`PageGoalOutcome::Verified`]
+///    when the fresh page's title or headings name settings.
+/// 3. Otherwise the shared [`open_identity_menu`] primitive spends the
+///    remaining click budget opening the account menu in a single call —
+///    its internal rank → click → poll loop is not reimplemented here,
+///    and a Miss ends the worker instead of re-looping over candidates
+///    it already exhausted.
+///
+/// An honest miss beats a guessed click: the worker only clicks controls
+/// the revealed-gating selected, and [`IntentError::NoMatch`] carries the
+/// tried-lines journal.
+///
+/// # Errors
+///
+/// Returns [`IntentError::NoMatch`] with the tried-lines journal when no
+/// settings destination is reached, and [`IntentError::Browser`] on CDP
+/// failure.
+pub async fn pursue_settings_chrome_inner<B: SettingsBrowser>(
+    browser: &B,
+    origin: &url::Url,
+) -> Result<PageGoalOutcome, IntentError> {
+    let mut clicked: Vec<ClickedControl> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    // Node ids from the previous iteration's snapshot — same "revealed"
+    // semantics as the identity worker: a destination must be genuinely
+    // new since the menu opened, never chrome that was already there.
+    let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut clicks_used: usize = 0;
+
+    while clicks_used < SETTINGS_MAX_CLICKS {
+        let (elements, check_before, _) = browser.menu_snapshot(origin).await;
+        let currently_seen: std::collections::HashSet<i64> = elements
+            .iter()
+            .map(|element| element.backend_node_id)
+            .collect();
+
+        // 1. A revealed settings destination ends the hunt — but only
+        // after the worker opened something, and only when the candidate
+        // actually appeared after that opening.
+        let target = match select_revealed_settings(&elements, &clicked, &previously_seen) {
+            Some(target) => Some(target),
+            None => {
+                select_revealed_settings_href(
+                    &elements,
+                    &clicked,
+                    &previously_seen,
+                    browser,
+                    origin,
+                )
+                .await
+            }
+        };
+        if let Some(target) = target {
+            let label = if target.name.trim().is_empty() {
+                let description = target.description.trim();
+                if description.is_empty() {
+                    "(settings link)".to_owned()
+                } else {
+                    description.to_owned()
+                }
+            } else {
+                target.name.clone()
+            };
+            browser.menu_click(target).await?;
+            clicked.push(ClickedControl::of(target));
+            clicks_used += 1;
+            tried.push(tried_label(target, "clicked, watching URL"));
+            if let Some(landed) = wait_for_url_change(browser).await {
+                return verify_settings_landing(&label, &landed, &tried);
+            }
+            // No navigation: the control acted like a disclosure. The
+            // settings surface must name itself in the fresh page's
+            // title or headings, or the click is not evidence.
+            let (fresh, _, _) = browser.menu_snapshot(origin).await;
+            let title = browser.settings_page_title().await;
+            if settings_surface_visible(&fresh, title.as_deref()) {
+                let landed = browser
+                    .settings_current_url()
+                    .await
+                    .unwrap_or_else(|| origin.clone());
+                return Ok(PageGoalOutcome::Verified {
+                    label,
+                    landed,
+                    username: None,
+                });
+            }
+            tried.push(tried_label(target, "clicked, no settings evidence"));
+            previously_seen = currently_seen;
+            continue;
+        }
+
+        // 2. No revealed destination: spend the remaining budget on the
+        // shared menu primitive in a single call — its internal
+        // click → poll-for-evidence → re-rank loop supersedes the old
+        // one-attempt-per-iteration shape, and a Miss means its
+        // candidates are exhausted against fresh snapshots, so the
+        // worker stops instead of re-looping.
+        let baseline = MenuOpenBaseline {
+            elements: &elements,
+            check: &check_before,
+        };
+        let clicks_before = clicked.len();
+        let opened = match open_identity_menu(
+            browser,
+            origin,
+            baseline,
+            &mut clicked,
+            (SETTINGS_MAX_CLICKS - clicks_used).min(MENU_OPEN_MAX_TRIES),
+        )
+        .await?
+        {
+            OpenMenuOutcome::Opened { tried: line, .. } => {
+                tried.push(line);
+                true
+            }
+            OpenMenuOutcome::Miss { tried: lines } => {
+                tried.extend(lines);
+                false
+            }
+        };
+        // The primitive records every attempt in `clicked`: the spend
+        // counts whether or not a menu opened.
+        clicks_used += clicked.len() - clicks_before;
+        if !opened {
+            break;
+        }
+        previously_seen = currently_seen;
+    }
+    Err(IntentError::NoMatch(settings_miss_diagnostic(&tried)))
+}
+
+/// First-class settings worker: pursue the settings destination through
+/// the account menu — open it with the shared menu primitive, click the
+/// revealed settings control, verify the landing generically. See
+/// [`pursue_settings_chrome_inner`] for the flow.
+///
+/// # Errors
+///
+/// Returns [`IntentError::NoMatch`] with the tried-lines journal when no
+/// settings destination is reached, and [`IntentError::Browser`] on CDP
+/// failure.
+pub async fn pursue_settings_chrome(
+    browser: &ManagedBrowser,
+    origin: &url::Url,
+) -> Result<PageGoalOutcome, IntentError> {
+    pursue_settings_chrome_inner(browser, origin).await
+}
+
 /// Count actionable controls in a snapshot: the click-effect check
 /// compares this before and after a disclosure click.
 fn count_actionable(elements: &[AxElement]) -> usize {
@@ -2058,10 +2419,10 @@ async fn pursue_with_model(
 
 /// Wait for the live page's URL to change from what it is now: shared by
 /// both pursuit phases after every click.
-async fn wait_for_url_change(browser: &ManagedBrowser) -> Option<url::Url> {
-    let from = browser.current_url().await.ok()??;
+async fn wait_for_url_change<B: SettingsBrowser>(browser: &B) -> Option<url::Url> {
+    let from = browser.settings_current_url().await?;
     wait_for_navigation_with(
-        || async { browser.current_url().await.ok().flatten() },
+        || async { browser.settings_current_url().await },
         &from,
         std::time::Duration::from_millis(FOLLOW_POLL_MS),
         std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),

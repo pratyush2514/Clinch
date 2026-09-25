@@ -11,6 +11,10 @@ pub enum GoalClass {
     /// current origin. Pursued via the header identity chrome, verified by
     /// page-revealed identity evidence, remembered per origin for repeats.
     AccountHome,
+    /// "settings", "preferences": the origin's settings surface. Pursued
+    /// through the same header identity chrome, remembered per origin
+    /// only from a verified landing, and never from a miss.
+    Settings,
 }
 
 impl GoalClass {
@@ -19,17 +23,21 @@ impl GoalClass {
     pub fn as_str(self) -> &'static str {
         match self {
             GoalClass::AccountHome => "account_home",
+            GoalClass::Settings => "settings",
         }
     }
 }
 
-/// Closed noun → goal class mapping. Only identity nouns qualify: every
-/// other artifact noun keeps the generic noun-hunt path, so a new goal
-/// class is an explicit product decision, not an emergent match.
+/// Closed noun → goal class mapping. Identity and settings nouns qualify:
+/// every other artifact noun keeps the generic noun-hunt path, so a new
+/// goal class is an explicit product decision, not an emergent match.
+/// Both the funnel's canonical nouns ("settings") and the follow-up
+/// detector's stemmed nouns ("setting") map, since both reach this table.
 #[must_use]
 pub fn goal_class_for(noun: &str) -> Option<GoalClass> {
     match noun.trim().to_lowercase().as_str() {
         "profile" | "account" => Some(GoalClass::AccountHome),
+        "setting" | "settings" | "preference" | "preferences" => Some(GoalClass::Settings),
         _ => None,
     }
 }
