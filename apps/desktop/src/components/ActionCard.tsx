@@ -81,6 +81,7 @@ export default function ActionCard({
           finalUrl={entry.finalUrl}
           pageTitle={entry.pageTitle}
           anchorHost={entry.anchor}
+          finalFrameCaptured={entry.finalFrameCaptured}
           onTakeControl={onTakeControl}
           onRelease={onRelease}
         />

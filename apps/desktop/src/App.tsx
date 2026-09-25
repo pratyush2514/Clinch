@@ -74,8 +74,10 @@ export default function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  // Frames belong to whichever entry is running, so a finished turn keeps the
-  // viewport it ended on instead of mirroring a later run.
+  // Frames stream on every paint, so the thread keeps only the latest in a
+  // ref (no per-frame dispatch or render): the settle action folds that
+  // last live frame into the entry as the fallback when the backend's
+  // settle-time capture misses.
   useEffect(() => {
     if (screencast.frame) thread.noteFrame(screencast.frame);
   }, [screencast.frame, thread.noteFrame]);

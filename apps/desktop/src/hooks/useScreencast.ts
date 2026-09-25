@@ -33,6 +33,23 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
   // Mirrors `status.attached` so `ensure` can read it without being rebuilt on
   // every status change (and without re-arming the thread's callbacks).
   const attached = useRef(false);
+  /**
+   * Which browser session the stream belongs to: latched from the first
+   * frame that arrives while attached. A frame already in flight when the
+   * context is released (or one held over from a previous session) must not
+   * repaint the stream — each one is dropped at the handler.
+   */
+  const sessionId = useRef<number | null>(null);
+  /**
+   * The frame pump: coalesces the CDP screencast to one state update per
+   * animation frame (the pump can emit faster than the browser paints, and
+   * every setState is a render pass over the whole thread). Lives in a ref
+   * so `release` can drain a frame that raced it.
+   */
+  const pendingFrame = useRef<{ queued: string | null; rafId: number | null }>({
+    queued: null,
+    rafId: null,
+  });
 
   useEffect(() => {
     attached.current = status.attached;
@@ -56,7 +73,26 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
   useEffect(() => {
     let live = true;
     let unlisten: UnlistenFn | undefined;
-    listen<ScreencastFrame>(SCREENCAST_EVENT, event => setFrame(event.payload.data))
+    const flush = () => {
+      pendingFrame.current.rafId = null;
+      const frame = pendingFrame.current.queued;
+      pendingFrame.current.queued = null;
+      // Re-check attach: a release may have raced the scheduled paint, and
+      // the release path clears the stream itself.
+      if (frame !== null && attached.current) setFrame(frame);
+    };
+    listen<ScreencastFrame>(SCREENCAST_EVENT, event => {
+      // Post-release stragglers arrive with the context gone: the release
+      // path already cleared the stream, so dropping here keeps the panel
+      // from flashing a previous session's last frame.
+      if (!attached.current) return;
+      if (sessionId.current === null) sessionId.current = event.payload.session_id;
+      if (event.payload.session_id !== sessionId.current) return;
+      pendingFrame.current.queued = event.payload.data;
+      if (pendingFrame.current.rafId === null) {
+        pendingFrame.current.rafId = requestAnimationFrame(flush);
+      }
+    })
       .then(stop => {
         if (live) unlisten = stop;
         else stop();
@@ -67,6 +103,9 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
     return () => {
       live = false;
       unlisten?.();
+      const id = pendingFrame.current.rafId;
+      pendingFrame.current.rafId = null;
+      if (id !== null) cancelAnimationFrame(id);
     };
   }, []);
 
@@ -74,6 +113,9 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
     if (attached.current) return;
     const next = await invoke<ContextStatus>("acquire_browser_context");
     attached.current = next.attached;
+    // A fresh attach starts a fresh session: the latch must not carry the
+    // previous session's id into the new stream.
+    sessionId.current = null;
     setStatus(next);
   }, []);
 
@@ -102,6 +144,14 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
       await invoke("release_browser_context");
       attached.current = false;
       setStatus(DORMANT);
+      // Drain the frame pump before clearing the stream: a release may have
+      // raced a scheduled paint, and the flushed frame must not resurrect
+      // the previous session's last frame.
+      const pending = pendingFrame.current.rafId;
+      pendingFrame.current.rafId = null;
+      pendingFrame.current.queued = null;
+      if (pending !== null) cancelAnimationFrame(pending);
+      sessionId.current = null;
       setFrame(null);
       report("Background browser released — no Chrome process remains.");
     } catch (error) {

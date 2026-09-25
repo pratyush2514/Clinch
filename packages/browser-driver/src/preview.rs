@@ -185,7 +185,7 @@ impl ManagedBrowser {
                 .map_err(|_| BrowserError::Connection)?;
             let params = CaptureScreenshotParams::builder()
                 .format(CaptureScreenshotFormat::Jpeg)
-                .quality(65)
+                .quality(80)
                 .build();
             let result = self
                 .page

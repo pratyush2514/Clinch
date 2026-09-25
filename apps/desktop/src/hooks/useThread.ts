@@ -23,7 +23,6 @@ import {
 } from "../lib/ipc";
 import { errorCode, message } from "../lib/errors";
 import {
-  activeEntry,
   anchorFromLines,
   dispatchChips,
   playbookGate,
@@ -124,6 +123,14 @@ export function useThread(
   // without being rebuilt for every progress event.
   const latest = useRef<ThreadEntry[]>(entries);
   latest.current = entries;
+  /**
+   * The newest screencast frame the hook has seen. No per-frame dispatch
+   * anymore: writing a ref costs no render, and the settle action folds
+   * this into the entry as the fallback when the backend reports no
+   * settle-time capture. Reset on every submit so a frameless run never
+   * inherits a stale frame from a previous run.
+   */
+  const lastLiveFrame = useRef<string | null>(null);
 
   const nextId = useCallback(() => {
     counter.current += 1;
@@ -141,8 +148,10 @@ export function useThread(
   }, []);
 
   const noteFrame = useCallback((frame: string) => {
-    const live = activeEntry(latest.current);
-    if (live) dispatch({ type: "frame", id: live.id, frame });
+    // Ref write only — no dispatch, no render. The old per-frame "frame"
+    // dispatch cost two renders per frame (one here, one in the screencast
+    // hook); the settle action folds the latest frame in when it needs it.
+    lastLiveFrame.current = frame;
   }, []);
 
   /**
@@ -168,6 +177,9 @@ export function useThread(
       if (!text) return;
       const id = nextId();
       dispatch({ type: "submit", id, lane: "playbook", prompt: text, at: Date.now() });
+      // The new run starts with no frame: a frameless run must not inherit a
+      // stale frame from the previous run.
+      lastLiveFrame.current = null;
       try {
         // Zero friction: the thread acquires the background browser itself
         // rather than asking the user to spin one up first.
@@ -200,6 +212,9 @@ export function useThread(
           // screencast frame: the stream is armed pre-navigation and can
           // freeze on the launch placeholder for direct opens.
           finalFrame: outcome.finalFrame ?? null,
+          // Last live frame as the fallback when the backend's capture
+          // missed: the hook keeps the newest frame in a ref.
+          lastLiveFrame: lastLiveFrame.current,
           // Human-verification gate instead of the destination: the card
           // offers headed takeover so the user solves it once.
           challenge: outcome.challenge ?? null,
@@ -232,6 +247,9 @@ export function useThread(
         prompt: `Replay ${playbook.name}`,
         at: Date.now(),
       });
+      // A frameless replay must not inherit a stale frame from the run
+      // before it.
+      lastLiveFrame.current = null;
       try {
         await ensureBrowser();
         const { progress, approved } = playbookChannel(id);
@@ -258,6 +276,9 @@ export function useThread(
           at: Date.now(),
           // Already stored: there is nothing left to learn from this run.
           result: sequenceResult(outcome, approved(), null),
+          // The ref holds the newest frame the hook saw this run; it falls
+          // back when the backend reports no settle-time capture.
+          lastLiveFrame: lastLiveFrame.current,
         });
       } catch (error) {
         fail(id, error);
@@ -270,6 +291,9 @@ export function useThread(
     async (workflow: string, portal: string) => {
       const id = nextId();
       dispatch({ type: "submit", id, lane: "task", prompt: `Replay macro ${workflow}`, at: Date.now() });
+      // A frameless macro replay must not inherit a stale frame from the
+      // run before it.
+      lastLiveFrame.current = null;
       try {
         const progress = new Channel<TaskEvent>();
         progress.onmessage = event => {
@@ -312,6 +336,9 @@ export function useThread(
                   }
                 : null,
           },
+          // The ref holds the newest frame the hook saw this run; it falls
+          // back when the backend reports no settle-time capture.
+          lastLiveFrame: lastLiveFrame.current,
         });
       } catch (error) {
         fail(id, error);

@@ -97,6 +97,14 @@ export type ThreadEntry = {
   /** Last screencast frame this entry saw, frozen once it settles. */
   frame: string | null;
   /**
+   * Whether the backend's settle-time capture landed: `true` when the run
+   * settled with a `finalFrame`, `false` when the card falls back to the
+   * last live frame because the capture missed, `null` before the entry
+   * settles. Drives the honest "last live frame" badge wording — `undefined`
+   * (legacy data) keeps the old "final frame" label.
+   */
+  finalFrameCaptured: boolean | null;
+  /**
    * Page URL when the run settled on a bot-mitigation interstitial
    * (human-verification gate) instead of the destination. The thread
    * offers headed takeover so the user solves the check once.
@@ -164,7 +172,7 @@ export type ThreadAction =
   | { type: "notes"; id: string; lines: string[] }
   | { type: "provenance"; id: string; tier?: Tier; anchor?: string }
   | { type: "frame"; id: string; frame: string }
-  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; challenge?: string | null; authUrl?: string | null; runId?: string | null; lendId?: string | null; finalUrl?: string | null; pageTitle?: string | null }
+  | { type: "settled"; id: string; at: number; elapsedMs?: number; result: EntryResult; finalFrame?: string | null; lastLiveFrame?: string | null; challenge?: string | null; authUrl?: string | null; runId?: string | null; lendId?: string | null; finalUrl?: string | null; pageTitle?: string | null }
   | { type: "failed"; id: string; at: number; message: string; code: string | null }
   | { type: "lendState"; id: string; lend: LendUiState }
   | { type: "authState"; id: string; auth: AuthUiState | null }
@@ -208,6 +216,8 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
           gate: null,
           notes: [],
           frame: null,
+          // No settle-time capture yet: the card may not claim "final frame".
+          finalFrameCaptured: null,
           challenge: null,
           authUrl: null,
           runId: null,
@@ -282,9 +292,12 @@ export function threadReducer(entries: ThreadEntry[], action: ThreadAction): Thr
         result: action.result,
         saveName: entry.saveName || action.result.save?.suggested || "",
         // The backend's settle-time capture is evidence of what the run
-        // saw; without it the card would keep the last live frame, which
-        // for direct opens is the launch placeholder.
-        frame: action.finalFrame ?? entry.frame,
+        // saw; without it the card keeps the last live frame the hook held
+        // in its ref, which for direct opens can be the launch placeholder.
+        frame: action.finalFrame ?? action.lastLiveFrame ?? entry.frame,
+        // Whether the badge may honestly say "final frame": an explicit
+        // false means the card is showing the last live frame instead.
+        finalFrameCaptured: action.finalFrame != null,
         // A completed run that landed on a human-verification gate keeps
         // the challenge URL so the thread can offer headed takeover.
         challenge: action.challenge ?? null,

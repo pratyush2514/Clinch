@@ -23,9 +23,9 @@ pub const SCREENCAST_JPEG_QUALITY: i64 = 80;
 /// Maximum screencast frame width in CSS pixels. Chromium downscales before
 /// JPEG encoding, so the IPC payload stays small and frames render quickly;
 /// the thread card shows the viewport at roughly half window width, where
-/// 800px is legible without the multi-megabyte cost of a full-viewport
-/// capture on every paint.
-pub const SCREENCAST_MAX_WIDTH: i64 = 800;
+/// 1280px stays crisp on high-DPI displays without the multi-megabyte cost
+/// of a full-viewport capture on every paint.
+pub const SCREENCAST_MAX_WIDTH: i64 = 1280;
 
 /// One compressed viewport frame, base64 JPEG, ready for a
 /// `data:image/jpeg;base64,…` source. `session_id` feeds the mandatory

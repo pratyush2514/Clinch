@@ -25,6 +25,7 @@ export default function ScreencastCard({
   finalUrl,
   pageTitle,
   anchorHost,
+  finalFrameCaptured,
   onTakeControl,
   onRelease,
 }: {
@@ -35,6 +36,12 @@ export default function ScreencastCard({
   finalUrl: string | null;
   pageTitle: string | null;
   anchorHost: string | null;
+  /**
+   * Whether the settled card may claim "final frame": explicit `false`
+   * means the capture missed and the card shows the last live frame
+   * instead. `null` (and legacy `undefined`) keep the old wording.
+   */
+  finalFrameCaptured: boolean | null;
   onTakeControl: () => void;
   onRelease: () => void;
 }) {
@@ -63,7 +70,9 @@ export default function ScreencastCard({
             ? headless
               ? "live · headless background session"
               : "live · headful, direct control"
-            : "final frame"}
+            : finalFrameCaptured === false
+              ? "last live frame"
+              : "final frame"}
         </span>
       </div>
       {frame ? (
@@ -114,7 +123,7 @@ export default function ScreencastCard({
             </span>
           )}
           <span className={`preview-badge${live ? " is-live" : ""}`}>
-            {live ? "● Live" : "Final frame"}
+            {live ? "● Live" : finalFrameCaptured === false ? "Last live frame" : "Final frame"}
           </span>
           <button
             type="button"
@@ -129,7 +138,13 @@ export default function ScreencastCard({
           {frame && (
             <img
               src={`data:image/jpeg;base64,${frame}`}
-              alt={live ? "Managed Chromium viewport, live" : "Managed Chromium viewport, final frame"}
+              alt={
+                live
+                  ? "Managed Chromium viewport, live"
+                  : finalFrameCaptured === false
+                    ? "Managed Chromium viewport, last live frame"
+                    : "Managed Chromium viewport, final frame"
+              }
             />
           )}
         </div>
