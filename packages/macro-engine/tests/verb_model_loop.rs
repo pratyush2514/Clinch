@@ -1,0 +1,324 @@
+//! The generalist model loop (`pursue_with_model`): the model acts, the
+//! verifier decides.
+//!
+//! * Up to `MODEL_GOAL_MAX_STEPS` (8) actions; exhaustion without
+//!   verification is the honest miss — never Completed.
+//! * `PageAction::Done` is a decline, never a completion claim: only the
+//!   verb's verifier can yield success.
+//! * Clicks without verification are a miss, not a completion — the
+//!   service maps this `NoMatch` to FAILED/Take Control.
+
+use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight};
+use macro_engine::{
+    ChromeActionBrowser, IntentError, MenuBrowser, PageAction, PageGoalOutcome, PageNavigator,
+    SettingsBrowser, VerbKind, VerbSpec, pursue_with_model,
+};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
+use url::Url;
+
+fn origin() -> Url {
+    Url::parse("https://www.example.com/").expect("test origin parses")
+}
+
+fn button(id: i64, name: &str) -> AxElement {
+    AxElement {
+        backend_node_id: id,
+        role: "button".to_string(),
+        name: name.to_string(),
+        description: String::new(),
+        container_text: Vec::new(),
+        landmark: None,
+    }
+}
+
+fn settings_spec() -> &'static VerbSpec {
+    VerbSpec::for_kind(VerbKind::Settings)
+}
+
+fn logout_spec() -> &'static VerbSpec {
+    VerbSpec::for_kind(VerbKind::LogOut)
+}
+
+/// Lean fake for the model loop: a static tree, scripted auth. Clicks
+/// change the URL asynchronously (like a real page: the navigation lands
+/// after the click returns), so the loop's URL-change poll resolves on
+/// its first check instead of burning its 10s timeout per click.
+struct LoopBrowser {
+    tree: Vec<AxElement>,
+    clicks: Mutex<Vec<i64>>,
+    url: Arc<AsyncMutex<Url>>,
+    auth: AuthState,
+    land_on_click: HashMap<i64, Url>,
+}
+
+impl LoopBrowser {
+    fn new(tree: Vec<AxElement>, auth: AuthState) -> Self {
+        Self {
+            tree,
+            clicks: Mutex::new(Vec::new()),
+            url: Arc::new(AsyncMutex::new(origin())),
+            auth,
+            land_on_click: HashMap::new(),
+        }
+    }
+
+    fn with_landing_on_click(mut self, id: i64, url: &str) -> Self {
+        self.land_on_click
+            .insert(id, Url::parse(url).expect("test landing parses"));
+        self
+    }
+
+    fn clicks(&self) -> Vec<i64> {
+        self.clicks.lock().expect("clicks lock").clone()
+    }
+}
+
+impl MenuBrowser for LoopBrowser {
+    fn menu_viewport_size(&self) -> impl std::future::Future<Output = Option<(f64, f64)>> + Send {
+        std::future::ready(Some((1200.0, 800.0)))
+    }
+
+    fn menu_node_rect(
+        &self,
+        backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Result<Highlight, BrowserError>> + Send {
+        std::future::ready(Ok(Highlight {
+            selector: format!("ax:{backend_node_id}"),
+            x: backend_node_id as f64 * 10.0,
+            y: 5.0,
+            width: 40.0,
+            height: 40.0,
+            matches: 1,
+        }))
+    }
+
+    async fn menu_snapshot(&self, _origin: &Url) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        (
+            self.tree.clone(),
+            AxResyncCheck::new(self.tree.len(), None),
+            0,
+        )
+    }
+
+    fn menu_node_expanded(
+        &self,
+        _backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Option<bool>> + Send {
+        std::future::ready(None)
+    }
+
+    async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
+        let id = element.backend_node_id;
+        let step = {
+            let mut clicks = self.clicks.lock().expect("clicks lock");
+            clicks.push(id);
+            clicks.len()
+        };
+        // Asynchronous like a real page: the navigation lands after the
+        // click returns, so the loop's poll sees a genuine change instead
+        // of timing out. The path (not the query) changes: the
+        // drift check compares scheme/host/port/path only.
+        let target = self.land_on_click.get(&id).cloned().unwrap_or_else(|| {
+            Url::parse(&format!("https://www.example.com/loop-step-{step}"))
+                .expect("step url parses")
+        });
+        let url = Arc::clone(&self.url);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            *url.lock().await = target;
+        });
+        Ok(())
+    }
+}
+
+impl SettingsBrowser for LoopBrowser {
+    async fn settings_current_url(&self) -> Option<Url> {
+        Some(self.url.lock().await.clone())
+    }
+
+    fn settings_node_href(
+        &self,
+        _backend_node_id: i64,
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
+        std::future::ready(None)
+    }
+
+    async fn settings_page_title(&self) -> Option<String> {
+        None
+    }
+}
+
+impl ChromeActionBrowser for LoopBrowser {
+    async fn chrome_auth_state(&self) -> AuthState {
+        self.auth
+    }
+
+    async fn chrome_navigate(&self, url: &Url) -> Result<(), IntentError> {
+        *self.url.lock().await = url.clone();
+        Ok(())
+    }
+}
+
+/// Scripted navigator: plays a queue of actions (empty queue / `None`
+/// declines), counts invocations.
+struct ScriptNavigator {
+    queue: Mutex<VecDeque<Option<PageAction>>>,
+    calls: Mutex<usize>,
+}
+
+impl ScriptNavigator {
+    fn new(actions: Vec<Option<PageAction>>) -> Self {
+        Self {
+            queue: Mutex::new(actions.into()),
+            calls: Mutex::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().expect("calls lock")
+    }
+}
+
+impl PageNavigator for ScriptNavigator {
+    fn next_action(&self, _goal: &str, _elements: &[AxElement]) -> Option<PageAction> {
+        *self.calls.lock().expect("calls lock") += 1;
+        self.queue.lock().expect("queue lock").pop_front().flatten()
+    }
+}
+
+/// Eight model actions, none verified: the loop spends its whole budget
+/// and the honest miss comes back — never Completed.
+#[tokio::test]
+async fn eight_unverified_model_actions_exhaust_to_miss() {
+    // Distinct names: the loop rejects re-picking an already-clicked
+    // control, so one shared name would decline instead of exhausting.
+    let tree: Vec<AxElement> = (1..=8)
+        .map(|id| button(id, &format!("loop action {id}")))
+        .collect();
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated);
+    let actions: Vec<Option<PageAction>> = (1..=8)
+        .map(|id| Some(PageAction::Click { target: id }))
+        .collect();
+    let navigator = Arc::new(ScriptNavigator::new(actions));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    assert!(
+        diagnostic.contains("exhausted 8 steps"),
+        "diagnostic names the exhausted budget: {diagnostic}"
+    );
+    assert_eq!(navigator.calls(), 8, "the full model budget is spent");
+    assert_eq!(
+        browser.clicks(),
+        (1..=8).collect::<Vec<_>>(),
+        "every proposed action executed"
+    );
+}
+
+/// `Done` is a decline: with the verifier passing (already signed out)
+/// the tail completes on evidence — the completion comes from the page,
+/// not from the model's claim.
+#[tokio::test]
+async fn done_with_verifier_passing_completes_on_evidence() {
+    let browser = LoopBrowser::new(vec![button(1, "account")], AuthState::LoggedOut);
+    let navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Done)]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        navigator,
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+    )
+    .await;
+    match result {
+        Ok(PageGoalOutcome::Verified { .. }) => {}
+        other => panic!("expected verifier-backed completion, got {other:?}"),
+    }
+}
+
+/// `Done` without verification is the miss, never a completion: the model
+/// cannot declare the goal achieved.
+#[tokio::test]
+async fn done_without_verification_is_miss_not_completion() {
+    let browser = LoopBrowser::new(vec![button(1, "account")], AuthState::Authenticated);
+    let navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Done)]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        navigator,
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(IntentError::NoMatch(_))),
+        "Done must never complete by itself: {result:?}"
+    );
+}
+
+/// The loop acted (one click) but the verifier failed: the honest miss,
+/// not a completion. The service maps this `NoMatch` to FAILED/Take
+/// Control.
+#[tokio::test]
+async fn acted_but_unverified_is_miss_not_completion() {
+    let browser = LoopBrowser::new(vec![button(1, "harmless")], AuthState::Authenticated);
+    let navigator = Arc::new(ScriptNavigator::new(vec![
+        Some(PageAction::Click { target: 1 }),
+        None,
+    ]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator,
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(IntentError::NoMatch(_))),
+        "a click is not completion: {result:?}"
+    );
+    assert_eq!(browser.clicks(), vec![1], "the gear acted once");
+}
+
+/// Positive control: the model's click lands on a token-named URL and the
+/// verifier — not the click — completes the goal.
+#[tokio::test]
+async fn verified_landing_after_model_click_completes() {
+    let browser = LoopBrowser::new(vec![button(1, "settings")], AuthState::Authenticated)
+        .with_landing_on_click(1, "https://www.example.com/settings/account");
+    let navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Click {
+        target: 1,
+    })]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator,
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+    )
+    .await;
+    match result {
+        Ok(PageGoalOutcome::Verified { label, landed, .. }) => {
+            assert_eq!(landed.as_str(), "https://www.example.com/settings/account");
+            assert_eq!(label, "settings");
+        }
+        other => panic!("expected verifier-backed completion, got {other:?}"),
+    }
+}

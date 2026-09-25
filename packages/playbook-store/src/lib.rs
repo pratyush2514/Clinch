@@ -69,7 +69,7 @@ pub struct SettingsDestination {
 }
 
 /// Goal class key for remembered settings destinations. Mirrors the key
-/// the settings worker resolves through `GoalClass::Settings.as_str()` —
+/// the settings worker resolves through `VerbKind::Settings.as_str()` —
 /// both name the same row, so the worker can recall through this API or
 /// through `recall_identity` with the class key interchangeably.
 const SETTINGS_GOAL_CLASS: &str = "settings";

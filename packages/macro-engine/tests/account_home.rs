@@ -4,8 +4,8 @@
 //! the live page is exercised by the opt-in native run, not by tests.
 use browser_driver::AxElement;
 use macro_engine::{
-    PageGoalOutcome, identity_miss_diagnostic, label_names_profile, path_names_account,
-    same_site_host, tried_label, username_from_href, username_from_menu_text,
+    PageGoalOutcome, VerbKind, VerbSpec, chrome_action_miss_diagnostic, label_names_profile,
+    path_names_account, same_site_host, tried_label, username_from_href, username_from_menu_text,
     validate_revealed_href, verify_account_landing,
 };
 use url::Url;
@@ -233,17 +233,20 @@ fn tried_label_truncates_long_names() {
 
 #[test]
 fn miss_diagnostic_reports_no_control_found() {
-    let diagnostic = identity_miss_diagnostic(&[]);
-    assert!(diagnostic.starts_with("account-home:"));
-    assert!(diagnostic.contains("no identity control found"));
+    let diagnostic = chrome_action_miss_diagnostic(VerbSpec::for_kind(VerbKind::AccountHome), &[]);
+    assert!(diagnostic.starts_with("account_home:"));
+    assert!(diagnostic.contains("no identity control revealed"));
 }
 
 #[test]
 fn miss_diagnostic_lists_tried_clicks() {
-    let diagnostic = identity_miss_diagnostic(&[
-        "button 'Open user menu' → menu opened".to_owned(),
-        "button 'Avatar' → no new controls".to_owned(),
-    ]);
+    let diagnostic = chrome_action_miss_diagnostic(
+        VerbSpec::for_kind(VerbKind::AccountHome),
+        &[
+            "button 'Open user menu' → menu opened".to_owned(),
+            "button 'Avatar' → no new controls".to_owned(),
+        ],
+    );
     assert!(diagnostic.contains("Tried:"));
     assert!(diagnostic.contains("menu opened"));
     assert!(diagnostic.contains("no new controls"));
@@ -269,8 +272,9 @@ fn revealed_element(id: i64, role: &str, name: &str, container: &[&str]) -> AxEl
 /// click budget (caught by the live-browser proof).
 #[test]
 fn revealed_profile_ignores_stale_header_buttons() {
-    use macro_engine::{ClickedControl, select_revealed_profile};
+    use macro_engine::{ClickedControl, VerbKind, VerbSpec, select_revealed_action};
     use std::collections::HashSet;
+    let spec = VerbSpec::for_kind(VerbKind::AccountHome);
     // Document order: header buttons first, the menu link last — like a
     // real opened menu.
     let elements = vec![
@@ -283,14 +287,16 @@ fn revealed_profile_ignores_stale_header_buttons() {
     // The header buttons were in the previous snapshot: only the menu
     // link is genuinely revealed.
     let seen: HashSet<i64> = [1, 2].into_iter().collect();
-    let picked = select_revealed_profile(&elements, &clicked, &seen).expect("revealed link picked");
+    let picked =
+        select_revealed_action(&elements, &clicked, &seen, spec).expect("revealed link picked");
     assert_eq!(picked.backend_node_id, 3);
 }
 
 #[test]
 fn revealed_profile_without_freshness_would_pick_stale_chrome() {
-    use macro_engine::{ClickedControl, select_revealed_profile};
+    use macro_engine::{ClickedControl, VerbKind, VerbSpec, select_revealed_action};
     use std::collections::HashSet;
+    let spec = VerbSpec::for_kind(VerbKind::AccountHome);
     // Pins the failure mode the freshness set exists to prevent: without
     // it, the first header button wins by document order. The tried
     // control matches nothing on the page, so exclusion changes nothing.
@@ -304,17 +310,25 @@ fn revealed_profile_without_freshness_would_pick_stale_chrome() {
         "already tried elsewhere",
         &[],
     ))];
-    let picked =
-        select_revealed_profile(&elements, &clicked, &HashSet::new()).expect("something picked");
+    let picked = select_revealed_action(&elements, &clicked, &HashSet::new(), spec)
+        .expect("something picked");
     assert_eq!(picked.backend_node_id, 1);
 }
 
 #[test]
 fn revealed_profile_stays_gated_on_worker_opened_something() {
-    use macro_engine::select_revealed_profile;
+    use macro_engine::{VerbKind, VerbSpec, select_revealed_action};
     use std::collections::HashSet;
     let elements = vec![revealed_element(3, "link", "u/someone", &[])];
-    assert!(select_revealed_profile(&elements, &[], &HashSet::new()).is_none());
+    assert!(
+        select_revealed_action(
+            &elements,
+            &[],
+            &HashSet::new(),
+            VerbSpec::for_kind(VerbKind::AccountHome)
+        )
+        .is_none()
+    );
 }
 
 /// Regression (live Reddit, 2026-09-25): the worker clicked "Open user

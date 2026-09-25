@@ -4,7 +4,6 @@ mod compound;
 mod domain_grounder;
 mod entity_resolver;
 mod funnel_slots;
-mod goal_class;
 mod intent_parser;
 mod intent_resolver;
 mod llm_intent_parser;
@@ -14,6 +13,7 @@ mod runner;
 mod store;
 mod task;
 mod url_policy;
+mod verb_spec;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use compound::split_compound;
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
@@ -22,7 +22,6 @@ pub use funnel_slots::{
     AsideInfo, FunnelDecision, FunnelPlan, FunnelSlots, ObjectClass, funnel_claims, funnel_plan,
     object_noun, split_slots, strip_asides,
 };
-pub use goal_class::{GoalClass, goal_class_for};
 pub use intent_parser::{
     IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, StubIntentParser, TestDoubleIntentParser,
     parse_prompt_bounded,
@@ -56,6 +55,10 @@ use url::Url;
 pub use url_policy::{
     UrlRejected, entry_url_valid, funnel_landing_matches, still_on_search_page,
     validate_proposed_url, validate_user_directed_url,
+};
+pub use verb_spec::{
+    VerbKind, VerbLedAction, VerbSpec, VerifierKind, detect_verb_led_action, spec_for_noun,
+    verb_site_context, verb_specs,
 };
 
 #[derive(Debug, thiserror::Error)]

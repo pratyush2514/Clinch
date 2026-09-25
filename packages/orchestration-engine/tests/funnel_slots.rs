@@ -135,3 +135,61 @@ fn contracted_framing_variant_is_stripped() {
         got.asides
     );
 }
+
+#[test]
+fn login_intent_clause_recovers_reddit_instead_of_log() {
+    // Live work item 6a: `"open reddit for me i want to log in"` parsed
+    // site `"log"` (→ log.com, vetoed, settle miss) because the login
+    // clause was not an aside and `log` won the reverse noun scan. The
+    // clause is a login-policy aside; the site must be `reddit`.
+    let got = slots("open reddit for me i want to log in");
+    assert_eq!(got.site_slot.as_deref(), Some("reddit"));
+    assert_eq!(got.object_slot, None);
+    assert!(got.login_hint, "the login clause must set the login hint");
+    for expected in ["for me", "i want to log in"] {
+        assert!(
+            got.asides.iter().any(|aside| aside == expected),
+            "expected aside {expected:?} in {:?}",
+            got.asides
+        );
+    }
+    let cleaned = strip_asides("open reddit for me i want to log in").cleaned;
+    assert_eq!(cleaned, "open reddit");
+}
+
+#[test]
+fn bare_login_words_are_never_site_slots() {
+    // Belt and braces behind the aside strip: `log`, `login`, `log in`,
+    // `signin` name the login action, never a destination — no prompt may
+    // route them to `log.com`.
+    for prompt in [
+        "open log",
+        "open login",
+        "open the log in",
+        "open signin",
+        "open the sign in page",
+    ] {
+        let got = slots(prompt);
+        assert!(
+            got.site_slot
+                .as_deref()
+                .is_none_or(|site| !["log", "login", "signin"].contains(&site)),
+            "login word must never be a site slot for {prompt:?}, got {:?}",
+            got.site_slot
+        );
+    }
+}
+
+#[test]
+fn login_aside_does_not_split_the_make_sure_clause() {
+    // `"make sure … login …"` stays one clause aside (the tail cut wins);
+    // the login hint still fires via the clause text.
+    let got = slots("can you open the X for me and make sure ill do the login first");
+    assert_eq!(got.site_slot.as_deref(), Some("x"));
+    assert!(got.login_hint);
+    assert!(
+        !got.asides.iter().any(|aside| aside == "login"),
+        "the make-sure clause must not be split, got {:?}",
+        got.asides
+    );
+}

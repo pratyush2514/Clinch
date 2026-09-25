@@ -2,10 +2,12 @@
 //! slot splitting).
 //!
 //! Raw prompts carry conversational filler that used to pollute the grammar
-//! slots: `"i want you to open X for me"` parsed `target="you"`, and
-//! `"…make sure ill do the login first"` parsed `target="login"`. This
-//! module strips that filler first, then splits the cleaned prompt into
-//! exactly two slots:
+//! slots: `"i want you to open X for me"` parsed `target="you"`,
+//! `"…make sure ill do the login first"` parsed `target="login"`, and
+//! `"open reddit for me i want to log in"` parsed site `"log"` —
+//! `"i want to log in"` is a login-policy aside, never a destination.
+//! This module strips that filler first (login-intent phrases included),
+//! then splits the cleaned prompt into exactly two slots:
 //!
 //! * `site_slot`: an opaque string for the dynamic routing ladder — never
 //!   checked against a site list here, so there is no hardcoded routing
@@ -46,6 +48,38 @@ const ASIDE_CLAUSE: &str = "make sure";
 /// Markers that make an aside a login-policy hint: the user announced they
 /// will log in themselves, so the funnel must not treat `login` as content.
 const LOGIN_MARKERS: &[&str] = &["login", "log in", "log-in", "signin", "sign in", "sign-in"];
+
+/// Login-intent phrases stripped as asides, matched case-insensitively on
+/// whole-word boundaries, longest first. The user announced they will log
+/// in themselves — a login-policy hint, never a destination. The long
+/// clauses precede the bare words they contain (`"i want to log in"`
+/// before `"log in"`) so the whole intent reads as one aside instead of
+/// leaking `log`/`login` into the grammar slots (live: `"open reddit for
+/// me i want to log in"` parsed site `"log"`).
+const LOGIN_ASIDE_PHRASES: &[&str] = &[
+    "i'd like to log in",
+    "id like to log in",
+    "i want to log in",
+    "i want to login",
+    "i want to sign in",
+    "i will log in",
+    "i will login",
+    "i will sign in",
+    "log in",
+    "log-in",
+    "login",
+    "sign in",
+    "sign-in",
+    "signin",
+];
+
+/// Single tokens that are login actions, never destinations. Belt and
+/// braces behind [`LOGIN_ASIDE_PHRASES`]: any surviving login word is
+/// refused as a site slot, so `"log"` / `"login"` can never route to
+/// `log.com` even when no surrounding clause was stripped.
+fn is_login_word(token: &str) -> bool {
+    matches!(token, "log" | "login" | "log-in" | "signin" | "sign-in")
+}
 
 /// Pronouns that can never be a site: a site slot names a destination, and
 /// a destination is never `you`.
@@ -132,6 +166,24 @@ pub fn strip_asides(prompt: &str) -> AsideInfo {
         while let Some(start) = find_phrase(&lowered[..tail_cut], from, phrase) {
             let end = start + phrase.chars().count();
             spans.push((start, end, (*phrase).to_string()));
+            from = end;
+        }
+    }
+
+    // Login-intent phrases, longest first: `"i want to log in"` wins over
+    // the `"log in"` it contains, so an already-recorded span is never
+    // re-reported. Scoped to `..tail_cut` like the filler phrases, so a
+    // `"make sure … login …"` clause keeps its single-aside shape.
+    for phrase in LOGIN_ASIDE_PHRASES {
+        let mut from = 0;
+        while let Some(start) = find_phrase(&lowered[..tail_cut], from, phrase) {
+            let end = start + phrase.chars().count();
+            let covered = spans
+                .iter()
+                .any(|(kept_start, kept_end, _)| start < *kept_end && *kept_start < end);
+            if !covered {
+                spans.push((start, end, (*phrase).to_string()));
+            }
             from = end;
         }
     }
@@ -249,9 +301,11 @@ pub struct FunnelSlots {
 /// * `site_slot`: the existing `parse_grammar` on the cleaned prompt. Its
 ///   `site_context` wins when present ([`FunnelSlots::site_from_context`]
 ///   records that); otherwise its `target_noun` — unless that is a
-///   pronoun or stopword (`you` is never a site). When the tokenizer
-///   dropped the destination entirely (one-character names are invisible
-///   to it), [`single_char_token`] recovers the standalone token.
+///   pronoun, a stopword, or a login word (`you` is never a site, and
+///   neither are `log`/`login`/`signin`: they name the login action, not
+///   a destination). When the tokenizer dropped the destination entirely
+///   (one-character names are invisible to it), [`single_char_token`]
+///   recovers the standalone token.
 /// * `object_slot`: whole-token stemmed match over the cleaned prompt's
 ///   tokens, so the object is found whether it precedes the site (`"open
 ///   settings on reddit"`) or follows it (`"open reddit's settings"`).
@@ -266,14 +320,16 @@ pub fn split_slots(prompt: &str) -> FunnelSlots {
     let from_context = grammar
         .site_context
         .as_deref()
-        .is_some_and(|site| !is_pronoun(site));
+        .is_some_and(|site| !is_pronoun(site) && !is_login_word(site));
     let site_slot = grammar
         .site_context
-        .filter(|site| !is_pronoun(site))
+        .filter(|site| !is_pronoun(site) && !is_login_word(site))
         .or_else(|| {
-            grammar
-                .target_noun
-                .filter(|target| !is_pronoun(target) && !STOPWORDS.contains(&target.as_str()))
+            grammar.target_noun.filter(|target| {
+                !is_pronoun(target)
+                    && !STOPWORDS.contains(&target.as_str())
+                    && !is_login_word(target)
+            })
         })
         .or_else(|| single_char_token(&info.cleaned));
     let object_slot = tokens(&info.cleaned)
@@ -364,14 +420,15 @@ fn exclude_object_noun_site(slots: &FunnelSlots) -> Option<&str> {
 }
 
 /// Content token eligible as a site mention: not a stopword, not a
-/// pronoun, not an action verb, and not a generic object noun — the same
-/// content bar the grammar's adjectival rule applies, minus its
-/// portal-verification (the ladder verifies instead).
+/// pronoun, not an action verb, not a generic object noun, and never a
+/// login word — the same content bar the grammar's adjectival rule
+/// applies, minus its portal-verification (the ladder verifies instead).
 fn is_site_mention_token(text: &str) -> bool {
     !STOPWORDS.contains(&text)
         && !is_pronoun(text)
         && !is_action_verb(text)
         && !is_object_noun(text)
+        && !is_login_word(text)
 }
 
 /// Adjectival site mention in a cleaned prompt: the first site-mention

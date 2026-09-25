@@ -984,8 +984,10 @@ pub enum PageGoalOutcome {
 const PAGE_GOAL_MAX_STEPS: usize = 3;
 
 /// Model-guided phase budget: the navigator gets fewer steps than the
-/// deterministic phase because each one costs a model call.
-const MODEL_GOAL_MAX_STEPS: usize = 5;
+/// deterministic phase because each one costs a model call. Eight bounds a
+/// real multi-turn pursuit (open menu → scan → click → verify) while a
+/// hostile page still cannot burn the run.
+const MODEL_GOAL_MAX_STEPS: usize = 8;
 
 /// Actionable roles a follow-up can meaningfully click: links plus the
 /// controls menus are made of. Wider than [`select_search_result`]'s
@@ -995,17 +997,20 @@ const PAGE_GOAL_ROLES: &[&str] = &["link", "button", "menuitem", "menuitemlink"]
 
 /// Pursue `noun` on the already-loaded portal page: the Muse-style
 /// follow-up. No new browser, no entry-URL resolution, no navigation
-/// before acting. Two phases:
+/// before acting. Two gears:
 ///
 /// 1. **Deterministic** (free, instant): click the first actionable control
 ///    mentioning `noun`; unfold one header menu when it isn't directly
 ///    visible. A URL change ends the pursuit as navigated.
-/// 2. **Model-guided** (only when `navigator` is `Some`): the navigator
-///    picks the next click from the live snapshot, up to
-///    [`MODEL_GOAL_MAX_STEPS`] steps. Every picked element id is validated
-///    against the snapshot before clicking.
+/// 2. **Generalist loop** (only when `navigator` is `Some`): the navigator
+///    proposes one [`PageAction`] per turn from the live snapshot, up to
+///    [`MODEL_GOAL_MAX_STEPS`] steps, and deterministic Rust executes
+///    each pick after validating it against the untruncated snapshot. The
+///    model never declares completion — [`PageAction::Done`] is a decline.
+///    With no verb spec there is no verifier, so a navigation still ends
+///    the loop as navigated.
 ///
-/// [`IntentError::NoMatch`] with the rendered evidence when both phases
+/// [`IntentError::NoMatch`] with the rendered evidence when both gears
 /// fail; [`IntentError::Browser`] on CDP failure.
 ///
 /// # Errors
@@ -1031,7 +1036,7 @@ pub async fn pursue_page_goal(
     let Some(navigator) = navigator else {
         return Err(IntentError::NoMatch(deterministic_miss));
     };
-    pursue_with_model(browser, origin, noun, navigator, deterministic_miss).await
+    pursue_with_model(browser, origin, noun, navigator, None, deterministic_miss).await
 }
 
 /// Stable identity for a control the worker already tried. Backend node
@@ -1070,23 +1075,87 @@ fn already_clicked(clicked: &[ClickedControl], element: &AxElement) -> bool {
     clicked.iter().any(|tried| tried.matches(element))
 }
 
-/// Pursue an `account_home` goal ("my profile", "my account") on the
-/// already-loaded portal page. Unlike the generic noun hunt, this worker
-/// is scoped to the header identity chrome:
+/// One action engine, three gears, for a verb goal: gear 1 (the
+/// deterministic chrome worker [`pursue_chrome_action`]) → gear 2 (the
+/// generalist model loop with the verb's vocabulary as a prompt hint and
+/// the verb's verifier as the wall) → honest miss.
 ///
-/// 1. **Guest short-circuit**: a signed-out page has no identity chrome,
-///    so the worker stops before any click (`SignedOut`).
-/// 2. **Deterministic chrome walk**: open the header identity control
-///    (landmarked → account-worded → rightmost-in-strip), quiet-wait for
-///    the revealed layer, then take the page-revealed profile destination
-///    — a validated href when the page offers one, else a click with an
-///    observed URL change. Every click must show an effect (new controls
-///    or navigation) or the candidate is discarded.
-/// 3. **Verifier**: a click alone never succeeds — the landed page must
-///    be same-origin, non-root, and carry the revealed username when one
-///    was read.
-/// 4. **Model fallback** (only when `navigator` is `Some`): the model
-///    picks the identity click, then the verifier still decides.
+/// Playbook replay stays the dispatcher's first gear (the memory fast
+/// paths), so this starts at gear 1. The model phase runs only when
+/// `navigator` is `Some`. Gear 1 can return its deterministic success
+/// shapes unverified (e.g. the settings `Navigated` landing) — the
+/// dispatcher must run the verb's verifier before treating them as
+/// COMPLETED, and maps a failed verifier to a workflow failure (hence
+/// FAILED/Take Control), never a completion. Gear 2's success shapes
+/// are verifier-decided: [`PageGoalOutcome::Verified`], or the log-out
+/// `AlreadyThere` on a pre-signed-out probe (the dispatcher re-reads the
+/// live auth state before accepting that one too).
+///
+/// [`IntentError::NoMatch`] with the tried-click journal when both gears
+/// miss; [`IntentError::Browser`] on CDP failure.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the goal is not reached or not
+/// verified, and [`IntentError::Browser`] on CDP failure.
+pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+) -> Result<PageGoalOutcome, IntentError> {
+    let deterministic_miss = match pursue_chrome_action(browser, origin, spec).await {
+        Ok(outcome) => return Ok(outcome),
+        // Browser errors fail fast: retrying them through the model would
+        // just burn model calls on a dead CDP session.
+        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+    };
+    let Some(navigator) = navigator else {
+        return Err(IntentError::NoMatch(deterministic_miss));
+    };
+    // The deterministic tried-log rides along as prompt context: without
+    // it the model re-proposes (or fails to recognize) controls the
+    // deterministic phase already evaluated — e.g. concluding "no avatar
+    // present" while staring at the "Open user actions" button it tried.
+    let goal = format!(
+        "{}. Already tried without success: {deterministic_miss}",
+        verb_goal_text(spec)
+    );
+    pursue_with_model(
+        browser,
+        origin,
+        &goal,
+        navigator,
+        Some(spec),
+        deterministic_miss,
+    )
+    .await
+}
+
+/// Goal sentence for the generalist loop, per verb: what the destination
+/// is, in generic words. No site names, no selectors, no procedures — the
+/// verb's closed vocabulary rides along separately as the prompt hint.
+fn verb_goal_text(spec: &VerbSpec) -> &'static str {
+    match spec.kind {
+        VerbKind::AccountHome => {
+            "account home: open the account/avatar menu in the page header, then the profile control, to reach my own profile page"
+        }
+        VerbKind::Settings => {
+            "settings: open the account menu in the page header, then the settings control, to reach the settings page"
+        }
+        VerbKind::LogOut => {
+            "log out: open the account menu in the page header, then the log-out control, to sign out"
+        }
+    }
+}
+
+/// Pursue an `account_home` goal ("my profile", "my account") on the
+/// already-loaded portal page through the action engine: gear 1
+/// (deterministic chrome walk via [`pursue_chrome_action`] with the
+/// account-home spec — the guest short-circuit lives inside it, so a
+/// signed-out landing still returns `SignedOut` before the model phase),
+/// then gear 2 (the generalist loop), then the honest miss. The verifier
+/// decides success — a click alone never succeeds.
 ///
 /// [`IntentError::NoMatch`] carries the tried-click log, not a control
 /// dump, so the FAILED card shows what the worker actually attempted.
@@ -1100,155 +1169,764 @@ pub async fn pursue_account_home(
     origin: &url::Url,
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
 ) -> Result<PageGoalOutcome, IntentError> {
-    if browser.auth_state().await == AuthState::LoggedOut {
-        return Ok(PageGoalOutcome::SignedOut);
-    }
-    let deterministic_miss = match pursue_identity_chrome(browser, origin).await {
-        Ok(outcome) => return Ok(outcome),
-        // Browser errors fail fast: retrying them through the model would
-        // just burn model calls on a dead CDP session.
-        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
-        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
-    };
-    let Some(navigator) = navigator else {
-        return Err(IntentError::NoMatch(deterministic_miss));
-    };
-    pursue_account_home_with_model(browser, origin, navigator, deterministic_miss).await
+    pursue_verb_goal(
+        browser,
+        origin,
+        VerbSpec::for_kind(VerbKind::AccountHome),
+        navigator,
+    )
+    .await
 }
 
-/// Identity-chrome click budget: opening the account menu plus one
-/// revealed control is two clicks; a third covers a nested disclosure.
-/// Bounded so a hostile header can't burn the run.
-const IDENTITY_MAX_CLICKS: usize = 3;
+/// The verbs the chrome worker can pursue. Verbs are few, sites are
+/// millions: each row of the table below pairs a verb with the vocabulary
+/// that reveals its destination in the page's identity chrome and the
+/// verifier that proves the action landed. Generic words only — no site
+/// names, no selectors, no URLs, no procedures. This table replaces the
+/// closed goal-class → worker mapping: a new verb is a new row, not a new
+/// worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbKind {
+    /// "profile", "account": the signed-in user's own page on the current
+    /// origin. Pursued via the header identity chrome, verified by
+    /// page-revealed identity evidence, remembered per origin for repeats.
+    AccountHome,
+    /// "settings", "preferences": the origin's settings surface. Pursued
+    /// through the same header identity chrome, remembered per origin only
+    /// from a verified landing, and never from a miss.
+    Settings,
+    /// "log out", "log off", "sign out": end the session on the current
+    /// origin. Verified by the live page reading signed out afterwards.
+    LogOut,
+}
 
-/// Deterministic half of [`pursue_account_home`]: open the header identity
-/// control, read what the live page reveals, navigate, verify.
-async fn pursue_identity_chrome(
-    browser: &ManagedBrowser,
+impl VerbKind {
+    /// Stable key used for identity-memory rows and journal lines.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerbKind::AccountHome => "account_home",
+            VerbKind::Settings => "settings",
+            VerbKind::LogOut => "log_out",
+        }
+    }
+}
+
+/// How a chrome action's landing is verified. A click alone never
+/// succeeds — the verifier decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifierKind {
+    /// The landed URL's path names the destination: stemmed generic tokens
+    /// (the settings row uses "setting"/"preference").
+    UrlPathTokens(&'static [&'static str]),
+    /// Page-revealed identity evidence: a username reappearing in the landed
+    /// URL, an account-worded path, or a profile-worded trigger label.
+    IdentityEvidence,
+    /// The live page reads signed out after the action.
+    AuthSignedOut,
+}
+
+/// One row of the verb table: the verb, the closed vocabulary that names
+/// its destination in revealed chrome, and the verifier that proves the
+/// action landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerbSpec {
+    pub kind: VerbKind,
+    pub vocabulary: &'static [&'static str],
+    pub verifier: VerifierKind,
+}
+
+impl VerbSpec {
+    /// Whether the artifact noun names this verb: exact match against the
+    /// closed vocabulary, case-insensitive. Nouns only — never site names.
+    #[must_use]
+    pub fn matches_noun(&self, noun: &str) -> bool {
+        let needle = noun.trim().to_lowercase();
+        self.vocabulary.iter().any(|word| *word == needle)
+    }
+
+    /// The table's spec for `kind`. Total: every [`VerbKind`] names its
+    /// own row below, so the match is exhaustive by construction.
+    #[must_use]
+    pub fn for_kind(kind: VerbKind) -> &'static VerbSpec {
+        match kind {
+            VerbKind::AccountHome => &ACCOUNT_HOME_SPEC,
+            VerbKind::Settings => &SETTINGS_SPEC,
+            VerbKind::LogOut => &LOG_OUT_SPEC,
+        }
+    }
+}
+
+/// Stemmed path tokens for the settings verifier: "settings" and
+/// "preferences" reduce to these roots, and compound segments
+/// ("user-settings", `account_preferences`) match on their tokens.
+/// Generic path vocabulary — no site routes.
+const SETTINGS_PATH_TOKENS: &[&str] = &["setting", "preference"];
+
+/// The verb table: one row per [`VerbKind`], each naming the closed
+/// vocabulary that reveals the verb's destination in identity chrome and
+/// the verifier that proves the action landed. Row order is irrelevant:
+/// [`VerbSpec::for_kind`] names each row directly and the orchestration
+/// layer's noun table scans the slice.
+static ACCOUNT_HOME_SPEC: VerbSpec = VerbSpec {
+    kind: VerbKind::AccountHome,
+    vocabulary: &["profile", "account"],
+    verifier: VerifierKind::IdentityEvidence,
+};
+static SETTINGS_SPEC: VerbSpec = VerbSpec {
+    kind: VerbKind::Settings,
+    vocabulary: &["setting", "settings", "preference", "preferences"],
+    verifier: VerifierKind::UrlPathTokens(SETTINGS_PATH_TOKENS),
+};
+static LOG_OUT_SPEC: VerbSpec = VerbSpec {
+    kind: VerbKind::LogOut,
+    vocabulary: &["log out", "log off", "sign out"],
+    verifier: VerifierKind::AuthSignedOut,
+};
+static VERB_SPECS: &[VerbSpec] = &[ACCOUNT_HOME_SPEC, SETTINGS_SPEC, LOG_OUT_SPEC];
+
+/// Every verb the chrome worker can pursue.
+#[must_use]
+pub fn verb_specs() -> &'static [VerbSpec] {
+    VERB_SPECS
+}
+
+/// Async browser seam for the spec-parameterized chrome worker
+/// ([`pursue_chrome_action`]): the menu primitive's seam
+/// ([`MenuBrowser`]) plus the live URL, node href, and page title reads
+/// ([`SettingsBrowser`]), plus the auth-state probe and the validated-href
+/// navigation the identity lane needs. [`ManagedBrowser`] is the
+/// production implementation; tests drive the worker against a scripted
+/// fake, so the whole flow is proven with no Chromium.
+pub trait ChromeActionBrowser: SettingsBrowser {
+    /// Live auth-state probe (title + URL + visible text — the same
+    /// [`ManagedBrowser::auth_state`] the settle probe uses, not the
+    /// URL-path-only `detect_auth_signal`: a signed-out landing page is
+    /// not always a login URL). The account-home lane short-circuits on
+    /// `LoggedOut` before any click; the log-out verifier requires
+    /// `LoggedOut` after the click.
+    fn chrome_auth_state(&self) -> impl std::future::Future<Output = AuthState> + Send;
+    /// Navigate to a page-revealed, Rust-validated URL: the identity lane
+    /// prefers navigating a validated href over clicking the control.
+    ///
+    /// # Errors
+    /// Returns [`IntentError::Browser`] on CDP failure.
+    fn chrome_navigate(
+        &self,
+        url: &url::Url,
+    ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send;
+}
+
+impl ChromeActionBrowser for ManagedBrowser {
+    async fn chrome_auth_state(&self) -> AuthState {
+        self.auth_state().await
+    }
+
+    async fn chrome_navigate(&self, url: &url::Url) -> Result<(), IntentError> {
+        self.navigate(url).await.map_err(IntentError::Browser)
+    }
+}
+
+/// Click budget for the chrome worker: opening the account menu plus one
+/// revealed-destination click, with one spare for a nested disclosure.
+/// Bounded so a hostile header can't burn the run.
+const CHROME_ACTION_MAX_CLICKS: usize = 3;
+
+/// A revealed destination for this worker iteration: the vocabulary
+/// matcher first, then — for path-token verbs — the href half (a
+/// blank-named link to a matching path). [`AxElement`] carries no href,
+/// so hrefs resolve lazily per genuinely-new candidate, never for the
+/// whole snapshot.
+async fn select_revealed_target<'a, B: ChromeActionBrowser>(
+    browser: &B,
     origin: &url::Url,
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64>,
+    spec: &VerbSpec,
+) -> Option<&'a AxElement> {
+    if let Some(target) = select_revealed_action(elements, clicked, previously_seen, spec) {
+        return Some(target);
+    }
+    match spec.verifier {
+        VerifierKind::UrlPathTokens(tokens) => {
+            select_revealed_action_href(elements, clicked, previously_seen, browser, origin, tokens)
+                .await
+        }
+        VerifierKind::IdentityEvidence | VerifierKind::AuthSignedOut => None,
+    }
+}
+
+/// Spend the remaining click budget on the shared menu primitive in a
+/// single call: its internal click → poll-for-evidence → re-rank loop
+/// supersedes the old one-attempt-per-iteration shape, and a Miss means
+/// its candidates are exhausted against fresh snapshots, so the worker
+/// stops instead of re-looping. Returns whether a menu opened.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn open_menu_within_budget<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    elements: &[AxElement],
+    check: &browser_driver::AxResyncCheck,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<bool, IntentError> {
+    let baseline = MenuOpenBaseline { elements, check };
+    let clicks_before = clicked.len();
+    let opened = match open_identity_menu(
+        browser,
+        origin,
+        baseline,
+        clicked,
+        (CHROME_ACTION_MAX_CLICKS - *clicks_used).min(MENU_OPEN_MAX_TRIES),
+    )
+    .await?
+    {
+        OpenMenuOutcome::Opened { tried: line, .. } => {
+            tried.push(line);
+            true
+        }
+        OpenMenuOutcome::Miss { tried: lines } => {
+            tried.extend(lines);
+            false
+        }
+    };
+    // The primitive records every attempt in `clicked`: the spend counts
+    // whether or not a menu opened.
+    *clicks_used += clicked.len() - clicks_before;
+    Ok(opened)
+}
+
+/// Identity lane: navigate a page-revealed, Rust-validated href when the
+/// revealed control discloses one; otherwise click it and watch the URL.
+/// Either way the identity verifier decides. Returns `Some` on a decided
+/// outcome, `None` when the click produced no evidence and the hunt
+/// continues.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the landing carries no identity
+/// evidence, and [`IntentError::Browser`] on CDP failure.
+async fn act_on_identity_target<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    target: &AxElement,
+    label: &str,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    // Prefer the page-revealed href when the control is a link that
+    // discloses one; validated in Rust, never trusted raw.
+    if let Some(href) = browser.settings_node_href(target.backend_node_id).await
+        && let Some(url) = validate_revealed_href(&href, origin)
+    {
+        tried.push(tried_label(target, "revealed href → navigate"));
+        browser.chrome_navigate(&url).await?;
+        let username = username_from_href(&url);
+        let landed = browser.settings_current_url().await.unwrap_or(url);
+        return verify_account_home(browser, origin, label, &landed, username.as_deref())
+            .await
+            .map(Some);
+    }
+    // No usable href: click the revealed control and watch the URL.
+    browser.menu_click(target).await?;
+    clicked.push(ClickedControl::of(target));
+    *clicks_used += 1;
+    tried.push(tried_label(target, "clicked, watching URL"));
+    if let Some(landed) = wait_for_url_change(browser).await {
+        let username = username_from_menu_text(label);
+        return verify_account_home(browser, origin, label, &landed, username.as_deref())
+            .await
+            .map(Some);
+    }
+    Ok(None)
+}
+
+/// Path-token lane (settings): click the revealed control and watch the
+/// URL. A token-named landing decides; a disclosure surface must name
+/// itself in the fresh page's title or headings, or the click is not
+/// evidence. Returns `Some` on a decided outcome, `None` when the click
+/// produced no evidence and the hunt continues.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn act_on_path_tokens_target<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    target: &AxElement,
+    spec: &VerbSpec,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    let VerifierKind::UrlPathTokens(tokens) = spec.verifier else {
+        // `pursue_chrome_action` only calls this helper for the path-token
+        // verifier; any other verifier here is a caller bug, reported as an
+        // honest miss rather than a panic.
+        return Err(IntentError::NoMatch(chrome_action_miss_diagnostic(
+            spec, tried,
+        )));
+    };
+    let label = revealed_label(target, spec);
+    browser.menu_click(target).await?;
+    clicked.push(ClickedControl::of(target));
+    *clicks_used += 1;
+    tried.push(tried_label(target, "clicked, watching URL"));
+    if let Some(landed) = wait_for_url_change(browser).await {
+        return verify_path_tokens_landing(&label, &landed, tokens, spec, tried).map(Some);
+    }
+    // No navigation: the control acted like a disclosure. The surface must
+    // name itself in the fresh page's title or headings, or the click is
+    // not evidence.
+    let (fresh, _, _) = browser.menu_snapshot(origin).await;
+    let title = browser.settings_page_title().await;
+    if action_surface_visible(&fresh, title.as_deref(), spec.vocabulary) {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        return Ok(Some(PageGoalOutcome::Verified {
+            label,
+            landed,
+            username: None,
+        }));
+    }
+    tried.push(tried_label(target, "clicked, no evidence"));
+    Ok(None)
+}
+
+/// Signed-out lane (log out): click the revealed control, then the auth
+/// probe decides — the URL may or may not change. Returns `Some` on a
+/// decided outcome, `None` when the page still reads signed in and the
+/// hunt continues.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn act_on_signed_out_target<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    target: &AxElement,
+    label: &str,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    browser.menu_click(target).await?;
+    clicked.push(ClickedControl::of(target));
+    *clicks_used += 1;
+    tried.push(tried_label(target, "clicked, watching URL"));
+    // Logging out usually navigates; the URL may also stay put, so the
+    // wait is best-effort and the auth probe decides either way.
+    let _ = wait_for_url_change(browser).await;
+    let landed = browser
+        .settings_current_url()
+        .await
+        .unwrap_or_else(|| origin.clone());
+    if browser.chrome_auth_state().await == AuthState::LoggedOut {
+        return Ok(Some(PageGoalOutcome::Verified {
+            label: label.to_owned(),
+            landed,
+            username: None,
+        }));
+    }
+    tried.push(tried_label(target, "clicked, still signed in"));
+    Ok(None)
+}
+
+/// Pursue a verb-spec action through the page's identity chrome: the single
+/// parameterized worker behind every in-page verb, collapsing the old
+/// per-goal workers. Deterministic — no model phase:
+///
+/// 1. **Per-verb pre-state, no clicks yet**: account-home short-circuits on
+///    a signed-out page (`SignedOut` — a guest landing has no identity
+///    chrome to pursue); log-out completes immediately when the page
+///    already reads signed out (`AlreadyThere`).
+/// 2. **Untruncated AX snapshot** via [`MenuBrowser::menu_snapshot`] (a
+///    revealed menu renders at the end of the document, past the
+///    300-element head truncation).
+/// 3. **A revealed destination ends the hunt**: an actionable control
+///    matching the spec's vocabulary that appeared *after* the worker
+///    opened something — `clicked` is non-empty and the candidate is
+///    genuinely new since the previous snapshot, never pre-existing
+///    chrome. The control is clicked (the identity lane navigates a
+///    page-revealed, Rust-validated href directly instead), then the
+///    spec's verifier decides: [`PageGoalOutcome::Navigated`] for a
+///    path-token landing, [`PageGoalOutcome::Verified`] for identity
+///    evidence, a named disclosure surface, or a signed-out page.
+/// 4. **Otherwise the shared [`open_identity_menu`] primitive** spends the
+///    remaining click budget opening the account menu — its internal
+///    rank → click → poll loop is not reimplemented here, and a Miss ends
+///    the worker instead of re-looping over candidates it exhausted.
+///
+/// An honest miss beats a guessed click: the worker only clicks controls
+/// the revealed-gating selected, and [`IntentError::NoMatch`] carries the
+/// tried-lines journal.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] with the tried-lines journal when the
+/// action is not verified, and [`IntentError::Browser`] on CDP failure.
+pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
 ) -> Result<PageGoalOutcome, IntentError> {
+    // Per-verb pre-state strategies, before any click.
+    match spec.kind {
+        VerbKind::AccountHome => {
+            // Guest short-circuit: a signed-out page has no identity chrome,
+            // so the worker stops before any click.
+            if browser.chrome_auth_state().await == AuthState::LoggedOut {
+                return Ok(PageGoalOutcome::SignedOut);
+            }
+        }
+        VerbKind::LogOut => {
+            // Already signed out: the goal is achieved; nothing to click.
+            if browser.chrome_auth_state().await == AuthState::LoggedOut {
+                let landed = browser
+                    .settings_current_url()
+                    .await
+                    .unwrap_or_else(|| origin.clone());
+                return Ok(PageGoalOutcome::AlreadyThere { landed });
+            }
+        }
+        VerbKind::Settings => {}
+    }
+
     let mut clicked: Vec<ClickedControl> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     // Node ids from the previous iteration's snapshot. A "revealed"
     // destination must be genuinely new: the container-text rollup lets an
-    // opened menu's "Profile" wording match every header button that was
-    // already on the page, so without this the worker clicks the header
-    // chrome itself as the profile destination and burns its click budget.
+    // opened menu's wording match every header button that was already on
+    // the page, so without this the worker clicks the header chrome itself
+    // as the destination and burns its click budget.
     let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    // Total click budget across both click kinds. The shared menu
-    // primitive retries internally now (up to MENU_OPEN_MAX_TRIES per
-    // call), so the loop counts every click it spends — menu-opening or
-    // revealed-destination — against IDENTITY_MAX_CLICKS instead of
-    // assuming one click per iteration. A menu Miss ends the worker: the
-    // primitive already re-snapshotted and re-ranked between attempts, so
-    // re-looping would only re-examine candidates it exhausted.
+    // Total click budget across both click kinds. The shared menu primitive
+    // retries internally, so the loop counts every click it spends —
+    // menu-opening or revealed-destination — against
+    // CHROME_ACTION_MAX_CLICKS. A menu Miss ends the worker: the primitive
+    // already re-snapshotted and re-ranked between attempts, so re-looping
+    // would only re-examine candidates it exhausted.
     let mut clicks_used: usize = 0;
 
-    while clicks_used < IDENTITY_MAX_CLICKS {
-        // Full snapshot, not the navigator slice: a revealed menu renders
-        // at the end of the document (React portal), past the 300-element
-        // head truncation — the capped view reported "no new controls"
-        // for a menu that plainly opened. Before/after id sets share the
-        // same full-list semantics so "genuinely new" stays correct.
-        let (elements, check_before, _) = browser.ax_snapshot_untruncated(origin).await;
+    while clicks_used < CHROME_ACTION_MAX_CLICKS {
+        // Full snapshot, not the navigator slice: a revealed menu renders at
+        // the end of the document (React portal), past the 300-element head
+        // cap. Before/after id sets share the same full-list semantics so
+        // "genuinely new" stays correct.
+        let (elements, check_before, _) = browser.menu_snapshot(origin).await;
         let currently_seen: std::collections::HashSet<i64> =
             elements.iter().map(|el| el.backend_node_id).collect();
 
-        // 1. A revealed profile destination ends the hunt — but only after
-        // the worker opened something, and only when the candidate actually
-        // appeared after that opening. A bare page's `u/someone` author
-        // links are other users, never "my" profile.
-        if let Some(target) = select_revealed_profile(&elements, &clicked, &previously_seen) {
-            let label = target.name.clone();
-            let node_id = target.backend_node_id;
-            // Prefer the page-revealed href when the control is a link
-            // that discloses one; validated in Rust, never trusted raw.
-            if let Some(href) = browser.node_href(node_id).await
-                && let Some(url) = validate_revealed_href(&href, origin)
-            {
-                tried.push(tried_label(target, "revealed href → navigate"));
-                browser.navigate(&url).await?;
-                let username = username_from_href(&url);
-                let landed = browser.current_url().await.ok().flatten().unwrap_or(url);
-                return verify_account_home(browser, origin, &label, &landed, username.as_deref())
-                    .await;
-            }
-            // No usable href: click the revealed control and watch the URL.
-            click_element(browser, target).await?;
-            clicked.push(ClickedControl::of(target));
-            clicks_used += 1;
-            tried.push(tried_label(target, "clicked, watching URL"));
-            if let Some(landed) = wait_for_url_change(browser).await {
-                let username = username_from_menu_text(&label);
-                return verify_account_home(browser, origin, &label, &landed, username.as_deref())
-                    .await;
+        // 1. A revealed destination ends the hunt — but only after the worker
+        // opened something, and only when the candidate actually appeared
+        // after that opening.
+        let target =
+            select_revealed_target(browser, origin, &elements, &clicked, &previously_seen, spec)
+                .await;
+        if let Some(target) = target {
+            let label = revealed_label(target, spec);
+            let outcome = match spec.verifier {
+                VerifierKind::IdentityEvidence => {
+                    act_on_identity_target(
+                        browser,
+                        origin,
+                        target,
+                        &label,
+                        &mut clicked,
+                        &mut tried,
+                        &mut clicks_used,
+                    )
+                    .await?
+                }
+                VerifierKind::UrlPathTokens(_) => {
+                    act_on_path_tokens_target(
+                        browser,
+                        origin,
+                        target,
+                        spec,
+                        &mut clicked,
+                        &mut tried,
+                        &mut clicks_used,
+                    )
+                    .await?
+                }
+                VerifierKind::AuthSignedOut => {
+                    act_on_signed_out_target(
+                        browser,
+                        origin,
+                        target,
+                        &label,
+                        &mut clicked,
+                        &mut tried,
+                        &mut clicks_used,
+                    )
+                    .await?
+                }
+            };
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
             }
             previously_seen = currently_seen;
             continue;
         }
 
         // 2. No revealed destination: spend the remaining budget on the
-        // shared menu primitive in a single call — its internal
-        // click → poll-for-evidence → re-rank loop supersedes the old
-        // one-attempt-per-iteration shape, and a Miss means its
-        // candidates are exhausted against fresh snapshots, so the
-        // worker stops instead of re-looping.
-        let baseline = MenuOpenBaseline {
-            elements: &elements,
-            check: &check_before,
-        };
-        let clicks_before = clicked.len();
-        let opened = match open_identity_menu(
+        // shared menu primitive in a single call.
+        let opened = open_menu_within_budget(
             browser,
             origin,
-            baseline,
+            &elements,
+            &check_before,
             &mut clicked,
-            (IDENTITY_MAX_CLICKS - clicks_used).min(MENU_OPEN_MAX_TRIES),
+            &mut tried,
+            &mut clicks_used,
         )
-        .await?
-        {
-            OpenMenuOutcome::Opened { tried: line, .. } => {
-                tried.push(line);
-                true
-            }
-            OpenMenuOutcome::Miss { tried: lines } => {
-                tried.extend(lines);
-                false
-            }
-        };
-        // The primitive records every attempt in `clicked`: the spend
-        // counts whether or not a menu opened.
-        clicks_used += clicked.len() - clicks_before;
+        .await?;
         if !opened {
             break;
         }
         previously_seen = currently_seen;
     }
-    Err(IntentError::NoMatch(identity_miss_diagnostic(&tried)))
+    Err(IntentError::NoMatch(chrome_action_miss_diagnostic(
+        spec, &tried,
+    )))
 }
 
-/// Model-guided half of [`pursue_account_home`]: the navigator picks the
-/// identity click from the live snapshot, but the verifier still decides
-/// success — a model-picked click alone never yields `Verified`.
-async fn pursue_account_home_with_model(
-    browser: &ManagedBrowser,
+/// A revealed verb destination: an actionable control matching the spec's
+/// vocabulary (or, for the identity lane, a page-revealed `u/name`-style
+/// handle), not yet clicked, and genuinely new since the previous snapshot
+/// — the container-text rollup shares an opened menu's wording with the
+/// header buttons that were already there, so "new" is what makes it
+/// revealed. Gated on `clicked` being non-empty (see
+/// [`pursue_chrome_action`]) so a bare page's footer links never qualify:
+/// the worker must have opened something first.
+#[must_use]
+pub fn select_revealed_action<'a, S: std::hash::BuildHasher>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64, S>,
+    spec: &VerbSpec,
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    let identity_lane = matches!(spec.verifier, VerifierKind::IdentityEvidence);
+    elements.iter().find(|element| {
+        PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            && !already_clicked(clicked, element)
+            && !previously_seen.contains(&element.backend_node_id)
+            && (mentions_vocabulary(element, spec.vocabulary)
+                || (identity_lane && username_from_menu_text(&element.name).is_some()))
+    })
+}
+
+/// The href half of the revealed-item matcher for the
+/// [`VerifierKind::UrlPathTokens`] lane: a genuinely-new actionable control
+/// whose page-revealed href resolves (via [`validate_revealed_href`]) to a
+/// URL whose path carries one of `tokens` — the blank-named-link case.
+/// Same "revealed" gating as [`select_revealed_action`]; hrefs resolve
+/// lazily per candidate, never for the whole snapshot.
+async fn select_revealed_action_href<'a, B: ChromeActionBrowser, S: std::hash::BuildHasher>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64, S>,
+    browser: &B,
     origin: &url::Url,
-    navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
-    deterministic_miss: String,
-) -> Result<PageGoalOutcome, IntentError> {
-    // The deterministic tried-log rides along as prompt context: without
-    // it the model re-proposes (or fails to recognize) controls the
-    // deterministic phase already evaluated — e.g. concluding "no avatar
-    // present" while staring at the "Open user actions" button it tried.
-    let goal = format!(
-        "account home: open the account/avatar menu in the page header, then the profile control, to reach my own profile page. Already tried without success: {deterministic_miss}"
-    );
-    match pursue_with_model(browser, origin, &goal, navigator, deterministic_miss).await {
-        Ok(PageGoalOutcome::Navigated { label, landed }) => {
-            verify_account_home(browser, origin, &label, &landed, None).await
+    tokens: &[&str],
+) -> Option<&'a AxElement> {
+    if clicked.is_empty() {
+        return None;
+    }
+    for element in elements {
+        if !PAGE_GOAL_ROLES.contains(&element.role.as_str())
+            || already_clicked(clicked, element)
+            || previously_seen.contains(&element.backend_node_id)
+        {
+            continue;
         }
-        Ok(other) => Ok(other),
-        Err(error) => Err(error),
+        let is_target = browser
+            .settings_node_href(element.backend_node_id)
+            .await
+            .as_deref()
+            .and_then(|href| validate_revealed_href(href, origin))
+            .is_some_and(|url| url_path_has_tokens(&url, tokens));
+        if is_target {
+            return Some(element);
+        }
+    }
+    None
+}
+
+/// Whether the element's name, description, or container rollup mentions a
+/// word of the verb's vocabulary, in [`normalize`]d form. Substring
+/// matching, so "setting" covers "settings"; multi-word vocabulary
+/// ("log out") matches the whitespace-collapsed text.
+fn mentions_vocabulary(element: &AxElement, vocabulary: &[&str]) -> bool {
+    let name = normalize(&element.name);
+    let description = normalize(&element.description);
+    let container = joined_container(element);
+    vocabulary
+        .iter()
+        .any(|word| name.contains(word) || description.contains(word) || container.contains(word))
+}
+
+/// Whether `text` mentions a vocabulary word, in [`normalize`]d form.
+fn text_mentions_vocabulary(text: &str, vocabulary: &[&str]) -> bool {
+    let haystack = normalize(text);
+    vocabulary.iter().any(|word| haystack.contains(word))
+}
+
+/// Whether a URL path segment names a token destination, stemmed: "settings"
+/// reduces to the root the token list uses, and compound segments
+/// ("user-settings", `account_preferences`) match on their tokens. Generic
+/// path vocabulary — no site routes.
+fn path_token_matches(segment: &str, tokens: &[&str]) -> bool {
+    segment
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|token| {
+            let stem = token.strip_suffix('s').unwrap_or(token);
+            tokens.contains(&stem)
+        })
+}
+
+/// Whether the URL's path carries a token segment (stemmed match).
+fn url_path_has_tokens(url: &url::Url, tokens: &[&str]) -> bool {
+    match url.path_segments() {
+        Some(mut segments) => segments.any(|segment| path_token_matches(segment, tokens)),
+        None => false,
+    }
+}
+
+/// Post-click disclosure check for the path-token lane: with no navigation,
+/// the click only counts when the fresh page names the verb in its title or
+/// a heading. Generic words only — the spec's own vocabulary.
+fn action_surface_visible(
+    elements: &[AxElement],
+    title: Option<&str>,
+    vocabulary: &[&str],
+) -> bool {
+    if title.is_some_and(|title| text_mentions_vocabulary(title, vocabulary)) {
+        return true;
+    }
+    elements
+        .iter()
+        .any(|element| element.role == "heading" && mentions_vocabulary(element, vocabulary))
+}
+
+/// The label a revealed control is journaled under: its name, else its
+/// description, else a generic fallback.
+fn revealed_label(target: &AxElement, spec: &VerbSpec) -> String {
+    let name = target.name.trim();
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    let description = target.description.trim();
+    if !description.is_empty() {
+        return description.to_owned();
+    }
+    format!("({} link)", spec.kind.as_str())
+}
+
+/// Path-token landing verifier: a navigation only counts when the landed
+/// URL's path names a token destination (stemmed segment match). A click
+/// alone never yields success — an irrelevant landing is an honest miss
+/// carrying the tried-lines journal.
+fn verify_path_tokens_landing(
+    label: &str,
+    landed: &url::Url,
+    tokens: &[&str],
+    spec: &VerbSpec,
+    tried: &[String],
+) -> Result<PageGoalOutcome, IntentError> {
+    if url_path_has_tokens(landed, tokens) {
+        Ok(PageGoalOutcome::Navigated {
+            label: label.to_owned(),
+            landed: landed.clone(),
+        })
+    } else {
+        Err(IntentError::NoMatch(chrome_action_miss_diagnostic(
+            spec, tried,
+        )))
+    }
+}
+
+/// Miss diagnostic for the chrome worker: what it actually tried, never a
+/// dump of the controls it evaluated.
+#[must_use]
+pub fn chrome_action_miss_diagnostic(spec: &VerbSpec, tried: &[String]) -> String {
+    let target = match spec.kind {
+        VerbKind::AccountHome => "identity",
+        VerbKind::Settings => "settings",
+        VerbKind::LogOut => "log out",
+    };
+    let key = spec.kind.as_str();
+    if tried.is_empty() {
+        format!("{key}: no {target} control revealed from the account menu")
+    } else {
+        format!(
+            "{key}: {target} destination not reached. Tried: [{}]",
+            tried.join("; ")
+        )
+    }
+}
+
+/// Deterministic verification wall for a verb spec: the ONLY decider of
+/// goal completion across the action engine's gears. Never clicks, never
+/// navigates — it reads the live page after the acting loop (gear 1 or
+/// gear 2) and reports whether the page proves the verb's destination was
+/// reached. A click alone never succeeds; this is what does.
+///
+/// `label` is the last action's label hint (clicked control name, or the
+/// goal text when nothing was clicked) for the identity lane; `username`
+/// is a page-revealed username when the acting loop read one — from a
+/// validated href or a menu label, never derived from the landed URL
+/// itself (that would make the identity check circular).
+///
+/// Per [`VerifierKind`]:
+/// * `UrlPathTokens`: the live URL's path carries the tokens, or the fresh
+///   page names the destination in its title/headings (the
+///   disclosure-without-navigation case) — the same two checks the chrome
+///   worker's path-token lane applies.
+/// * `IdentityEvidence`: the shared [`verify_account_landing`] core —
+///   same-site, non-root, and the username reappearing or the path/label
+///   naming the account area.
+/// * `AuthSignedOut`: the live auth probe reads signed out.
+///
+/// A failed browser read fails the verification closed (`false`): the
+/// caller reports the honest miss.
+pub async fn verify_verb<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    label: Option<&str>,
+    username: Option<&str>,
+) -> bool {
+    match spec.verifier {
+        VerifierKind::UrlPathTokens(tokens) => {
+            let Some(current) = browser.settings_current_url().await else {
+                return false;
+            };
+            if url_path_has_tokens(&current, tokens) {
+                return true;
+            }
+            // No navigation: the disclosure surface must name itself in
+            // the fresh page's title or headings, or the action is not
+            // evidence — same bar as the chrome worker.
+            let (fresh, _, _) = browser.menu_snapshot(origin).await;
+            let title = browser.settings_page_title().await;
+            action_surface_visible(&fresh, title.as_deref(), spec.vocabulary)
+        }
+        VerifierKind::IdentityEvidence => {
+            let Some(current) = browser.settings_current_url().await else {
+                return false;
+            };
+            verify_account_landing(&current, origin, label.unwrap_or(""), username).is_ok()
+        }
+        VerifierKind::AuthSignedOut => browser.chrome_auth_state().await == AuthState::LoggedOut,
     }
 }
 
@@ -1339,9 +2017,9 @@ impl MenuBrowser for ManagedBrowser {
 
 /// Per-invocation click cap for the shared menu primitive: one candidate
 /// per try, each effect-verified. Callers pass their own remaining
-/// budget (the identity lane passes its `IDENTITY_MAX_CLICKS` remainder);
-/// the primitive never exceeds this cap, so a hostile header can't burn
-/// the run.
+/// budget (the chrome worker passes its `CHROME_ACTION_MAX_CLICKS`
+/// remainder); the primitive never exceeds this cap, so a hostile header
+/// can't burn the run.
 const MENU_OPEN_MAX_TRIES: usize = 3;
 
 /// Ordered menu-opening candidates, pure decision: (a) landmarked
@@ -1695,124 +2373,8 @@ pub async fn open_identity_menu<B: MenuBrowser>(
     Ok(OpenMenuOutcome::Miss { tried })
 }
 
-/// A revealed profile destination: an actionable control mentioning
-/// profile/account words or carrying a `u/`-style username, not yet
-/// clicked, and genuinely new since the previous snapshot — the
-/// container-text rollup shares an opened menu's wording with the header
-/// buttons that were already there, so "new" is what makes it revealed.
-/// Gated on `clicked` being non-empty (see [`pursue_identity_chrome`]) so
-/// author links on a bare page never qualify.
-#[must_use]
-pub fn select_revealed_profile<'a, S: std::hash::BuildHasher>(
-    elements: &'a [AxElement],
-    clicked: &[ClickedControl],
-    previously_seen: &std::collections::HashSet<i64, S>,
-) -> Option<&'a AxElement> {
-    if clicked.is_empty() {
-        return None;
-    }
-    elements.iter().find(|element| {
-        PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            && !already_clicked(clicked, element)
-            && !previously_seen.contains(&element.backend_node_id)
-            // `mentions_noun` expands "profile" to {"profile", "account"}
-            // via NOUN_SYNONYMS, so one call covers both words.
-            && (mentions_noun(element, "profile")
-                || username_from_menu_text(&element.name).is_some())
-    })
-}
-
-/// Settings vocabulary for the revealed-settings matcher. `NOUN_SYNONYMS`
-/// carries no "setting" expansion, so the matcher uses this closed word
-/// list instead. General words only — never site procedures. Substring
-/// matching means "setting" also covers "settings" and "preference"
-/// covers "preferences"; the longer forms are listed for readability.
-const SETTINGS_WORDS: &[&str] = &["setting", "settings", "preference", "preferences"];
-
-/// Whether `text` mentions a settings word, in [`normalize`]d form.
-fn text_mentions_settings(text: &str) -> bool {
-    let haystack = normalize(text);
-    SETTINGS_WORDS.iter().any(|word| haystack.contains(word))
-}
-
-/// Whether the element's name, description, or container rollup mentions
-/// a settings word — the name half of the revealed-settings matcher.
-fn mentions_settings_words(element: &AxElement) -> bool {
-    text_mentions_settings(&element.name)
-        || text_mentions_settings(&element.description)
-        || text_mentions_settings(&joined_container(element))
-}
-
-/// Whether a URL path segment names a settings destination, stemmed:
-/// "settings" and "preferences" reduce to the roots the word list uses,
-/// and compound segments ("user-settings", `account_preferences`) match
-/// on their tokens. Generic path vocabulary — no site routes.
-fn settings_path_token(segment: &str) -> bool {
-    segment
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|token| {
-            let stem = token.strip_suffix('s').unwrap_or(token);
-            stem == "setting" || stem == "preference"
-        })
-}
-
-/// Whether the URL's path carries a settings segment (stemmed match).
-fn url_path_mentions_settings(url: &url::Url) -> bool {
-    match url.path_segments() {
-        Some(mut segments) => segments.any(settings_path_token),
-        None => false,
-    }
-}
-
-/// A revealed settings destination: an actionable control mentioning
-/// settings/preferences words, not yet clicked, and genuinely new since
-/// the previous snapshot — the same "revealed" gating as
-/// [`select_revealed_profile`]: the container-text rollup shares an
-/// opened menu's wording with header buttons that were already there,
-/// so "new" is what makes it revealed. Gated on `clicked` being
-/// non-empty so a bare page's "settings" footer link never qualifies —
-/// the worker must have opened something first.
-/// The href half of the matcher (a blank-named link to a settings path)
-/// lives in the settings worker: [`AxElement`] carries no href, so a
-/// pure selector cannot see it — the worker resolves `node_href` lazily
-/// per genuinely-new candidate instead.
-#[must_use]
-// `&HashSet<i64>` (not a hasher-generic) is the prescribed contract for
-// this selector, matching the call sites' concrete sets.
-#[allow(clippy::implicit_hasher)]
-pub fn select_revealed_settings<'a>(
-    elements: &'a [AxElement],
-    clicked: &[ClickedControl],
-    previously_seen: &std::collections::HashSet<i64>,
-) -> Option<&'a AxElement> {
-    if clicked.is_empty() {
-        return None;
-    }
-    elements.iter().find(|element| {
-        PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            && !already_clicked(clicked, element)
-            && !previously_seen.contains(&element.backend_node_id)
-            && mentions_settings_words(element)
-    })
-}
-
-/// Miss diagnostic for the settings worker: what it actually tried,
-/// never a dump of the controls it evaluated.
-#[must_use]
-pub fn settings_miss_diagnostic(tried: &[String]) -> String {
-    if tried.is_empty() {
-        "settings: no settings control revealed from the account menu".to_owned()
-    } else {
-        format!(
-            "settings: settings destination not reached. Tried: [{}]",
-            tried.join("; ")
-        )
-    }
-}
-
-/// Async browser seam for the settings worker
-/// ([`pursue_settings_chrome`]): the CDP operations the shared menu
+/// Async browser seam for the spec-parameterized chrome worker
+/// ([`pursue_chrome_action`]): the CDP operations the shared menu
 /// primitive ([`MenuBrowser`]) does not cover — reading the live URL to
 /// detect post-click navigation, page-revealed hrefs for the
 /// blank-named-link case, and the document title for the
@@ -1844,243 +2406,6 @@ impl SettingsBrowser for ManagedBrowser {
     async fn settings_page_title(&self) -> Option<String> {
         self.page_title().await
     }
-}
-
-/// Per-invocation click budget for the settings worker, mirroring
-/// [`IDENTITY_MAX_CLICKS`]: the shared menu primitive retries internally,
-/// so the loop counts every click — menu-opening or revealed-destination
-/// — against one budget. A menu Miss ends the worker: the primitive
-/// already re-snapshotted and re-ranked between attempts, so re-looping
-/// would only re-examine candidates it exhausted.
-const SETTINGS_MAX_CLICKS: usize = 3;
-
-/// The href half of the revealed-settings matcher: a genuinely-new
-/// actionable control whose page-revealed href resolves (via
-/// [`validate_revealed_href`]) to a settings path. Same "revealed"
-/// gating as [`select_revealed_settings`]; hrefs resolve lazily per
-/// candidate — never for the whole snapshot.
-async fn select_revealed_settings_href<'a, B: SettingsBrowser>(
-    elements: &'a [AxElement],
-    clicked: &[ClickedControl],
-    previously_seen: &std::collections::HashSet<i64>,
-    browser: &B,
-    origin: &url::Url,
-) -> Option<&'a AxElement> {
-    if clicked.is_empty() {
-        return None;
-    }
-    for element in elements {
-        if !PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            || already_clicked(clicked, element)
-            || previously_seen.contains(&element.backend_node_id)
-        {
-            continue;
-        }
-        let is_settings = browser
-            .settings_node_href(element.backend_node_id)
-            .await
-            .as_deref()
-            .and_then(|href| validate_revealed_href(href, origin))
-            .is_some_and(|url| url_path_mentions_settings(&url));
-        if is_settings {
-            return Some(element);
-        }
-    }
-    None
-}
-
-/// Post-click disclosure check: with no navigation, the click only
-/// counts when the fresh page names settings in its title or a heading.
-/// Generic words only — the same [`SETTINGS_WORDS`] vocabulary.
-fn settings_surface_visible(elements: &[AxElement], title: Option<&str>) -> bool {
-    if title.is_some_and(text_mentions_settings) {
-        return true;
-    }
-    elements
-        .iter()
-        .any(|element| element.role == "heading" && mentions_settings_words(element))
-}
-
-/// Settings landing verifier: a navigation only counts when the landed
-/// URL's path names a settings destination (stemmed segment match). A
-/// click alone never yields success — an irrelevant landing is an honest
-/// miss carrying the tried-lines journal.
-fn verify_settings_landing(
-    label: &str,
-    landed: &url::Url,
-    tried: &[String],
-) -> Result<PageGoalOutcome, IntentError> {
-    if url_path_mentions_settings(landed) {
-        Ok(PageGoalOutcome::Navigated {
-            label: label.to_owned(),
-            landed: landed.clone(),
-        })
-    } else {
-        Err(IntentError::NoMatch(settings_miss_diagnostic(tried)))
-    }
-}
-
-/// First-class settings worker, generic over [`SettingsBrowser`] so the
-/// flow is provable against a scripted fake; [`pursue_settings_chrome`]
-/// fixes this to [`ManagedBrowser`] for the wiring worker. Modeled on
-/// [`pursue_identity_chrome`].
-///
-/// Deterministic only — no model phase:
-///
-/// 1. Untruncated AX snapshot via [`MenuBrowser::menu_snapshot`] (for
-///    [`ManagedBrowser`] this is `ax_snapshot_untruncated`: a revealed
-///    menu renders at the end of the document, past the 300-element head
-///    truncation).
-/// 2. A revealed settings destination ends the hunt — name-worded first,
-///    then the blank-named link whose page-revealed href points at a
-///    settings path. The control is clicked and the URL watched: a
-///    navigation to a settings path is [`PageGoalOutcome::Navigated`]; a
-///    disclosure with no navigation is [`PageGoalOutcome::Verified`]
-///    when the fresh page's title or headings name settings.
-/// 3. Otherwise the shared [`open_identity_menu`] primitive spends the
-///    remaining click budget opening the account menu in a single call —
-///    its internal rank → click → poll loop is not reimplemented here,
-///    and a Miss ends the worker instead of re-looping over candidates
-///    it already exhausted.
-///
-/// An honest miss beats a guessed click: the worker only clicks controls
-/// the revealed-gating selected, and [`IntentError::NoMatch`] carries the
-/// tried-lines journal.
-///
-/// # Errors
-///
-/// Returns [`IntentError::NoMatch`] with the tried-lines journal when no
-/// settings destination is reached, and [`IntentError::Browser`] on CDP
-/// failure.
-pub async fn pursue_settings_chrome_inner<B: SettingsBrowser>(
-    browser: &B,
-    origin: &url::Url,
-) -> Result<PageGoalOutcome, IntentError> {
-    let mut clicked: Vec<ClickedControl> = Vec::new();
-    let mut tried: Vec<String> = Vec::new();
-    // Node ids from the previous iteration's snapshot — same "revealed"
-    // semantics as the identity worker: a destination must be genuinely
-    // new since the menu opened, never chrome that was already there.
-    let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut clicks_used: usize = 0;
-
-    while clicks_used < SETTINGS_MAX_CLICKS {
-        let (elements, check_before, _) = browser.menu_snapshot(origin).await;
-        let currently_seen: std::collections::HashSet<i64> = elements
-            .iter()
-            .map(|element| element.backend_node_id)
-            .collect();
-
-        // 1. A revealed settings destination ends the hunt — but only
-        // after the worker opened something, and only when the candidate
-        // actually appeared after that opening.
-        let target = match select_revealed_settings(&elements, &clicked, &previously_seen) {
-            Some(target) => Some(target),
-            None => {
-                select_revealed_settings_href(
-                    &elements,
-                    &clicked,
-                    &previously_seen,
-                    browser,
-                    origin,
-                )
-                .await
-            }
-        };
-        if let Some(target) = target {
-            let label = if target.name.trim().is_empty() {
-                let description = target.description.trim();
-                if description.is_empty() {
-                    "(settings link)".to_owned()
-                } else {
-                    description.to_owned()
-                }
-            } else {
-                target.name.clone()
-            };
-            browser.menu_click(target).await?;
-            clicked.push(ClickedControl::of(target));
-            clicks_used += 1;
-            tried.push(tried_label(target, "clicked, watching URL"));
-            if let Some(landed) = wait_for_url_change(browser).await {
-                return verify_settings_landing(&label, &landed, &tried);
-            }
-            // No navigation: the control acted like a disclosure. The
-            // settings surface must name itself in the fresh page's
-            // title or headings, or the click is not evidence.
-            let (fresh, _, _) = browser.menu_snapshot(origin).await;
-            let title = browser.settings_page_title().await;
-            if settings_surface_visible(&fresh, title.as_deref()) {
-                let landed = browser
-                    .settings_current_url()
-                    .await
-                    .unwrap_or_else(|| origin.clone());
-                return Ok(PageGoalOutcome::Verified {
-                    label,
-                    landed,
-                    username: None,
-                });
-            }
-            tried.push(tried_label(target, "clicked, no settings evidence"));
-            previously_seen = currently_seen;
-            continue;
-        }
-
-        // 2. No revealed destination: spend the remaining budget on the
-        // shared menu primitive in a single call — its internal
-        // click → poll-for-evidence → re-rank loop supersedes the old
-        // one-attempt-per-iteration shape, and a Miss means its
-        // candidates are exhausted against fresh snapshots, so the
-        // worker stops instead of re-looping.
-        let baseline = MenuOpenBaseline {
-            elements: &elements,
-            check: &check_before,
-        };
-        let clicks_before = clicked.len();
-        let opened = match open_identity_menu(
-            browser,
-            origin,
-            baseline,
-            &mut clicked,
-            (SETTINGS_MAX_CLICKS - clicks_used).min(MENU_OPEN_MAX_TRIES),
-        )
-        .await?
-        {
-            OpenMenuOutcome::Opened { tried: line, .. } => {
-                tried.push(line);
-                true
-            }
-            OpenMenuOutcome::Miss { tried: lines } => {
-                tried.extend(lines);
-                false
-            }
-        };
-        // The primitive records every attempt in `clicked`: the spend
-        // counts whether or not a menu opened.
-        clicks_used += clicked.len() - clicks_before;
-        if !opened {
-            break;
-        }
-        previously_seen = currently_seen;
-    }
-    Err(IntentError::NoMatch(settings_miss_diagnostic(&tried)))
-}
-
-/// First-class settings worker: pursue the settings destination through
-/// the account menu — open it with the shared menu primitive, click the
-/// revealed settings control, verify the landing generically. See
-/// [`pursue_settings_chrome_inner`] for the flow.
-///
-/// # Errors
-///
-/// Returns [`IntentError::NoMatch`] with the tried-lines journal when no
-/// settings destination is reached, and [`IntentError::Browser`] on CDP
-/// failure.
-pub async fn pursue_settings_chrome(
-    browser: &ManagedBrowser,
-    origin: &url::Url,
-) -> Result<PageGoalOutcome, IntentError> {
-    pursue_settings_chrome_inner(browser, origin).await
 }
 
 /// Count actionable controls in a snapshot: the click-effect check
@@ -2242,8 +2567,8 @@ pub fn verify_account_landing(
     }
 }
 
-async fn verify_account_home(
-    browser: &ManagedBrowser,
+async fn verify_account_home<B: ChromeActionBrowser>(
+    browser: &B,
     origin: &url::Url,
     label: &str,
     landed: &url::Url,
@@ -2252,10 +2577,8 @@ async fn verify_account_home(
     // The live page is the truth: re-read the URL after the navigation
     // and verify that, not the URL we asked for.
     let current = browser
-        .current_url()
+        .settings_current_url()
         .await
-        .ok()
-        .flatten()
         .unwrap_or_else(|| landed.clone());
     verify_account_landing(&current, origin, label, username).map_err(IntentError::NoMatch)
 }
@@ -2265,20 +2588,6 @@ async fn verify_account_home(
 pub fn tried_label(element: &AxElement, effect: &str) -> String {
     let name: String = element.name.chars().take(40).collect();
     format!("{} '{name}' → {effect}", element.role)
-}
-
-/// Miss diagnostic for the account-home worker: what it actually tried,
-/// never a dump of the controls it evaluated.
-#[must_use]
-pub fn identity_miss_diagnostic(tried: &[String]) -> String {
-    if tried.is_empty() {
-        "account-home: no identity control found in the header chrome".to_owned()
-    } else {
-        format!(
-            "account-home: identity control not reached. Tried: [{}]",
-            tried.join("; ")
-        )
-    }
 }
 
 /// Phase 1: deterministic observe-act loop. Evidence-only: every click
@@ -2345,76 +2654,411 @@ async fn pursue_deterministic(
     )))
 }
 
-/// Phase 2: model-guided observe-act loop. The navigator sees the goal plus
-/// the snapshot's actionable elements and picks one [`PageAction`]; the
-/// pick is validated against the snapshot before anything clicks.
-async fn pursue_with_model(
-    browser: &ManagedBrowser,
+/// Gear 2: the generalist agent loop — observe, propose, act.
+///
+/// Per turn:
+/// 1. **Observe**: untruncated AX snapshot via [`MenuBrowser::menu_snapshot`]
+///    (a revealed menu renders at document end, past the head truncation
+///    the old phase-2 loop used — the pick is validated against the same
+///    full list the loop observes).
+/// 2. **Propose**: the navigator picks exactly ONE [`PageAction`] from the
+///    rendered head slice ([`MAX_NAVIGATOR_ELEMENTS`] lines, zones
+///    included). The optional `spec` adds the verb's closed vocabulary as
+///    a prompt hint — selection and execution stay deterministic.
+/// 3. **Act**: deterministic Rust validates the picked id against the live
+///    snapshot and clicks it. Unknown ids decline, never guess; an
+///    already-clicked re-pick declines instead of toggling a menu shut.
+///
+/// Bounded budget: [`MODEL_GOAL_MAX_STEPS`] steps, then the loop stops.
+/// The model NEVER declares completion: [`PageAction::Done`] is a decline —
+/// the loop stops acting and falls through to verification. Completion is
+/// decided ONLY by the verifier: with `spec` present [`verify_verb`] runs
+/// after every click (an early verified landing ends the loop instead of
+/// burning the remaining budget) and once more at the tail, so a decline
+/// on an already-correct page still completes — the verifier decided, not
+/// the model. Without a spec (the generic noun hunt) no verifier exists,
+/// so a navigation ends the loop as `Navigated`, like the old phase-2
+/// contract.
+///
+/// [`IntentError::NoMatch`] with the loop's tried-click journal when the
+/// goal is not verified; [`IntentError::Browser`] on CDP failure.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the goal is not reached or not
+/// verified, and [`IntentError::Browser`] on CDP failure.
+pub async fn pursue_with_model<B: ChromeActionBrowser>(
+    browser: &B,
     origin: &url::Url,
     goal: &str,
     navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    spec: Option<&VerbSpec>,
     deterministic_miss: String,
 ) -> Result<PageGoalOutcome, IntentError> {
     use crate::navigator::PageAction;
+    let mut clicked: Vec<ClickedControl> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    let mut last_label: Option<String> = None;
+    // Page-revealed username candidate for the identity verifier: read from
+    // a clicked control's href or label BEFORE the click, never derived
+    // from the landed URL (that would make the check circular).
+    let mut revealed_username: Option<String> = None;
+
     for _ in 0..MODEL_GOAL_MAX_STEPS {
-        let (elements, _, _) = browser.ax_snapshot(origin).await;
-        // The navigator is synchronous (one bounded HTTP call); the async
-        // runtime never blocks on it. Everything the closure touches is
-        // owned, so the future stays `'static`.
-        //
-        // Zone the same head slice the navigator renders, so `zones[i]`
-        // describes rendered line `i`. Best-effort: unzoned on failure.
-        let goal_owned = goal.to_owned();
-        let owned_elements: Vec<AxElement> = elements
+        // Untruncated: the pick is validated against the same full list
+        // the loop observed — a control past the head truncation is
+        // clickable when the model names it.
+        let (elements, _, _) = browser.menu_snapshot(origin).await;
+        let prompt_goal = model_goal_text(goal, spec);
+        // The navigator renders the head slice; zones describe exactly
+        // that slice, best-effort — unzoned on failure.
+        let head: Vec<AxElement> = elements
             .iter()
             .take(crate::MAX_NAVIGATOR_ELEMENTS)
             .cloned()
             .collect();
-        let zones = position_zones(browser, &owned_elements).await;
+        let zones = model_zones(browser, &head).await;
+        // The navigator is synchronous (one bounded HTTP call); the async
+        // runtime never blocks on it. Everything the closure touches is
+        // owned, so the future stays `'static`.
         let owned_navigator = navigator.clone();
         let action = tokio::task::spawn_blocking(move || {
-            owned_navigator.next_action_zoned(&goal_owned, &owned_elements, &zones)
+            owned_navigator.next_action_zoned(&prompt_goal, &head, &zones)
         })
         .await
         .map_err(|_| {
             IntentError::NoMatch(format!("navigator task failed; {deterministic_miss}"))
         })?;
+        // A decline stops the acting loop and falls through to the
+        // verification tail — the verifier, never the model, decides
+        // completion. (A closure would borrow `tried`/`clicked` across the
+        // click arm's mutations, so each site calls the tail directly.)
         match action {
             None => {
-                return Err(IntentError::NoMatch(format!(
-                    "navigator declined; {deterministic_miss}"
-                )));
+                return model_loop_tail(
+                    browser,
+                    origin,
+                    spec,
+                    goal,
+                    &deterministic_miss,
+                    &tried,
+                    last_label.as_deref(),
+                    revealed_username.as_deref(),
+                    "navigator declined",
+                )
+                .await;
             }
             Some(PageAction::GiveUp { reason }) => {
-                return Err(IntentError::NoMatch(format!(
-                    "navigator gave up ({reason}); {deterministic_miss}"
-                )));
+                return model_loop_tail(
+                    browser,
+                    origin,
+                    spec,
+                    goal,
+                    &deterministic_miss,
+                    &tried,
+                    last_label.as_deref(),
+                    revealed_username.as_deref(),
+                    &format!("navigator gave up ({reason})"),
+                )
+                .await;
             }
             Some(PageAction::Done) => {
-                let landed = browser
-                    .current_url()
-                    .await?
-                    .ok_or(browser_driver::BrowserError::WrongOrigin)?;
-                return Ok(PageGoalOutcome::AlreadyThere { landed });
+                // Done is a decline, not a completion claim: the model
+                // never declares the goal achieved. The tail still runs
+                // the verifier, so a correct page completes on evidence.
+                return model_loop_tail(
+                    browser,
+                    origin,
+                    spec,
+                    goal,
+                    &deterministic_miss,
+                    &tried,
+                    last_label.as_deref(),
+                    revealed_username.as_deref(),
+                    "navigator done (treated as decline)",
+                )
+                .await;
             }
             Some(PageAction::Click { target }) => {
-                let element = elements
-                    .iter()
-                    .find(|element| element.backend_node_id == target)
-                    .ok_or_else(|| {
-                        IntentError::NoMatch(format!("navigator picked unknown element {target}"))
-                    })?;
-                let label = element.name.clone();
-                click_element(browser, element).await?;
-                if let Some(landed) = wait_for_url_change(browser).await {
-                    return Ok(PageGoalOutcome::Navigated { label, landed });
+                if let Some(outcome) = model_loop_click(
+                    browser,
+                    origin,
+                    goal,
+                    spec,
+                    &elements,
+                    target,
+                    &deterministic_miss,
+                    &mut clicked,
+                    &mut tried,
+                    &mut last_label,
+                    &mut revealed_username,
+                )
+                .await?
+                {
+                    return Ok(outcome);
                 }
             }
         }
     }
-    Err(IntentError::NoMatch(format!(
-        "navigator exhausted {MODEL_GOAL_MAX_STEPS} steps; {deterministic_miss}"
-    )))
+    model_loop_tail(
+        browser,
+        origin,
+        spec,
+        goal,
+        &deterministic_miss,
+        &tried,
+        last_label.as_deref(),
+        revealed_username.as_deref(),
+        &format!("navigator exhausted {MODEL_GOAL_MAX_STEPS} steps"),
+    )
+    .await
+}
+
+/// One model-picked click inside [`pursue_with_model`]: validate the
+/// picked id against the live snapshot, gather identity-lane evidence,
+/// click, watch for navigation, run the per-click verifier.
+///
+/// Returns `Some` when the loop ends here — a decline (unknown id or a
+/// re-picked control), a verified landing, or the generic lane's
+/// navigation — and `None` to keep observing.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] for an unknown element id and
+/// [`IntentError::Browser`] on CDP failure.
+#[allow(clippy::too_many_arguments)]
+async fn model_loop_click<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    goal: &str,
+    spec: Option<&VerbSpec>,
+    elements: &[AxElement],
+    target: i64,
+    deterministic_miss: &str,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    last_label: &mut Option<String>,
+    revealed_username: &mut Option<String>,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    let element = elements
+        .iter()
+        .find(|element| element.backend_node_id == target)
+        .ok_or_else(|| {
+            IntentError::NoMatch(format!(
+                "navigator picked unknown element {target}; {deterministic_miss}"
+            ))
+        })?;
+    if already_clicked(clicked, element) {
+        return model_loop_tail(
+            browser,
+            origin,
+            spec,
+            goal,
+            deterministic_miss,
+            tried,
+            last_label.as_deref(),
+            revealed_username.as_deref(),
+            &format!(
+                "navigator re-picked an already-clicked control ({}); {deterministic_miss}",
+                tried_label(element, "already clicked"),
+            ),
+        )
+        .await
+        .map(Some);
+    }
+    let label = element.name.clone();
+    // Identity-lane evidence, read before the click.
+    if revealed_username.is_none()
+        && matches!(
+            spec.map(|spec| spec.verifier),
+            Some(VerifierKind::IdentityEvidence)
+        )
+        && let Some(href) = browser.settings_node_href(element.backend_node_id).await
+        && let Some(url) = validate_revealed_href(&href, origin)
+        && let Some(name) = username_from_href(&url)
+    {
+        *revealed_username = Some(name);
+    }
+    if revealed_username.is_none()
+        && matches!(
+            spec.map(|spec| spec.verifier),
+            Some(VerifierKind::IdentityEvidence)
+        )
+    {
+        *revealed_username = username_from_menu_text(&label);
+    }
+    browser.menu_click(element).await?;
+    clicked.push(ClickedControl::of(element));
+    *last_label = Some(label.clone());
+    let navigated = wait_for_url_change(browser).await;
+    if let Some(spec) = spec {
+        // The verifier decides after every click: an early
+        // verified landing ends the loop instead of burning
+        // the remaining budget on clicks that could navigate
+        // away again.
+        if verify_verb(
+            browser,
+            origin,
+            spec,
+            Some(&label),
+            revealed_username.as_deref(),
+        )
+        .await
+        {
+            let landed = browser
+                .settings_current_url()
+                .await
+                .unwrap_or_else(|| origin.clone());
+            return Ok(Some(PageGoalOutcome::Verified {
+                label,
+                landed,
+                username: revealed_username.clone(),
+            }));
+        }
+        tried.push(tried_label(
+            element,
+            if navigated.is_some() {
+                "clicked, navigated, verifier failed"
+            } else {
+                "clicked, no navigation, verifier failed"
+            },
+        ));
+    } else if let Some(landed) = navigated {
+        // Generic noun hunt: no verifier exists, so a
+        // navigation ends the loop as before.
+        return Ok(Some(PageGoalOutcome::Navigated { label, landed }));
+    } else {
+        tried.push(tried_label(element, "clicked, no navigation"));
+    }
+    Ok(None)
+}
+
+/// Goal text for one model turn: the caller's goal plus, when a verb spec
+/// is present, the verb's closed vocabulary as a hint. The vocabulary is
+/// generic words from the spec table — never site names, selectors, or
+/// procedures — and the model still only proposes actions; selection and
+/// execution stay deterministic.
+fn model_goal_text(goal: &str, spec: Option<&VerbSpec>) -> String {
+    match spec {
+        None => goal.to_owned(),
+        Some(spec) => format!(
+            "{goal} [verb hint: {}; destination words: {}]",
+            spec.kind.as_str(),
+            spec.vocabulary.join(", ")
+        ),
+    }
+}
+
+/// Coarse position zones for the model phase over the menu seam:
+/// distribution-relative zoning — each rendered control's center zoned
+/// against the bounding box of the measured control set, so the model can
+/// pick an unnamed avatar button by its header position instead of
+/// guessing. Measured through [`MenuBrowser::menu_node_rect`].
+/// Best-effort and time-bounded — geometry that won't resolve degrades to
+/// unzoned lines, never a stall.
+async fn model_zones<B: MenuBrowser>(
+    browser: &B,
+    elements: &[AxElement],
+) -> Vec<Option<crate::navigator::PositionZone>> {
+    use crate::navigator::zone_for;
+    const ZONE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    let ids: Vec<i64> = elements
+        .iter()
+        .map(|element| element.backend_node_id)
+        .collect();
+    let measured = tokio::time::timeout(ZONE_BUDGET, async {
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for id in &ids {
+            if let Ok(highlight) = browser.menu_node_rect(*id).await {
+                points.push((
+                    highlight.x + highlight.width / 2.0,
+                    highlight.y + highlight.height / 2.0,
+                ));
+            } else {
+                points.push((f64::NAN, f64::NAN));
+            }
+        }
+        points
+    })
+    .await
+    .ok();
+    let Some(points) = measured else {
+        return vec![None; ids.len()];
+    };
+    let finite: Vec<(f64, f64)> = points
+        .iter()
+        .copied()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return vec![None; ids.len()];
+    }
+    let (min_x, max_x) = finite
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (x, _)| {
+            (lo.min(*x), hi.max(*x))
+        });
+    let (min_y, max_y) = finite
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, y)| {
+            (lo.min(*y), hi.max(*y))
+        });
+    points
+        .iter()
+        .map(|(x, y)| {
+            if x.is_finite() && y.is_finite() {
+                Some(zone_for(*x, *y, (min_x, min_y, max_x, max_y)))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Verification tail of the generalist loop: runs after the budget is
+/// exhausted or the navigator declines (including [`PageAction::Done`]).
+/// With `spec` present the verb's verifier decides — a decline on an
+/// already-correct page still completes as `Verified`, because the
+/// verifier decided, not the model. Without a spec (the generic noun
+/// hunt) no verifier exists, so a decline is the honest miss.
+#[allow(clippy::too_many_arguments)]
+async fn model_loop_tail<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: Option<&VerbSpec>,
+    goal: &str,
+    deterministic_miss: &str,
+    tried: &[String],
+    last_label: Option<&str>,
+    revealed_username: Option<&str>,
+    note: &str,
+) -> Result<PageGoalOutcome, IntentError> {
+    let journal = if tried.is_empty() {
+        format!("{note}; {deterministic_miss}")
+    } else {
+        format!("{note}; tried [{}]; {deterministic_miss}", tried.join("; "))
+    };
+    let Some(spec) = spec else {
+        return Err(IntentError::NoMatch(journal));
+    };
+    if verify_verb(
+        browser,
+        origin,
+        spec,
+        last_label.or(Some(goal)),
+        revealed_username,
+    )
+    .await
+    {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        return Ok(PageGoalOutcome::Verified {
+            label: last_label.unwrap_or(goal).to_owned(),
+            landed,
+            username: revealed_username.map(str::to_owned),
+        });
+    }
+    Err(IntentError::NoMatch(journal))
 }
 
 /// Wait for the live page's URL to change from what it is now: shared by
@@ -2544,71 +3188,6 @@ async fn select_rightmost_button<'a>(
     elements
         .iter()
         .find(|element| element.backend_node_id == winner)
-}
-
-/// Coarse position zones for the model phase: measure the head of the
-/// snapshot (the same slice the navigator renders), then zone each point
-/// against the measured bounding box. Best-effort and time-bounded —
-///
-/// geometry that won't resolve degrades to unzoned lines, never a stall.
-async fn position_zones(
-    browser: &ManagedBrowser,
-    elements: &[AxElement],
-) -> Vec<Option<crate::navigator::PositionZone>> {
-    use crate::navigator::zone_for;
-    const ZONE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    let head: Vec<i64> = elements
-        .iter()
-        .take(crate::navigator::MAX_NAVIGATOR_ELEMENTS)
-        .map(|element| element.backend_node_id)
-        .collect();
-    let measured = tokio::time::timeout(ZONE_BUDGET, async {
-        let mut points: Vec<(f64, f64)> = Vec::new();
-        for id in &head {
-            if let Ok(highlight) = browser.node_rect(*id).await {
-                points.push((
-                    highlight.x + highlight.width / 2.0,
-                    highlight.y + highlight.height / 2.0,
-                ));
-            } else {
-                points.push((f64::NAN, f64::NAN));
-            }
-        }
-        points
-    })
-    .await
-    .ok();
-    let Some(points) = measured else {
-        return vec![None; head.len()];
-    };
-    let finite: Vec<(f64, f64)> = points
-        .iter()
-        .copied()
-        .filter(|(x, y)| x.is_finite() && y.is_finite())
-        .collect();
-    if finite.is_empty() {
-        return vec![None; head.len()];
-    }
-    let (min_x, max_x) = finite
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (x, _)| {
-            (lo.min(*x), hi.max(*x))
-        });
-    let (min_y, max_y) = finite
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, y)| {
-            (lo.min(*y), hi.max(*y))
-        });
-    points
-        .iter()
-        .map(|(x, y)| {
-            if x.is_finite() && y.is_finite() {
-                Some(zone_for(*x, *y, (min_x, min_y, max_x, max_y)))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 /// Diagnostic for a failed in-page pursuit: the noun plus every actionable

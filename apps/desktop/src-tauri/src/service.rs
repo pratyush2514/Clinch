@@ -2902,6 +2902,19 @@ impl AppService {
         mut intent: macro_engine::SemanticIntent,
         mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Verb-led preemption: a prompt starting with a closed-vocabulary
+        // verb phrase ("log out from reddit") routes before the
+        // funnel/search machinery — saved replay already won (this is an
+        // ephemeral lane), so nothing taught is bypassed. Settles here
+        // because the ad-hoc lane's own settle runs at its end, past this
+        // early return.
+        if let Some(action) = orchestration_engine::detect_verb_led_action(&prompt) {
+            let mut outcome = self
+                .dispatch_verb_led_action(prompt, action, &mut emit)
+                .await?;
+            self.settle_ephemeral_outcome(&mut outcome).await;
+            return Ok(outcome);
+        }
         // Funnel first: open-verb-led, non-plural prompts route through the
         // funnel before the old follow-up / proposal / search machinery.
         // The gate is pure (no browser): only a claimed prompt attaches
@@ -3678,6 +3691,17 @@ impl AppService {
         mut intent: macro_engine::SemanticIntent,
         mut emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Verb-led preemption: a prompt starting with a closed-vocabulary
+        // verb phrase ("log out from reddit") routes before the
+        // funnel/search machinery — saved replay already won (this is an
+        // ephemeral lane), so nothing taught is bypassed. `dispatch_one_prompt`
+        // settles this lane's outcome, so the verb-led outcome returns
+        // unsettled like every other path here.
+        if let Some(action) = orchestration_engine::detect_verb_led_action(&prompt) {
+            return self
+                .dispatch_verb_led_action(prompt, action, &mut emit)
+                .await;
+        }
         // Funnel first: open-verb-led, non-plural prompts claim the funnel
         // before the old connected in-page detector, so claiming and
         // journaling are never bypassed (e.g. "open settings on reddit").
@@ -3857,27 +3881,20 @@ impl AppService {
                 }
             ))
             .await;
-        // Goal-class branch: identity goals ("my profile", "my account")
-        // get the chrome worker with memory and verification; settings
-        // goals ("settings", "preferences") get the settings worker with
-        // the same memory shape; every other artifact keeps the generic
-        // noun-hunt path below.
-        if let Some(goal_class) = orchestration_engine::goal_class_for(&noun) {
+        // Verb-spec branch: the closed noun table maps the artifact noun to
+        // its verb spec (vocabulary + verifier). Identity goals ("my
+        // profile", "my account") get the chrome worker with memory and
+        // verification; settings goals ("settings", "preferences") get the
+        // same worker with the same memory shape; log-out goals get the
+        // worker with the signed-out verifier and no memory; every other
+        // artifact keeps the generic noun-hunt path below.
+        if let Some(spec) = orchestration_engine::spec_for_noun(&noun) {
             let _ = self
-                .record(&format!("in_page_goal_class: {}", goal_class.as_str()))
+                .record(&format!("in_page_goal_class: {}", spec.kind.as_str()))
                 .await;
-            return match goal_class {
-                orchestration_engine::GoalClass::AccountHome => {
-                    self.dispatch_account_home_goal(
-                        &browser, &portal, &name, goal_class, navigator, goal_line,
-                    )
-                    .await
-                }
-                orchestration_engine::GoalClass::Settings => {
-                    self.dispatch_settings_goal(&browser, &portal, &name, goal_line)
-                        .await
-                }
-            };
+            return self
+                .dispatch_verb_spec_goal(&browser, &portal, &name, spec, goal_line, navigator)
+                .await;
         }
         match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
@@ -3975,19 +3992,21 @@ impl AppService {
     /// observed fact from the user's own run — written automatically,
     /// announced in the journal, revoked by "Forget this site".
     /// Memory fast path for `account_home`: recall the remembered
-    /// identity href, validate and navigate it, verify the live page.
-    /// Returns `Some(outcome)` on a live hit, `None` on miss or stale
-    /// (stale rows are deleted here). Extracted so
+    /// identity href, validate and navigate it, verify the live page with
+    /// the account-home verb verifier. Returns `Some(outcome)` on a
+    /// verified live hit, `None` on miss or stale (stale and unverified
+    /// rows are deleted here). Extracted so
     /// `dispatch_account_home_goal` stays within the line budget.
     async fn recall_account_home(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         origin_host: &str,
-        class_key: &str,
         name: &str,
         goal_line: String,
+        spec: &'static orchestration_engine::VerbSpec,
     ) -> Result<Option<DispatchOutcome>, AppError> {
+        let class_key = spec.kind.as_str();
         let remembered = self
             .playbooks()
             .await?
@@ -4005,14 +4024,33 @@ impl AppService {
             .navigate_remembered_identity(browser, portal, &remembered)
             .await
         {
+            // Verifier-backed completion: the remembered URL must still
+            // read as the account home on the live page. Memory is a
+            // shortcut to the goal, not a claim the goal was reached.
+            if macro_engine::verify_verb(
+                &**browser,
+                portal,
+                spec,
+                None,
+                remembered.username.as_deref(),
+            )
+            .await
+            {
+                let _ = self
+                    .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                    .await;
+                return Ok(Some(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                )));
+            }
             let _ = self
-                .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                .record(&format!(
+                    "in_page_goal_memory: remembered URL no longer verifies → {}",
+                    landed.as_str()
+                ))
                 .await;
-            return Ok(Some(Self::in_page_goal_outcome(
-                name,
-                goal_line,
-                Some(landed.as_str().to_owned()),
-            )));
         }
         // Stale: drop only this goal class's row and fall through to the
         // live chrome read. A stale profile row must not evict the
@@ -4026,38 +4064,194 @@ impl AppService {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Shared verb dispatch: one match on the verb kind routes to the
+    /// per-verb dispatcher, each of which runs the action engine's three
+    /// gears (deterministic chrome worker → generalist model loop → honest
+    /// miss) with the verb's verifier as the only completion decider. The
+    /// noun-led path (`dispatch_in_page_goal`) and the verb-led path
+    /// (`dispatch_verb_led_action`) share this, so memory, verification,
+    /// and journaling stay one implementation.
+    async fn dispatch_verb_spec_goal(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        name: &str,
+        spec: &'static orchestration_engine::VerbSpec,
+        goal_line: String,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+    ) -> Result<DispatchOutcome, AppError> {
+        match spec.kind {
+            orchestration_engine::VerbKind::AccountHome => {
+                self.dispatch_account_home_goal(browser, portal, name, spec, goal_line, navigator)
+                    .await
+            }
+            orchestration_engine::VerbKind::Settings => {
+                self.dispatch_settings_goal(browser, portal, name, spec, goal_line, navigator)
+                    .await
+            }
+            orchestration_engine::VerbKind::LogOut => {
+                self.dispatch_log_out_goal(browser, portal, name, spec, goal_line, navigator)
+                    .await
+            }
+        }
+    }
+
+    /// Verb-led action dispatch: the prompt starts with a closed-vocabulary
+    /// verb phrase ("log out from reddit"), detected by
+    /// [`orchestration_engine::detect_verb_led_action`]. Saved replay
+    /// already won (this runs in the ephemeral lanes only), so this
+    /// preempts the funnel/search machinery:
+    ///
+    /// * empty site context ("log out") → act on the live portal; no
+    ///   portal is [`AppError::SessionRequired`].
+    /// * site context matching the live origin → act in-page without
+    ///   grounding (the funnel's already-on-origin rule, same
+    ///   alias-aware matcher; the ladder runs only on a miss).
+    /// * otherwise → ground the site context through the normal site
+    ///   ladder (preposition stripped, no site list), land it, then act.
+    ///
+    /// The verb's in-page goal runs through the shared
+    /// [`Self::dispatch_verb_spec_goal`], so memory, the action engine's
+    /// three gears, and the verifier wall are the same implementation the
+    /// noun-led path uses. Returns unsettled like
+    /// [`Self::dispatch_in_page_goal`] — the lane settles.
+    async fn dispatch_verb_led_action(
+        &self,
+        prompt: String,
+        action: orchestration_engine::VerbLedAction,
+        _emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        let spec = action.spec;
+        let _ = self
+            .record(&format!(
+                "verb_led: '{}' · site context '{}'",
+                spec.kind.as_str(),
+                if action.site_text.is_empty() {
+                    "(live portal)"
+                } else {
+                    action.site_text.as_str()
+                }
+            ))
+            .await;
+        let site = orchestration_engine::verb_site_context(&action.site_text);
+        // A bare verb ("log out") or an aside-only remainder ("log out for
+        // me") acts on the live portal — the remainder names no site.
+        let live = self.live_portal().await;
+        let (portal, entry) = if let Some(site) = site {
+            // Already-on-origin: the named site IS the live portal —
+            // act in-page without grounding, like the funnel does. The
+            // alias-aware matcher is the same rule the funnel and the
+            // directory veto share; the ladder runs only on a miss.
+            let on_origin = live
+                .as_ref()
+                .and_then(|portal| portal.host_str())
+                .is_some_and(|host| orchestration_engine::site_matches_host(&site, host));
+            if on_origin {
+                let portal = live.clone().ok_or(AppError::Internal)?;
+                let _ = self
+                    .record(&format!(
+                        "verb_led: already_on_origin '{site}' ({}) · ladder skipped",
+                        portal.host_str().unwrap_or("?")
+                    ))
+                    .await;
+                (portal, None)
+            } else {
+                // Ground the site context through the normal ladder,
+                // then land it like the cold in-page goal does.
+                let (route, _) = self.resolve_site_via_ladder(&site).await;
+                let Some(route) = route else {
+                    let _ = self
+                        .record(&format!("verb_led_miss: site='{site}' ungrounded"))
+                        .await;
+                    let journal = self.recent_journal(16).await;
+                    return Err(AppError::WorkflowFailed(journal));
+                };
+                let valid =
+                    orchestration_engine::entry_url_valid(Some(route.source), route.url.as_str());
+                if !valid {
+                    return Err(AppError::InvalidInput(
+                        "The derived intent is not runnable.",
+                    ));
+                }
+                let _ = self
+                    .record(&format!(
+                        "route_proposed: verb-led '{site}' → {} · source: {:?}",
+                        route.url.as_str(),
+                        route.source
+                    ))
+                    .await;
+                let mut portal = route.url.clone();
+                portal.set_path("/");
+                portal.set_query(None);
+                portal.set_fragment(None);
+                *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
+                (portal, Some(route.url))
+            }
+        } else {
+            let portal = live.clone().ok_or(AppError::SessionRequired)?;
+            (portal, None)
+        };
+        // Background intent: reuse the attached session, never open a
+        // window. With a grounded site the browser lands it first — the
+        // pursuit snapshots the live page, so acting must start from the
+        // destination, not about:blank. With the live portal there is no
+        // navigation before acting.
+        let browser = self.browser(BrowserIntent::Background).await?;
+        if let Some(entry) = entry {
+            macro_engine::ensure_at_entry_url(&browser, &entry)
+                .await
+                .map_err(|_| AppError::BrowserUnavailable)?;
+        }
+        let name = orchestration_engine::ephemeral_name(&prompt);
+        let goal_line = format!(
+            "verb_led_goal: '{}' on {}",
+            spec.kind.as_str(),
+            portal.host_str().unwrap_or("?")
+        );
+        let navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>> =
+            orchestration_engine::LlmPageNavigator::from_env()
+                .map(|navigator| std::sync::Arc::new(navigator) as _);
+        let _ = self
+            .record(&format!(
+                "in_page_goal_navigator: {}",
+                if navigator.is_some() {
+                    "model-guided phase armed"
+                } else {
+                    "deterministic only"
+                }
+            ))
+            .await;
+        self.dispatch_verb_spec_goal(&browser, &portal, &name, spec, goal_line, navigator)
+            .await
+    }
+
     async fn dispatch_account_home_goal(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         name: &str,
-        goal_class: orchestration_engine::GoalClass,
-        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
     ) -> Result<DispatchOutcome, AppError> {
         let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
-        let class_key = goal_class.as_str();
+        let class_key = spec.kind.as_str();
 
         // 1. Memory: a previous run revealed this origin's profile URL from
         // the live page. A live hit completes here; miss or stale falls
         // through to the chrome worker.
         if let Some(outcome) = self
-            .recall_account_home(
-                browser,
-                portal,
-                &origin_host,
-                class_key,
-                name,
-                goal_line.clone(),
-            )
+            .recall_account_home(browser, portal, &origin_host, name, goal_line.clone(), spec)
             .await?
         {
             return Ok(outcome);
         }
 
-        // 2. Live chrome worker with verifier.
-        match macro_engine::pursue_account_home(browser, portal, navigator).await {
+        // 2. Live chrome worker with verifier, then the generalist model
+        // loop, then the honest miss: one action engine, three gears. The
+        // guest short-circuit lives inside the worker, so a signed-out
+        // landing still returns `SignedOut` before the model phase.
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Verified {
                 label,
                 landed,
@@ -4112,7 +4306,8 @@ impl AppService {
                 macro_engine::PageGoalOutcome::Navigated { .. }
                 | macro_engine::PageGoalOutcome::AlreadyThere { .. },
             ) => {
-                // `pursue_account_home` never yields these; defensive.
+                // `pursue_chrome_action` never yields these for the
+                // account-home spec; defensive.
                 Err(AppError::Internal)
             }
             Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
@@ -4130,11 +4325,12 @@ impl AppService {
     }
 
     /// Memory fast path for `settings`: recall the remembered settings
-    /// destination, validate and navigate it. Returns `Some(outcome)` on
-    /// a live hit, `None` on miss or stale (stale rows are deleted here,
-    /// scoped to the settings goal class so the origin's identity row
-    /// survives). Extracted so `dispatch_settings_goal` stays within the
-    /// line budget.
+    /// destination, validate and navigate it, then verify the live page
+    /// with the settings verb verifier. Returns `Some(outcome)` on a
+    /// verified live hit, `None` on miss or stale (stale and unverified
+    /// rows are deleted here, scoped to the settings goal class so the
+    /// origin's identity row survives). Extracted so
+    /// `dispatch_settings_goal` stays within the line budget.
     async fn recall_settings_destination_fast_path(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
@@ -4142,6 +4338,7 @@ impl AppService {
         origin_host: &str,
         name: &str,
         goal_line: String,
+        spec: &'static orchestration_engine::VerbSpec,
     ) -> Result<Option<DispatchOutcome>, AppError> {
         let remembered = self
             .playbooks()
@@ -4160,14 +4357,26 @@ impl AppService {
             .navigate_remembered_href(browser, portal, &destination.href, None)
             .await
         {
+            // Verifier-backed completion: the remembered URL must still
+            // read as the settings destination on the live page. Memory is
+            // a shortcut to the goal, not a claim the goal was reached —
+            // an unverified landing is stale, not a completion.
+            if macro_engine::verify_verb(&**browser, portal, spec, None, None).await {
+                let _ = self
+                    .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                    .await;
+                return Ok(Some(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                )));
+            }
             let _ = self
-                .record(&format!("in_page_goal_done: memory → {}", landed.as_str()))
+                .record(&format!(
+                    "in_page_goal_memory: remembered URL no longer verifies → {}",
+                    landed.as_str()
+                ))
                 .await;
-            return Ok(Some(Self::in_page_goal_outcome(
-                name,
-                goal_line,
-                Some(landed.as_str().to_owned()),
-            )));
         }
         // Stale: drop only the settings row and fall through to the live
         // settings worker — the origin's identity row (if any) is a
@@ -4177,26 +4386,30 @@ impl AppService {
             .await?
             .forget_identity_for_origin_and_class(
                 origin_host,
-                orchestration_engine::GoalClass::Settings.as_str(),
+                orchestration_engine::VerbKind::Settings.as_str(),
             )
             .await;
         let _ = self.record("in_page_goal_memory: stale → rediscover").await;
         Ok(None)
     }
 
-    /// `settings` dispatch: memory fast path first, live settings chrome
-    /// worker second, verifier-gated memory write, honest miss. Mirrors
+    /// `settings` dispatch: memory fast path first, live settings action
+    /// engine second (chrome worker → model loop → honest miss),
+    /// verifier-gated memory write. Mirrors
     /// `dispatch_account_home_goal`'s shape: the memory row is an observed
     /// fact from the user's own run — written automatically from a
     /// verified landing only, announced in the journal, revoked by
-    /// "Forget this site". An unverified navigation completes the run
-    /// but never becomes memory.
+    /// "Forget this site". An unverified navigation is checked against
+    /// the live page and becomes the honest miss when it fails — it never
+    /// completes the run, and never becomes memory.
     async fn dispatch_settings_goal(
         &self,
         browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
         portal: &url::Url,
         name: &str,
+        spec: &'static orchestration_engine::VerbSpec,
         goal_line: String,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
     ) -> Result<DispatchOutcome, AppError> {
         let origin_host = portal.host_str().unwrap_or("?").to_lowercase();
 
@@ -4210,31 +4423,46 @@ impl AppService {
                 &origin_host,
                 name,
                 goal_line.clone(),
+                spec,
             )
             .await?
         {
             return Ok(outcome);
         }
 
-        // 2. Live settings worker: menu hunt through the shared identity
-        // menu, verified landing only.
-        match macro_engine::pursue_settings_chrome(browser, portal).await {
+        // 2. Live settings worker, then the generalist model loop, then the
+        // honest miss: one action engine, three gears. The verifier is the
+        // only completion decider — an unverified `Navigated` is checked
+        // against the live page here and becomes a miss when it fails.
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
             Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
-                // Reached a settings destination, but the worker could not
-                // verify it from the page itself — the run completes, and
-                // memory stays untouched. Memory rows are verified landings
-                // only.
-                let _ = self
-                    .record(&format!(
-                        "in_page_goal_done: '{label}' → {} (unverified · no memory write)",
-                        landed.host_str().unwrap_or("?")
+                // The worker reached a token-named landing but could not
+                // verify it from the page itself. The run completes only
+                // when the live page now passes the verb's verifier —
+                // memory still stays untouched on this arm: memory rows are
+                // the deterministic worker's own verified landings.
+                if macro_engine::verify_verb(&**browser, portal, spec, Some(&label), None).await {
+                    let _ = self
+                        .record(&format!(
+                            "in_page_goal_done: '{label}' → {} (verified at completion)",
+                            landed.as_str()
+                        ))
+                        .await;
+                    Ok(Self::in_page_goal_outcome(
+                        name,
+                        goal_line,
+                        Some(landed.as_str().to_owned()),
                     ))
-                    .await;
-                Ok(Self::in_page_goal_outcome(
-                    name,
-                    goal_line,
-                    Some(landed.as_str().to_owned()),
-                ))
+                } else {
+                    let _ = self
+                        .record(&format!(
+                            "in_page_goal_miss: '{label}' → {} (navigation not verified)",
+                            landed.as_str()
+                        ))
+                        .await;
+                    let journal = self.recent_journal(16).await;
+                    Err(AppError::WorkflowFailed(journal))
+                }
             }
             Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
                 let _ = self
@@ -4283,7 +4511,84 @@ impl AppService {
                 macro_engine::PageGoalOutcome::AlreadyThere { .. }
                 | macro_engine::PageGoalOutcome::SignedOut,
             ) => {
-                // `pursue_settings_chrome` never yields these; defensive.
+                // `pursue_chrome_action` never yields these for the settings
+                // spec; defensive.
+                Err(AppError::Internal)
+            }
+        }
+    }
+
+    /// `log_out` dispatch: no memory shape — a signed-out session leaves
+    /// nothing to remember — just the spec-parameterized action engine with
+    /// the signed-out verifier. `Verified` means the live page reads signed
+    /// out after the click; `AlreadyThere` means the pre-click probe read
+    /// signed out, and it is accepted only after the verifier still reads
+    /// signed out — the probe alone is not completion evidence.
+    async fn dispatch_log_out_goal(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        name: &str,
+        spec: &'static orchestration_engine::VerbSpec,
+        goal_line: String,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+    ) -> Result<DispatchOutcome, AppError> {
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator).await {
+            Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: signed out via '{label}' → {}",
+                        landed.as_str()
+                    ))
+                    .await;
+                Ok(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                ))
+            }
+            Ok(macro_engine::PageGoalOutcome::AlreadyThere { landed }) => {
+                // Completion is verifier-backed: re-read the live auth
+                // state now, because the probe that produced `AlreadyThere`
+                // may predate a page change. A signed-in re-read is a
+                // miss, never a completion.
+                if macro_engine::verify_verb(&**browser, portal, spec, None, None).await {
+                    let _ = self
+                        .record(&format!(
+                            "in_page_goal_done: already signed out at {}",
+                            landed.as_str()
+                        ))
+                        .await;
+                    Ok(Self::in_page_goal_outcome(
+                        name,
+                        goal_line,
+                        Some(landed.as_str().to_owned()),
+                    ))
+                } else {
+                    let _ = self
+                        .record("in_page_goal_miss: page no longer reads signed out")
+                        .await;
+                    let journal = self.recent_journal(16).await;
+                    Err(AppError::WorkflowFailed(journal))
+                }
+            }
+            Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
+                let _ = self
+                    .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                let journal = self.recent_journal(16).await;
+                Err(AppError::WorkflowFailed(journal))
+            }
+            Err(macro_engine::IntentError::Browser(_)) => {
+                let _ = self.record("in_page_goal_miss: browser error").await;
+                Err(AppError::BrowserUnavailable)
+            }
+            Ok(
+                macro_engine::PageGoalOutcome::Navigated { .. }
+                | macro_engine::PageGoalOutcome::SignedOut,
+            ) => {
+                // `pursue_chrome_action` never yields these for the log-out
+                // spec; defensive.
                 Err(AppError::Internal)
             }
         }
@@ -7312,6 +7617,64 @@ pub(crate) mod tests {
             .map_err(|_| "session")?
             .clone();
         assert!(connected.is_none(), "no portal invented");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn funnel_preempts_old_proposal_in_connected_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Work item 6b: the B4 regression pinned the ad-hoc lane, but the
+        // live incident ran on a warm browser — the connected
+        // single-ephemeral lane (`dispatch_single_ephemeral`). A
+        // funnel-claimed prompt must journal the funnel's slots before,
+        // and instead of, any old `propose_entry_url` machinery there too.
+        // Uses the exact live prompt: the funnel must claim it for
+        // `reddit` (never `log`) and take AlreadyOnOrigin on the reddit
+        // portal, so no browser or network is touched.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        let portal = url::Url::parse("https://www.reddit.com/").map_err(|_| "portal")?;
+        service.test_connect(portal).map_err(|_| "connect")?;
+        let outcome = service
+            .dispatch_natural_command("open reddit for me i want to log in".to_owned(), |_| {})
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "already-on-origin completes without a browser"
+        );
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        let first_funnel = events
+            .iter()
+            .position(|line| line.starts_with("funnel_"))
+            .ok_or("the funnel must journal on a funnel-claimed prompt")?;
+        assert!(
+            events[first_funnel].starts_with("funnel_slots:"),
+            "the funnel's first line must be its slots, got: {}",
+            events[first_funnel]
+        );
+        assert!(
+            events[first_funnel].contains("site=Some(\"reddit\")"),
+            "the site slot is reddit, never log: {}",
+            events[first_funnel]
+        );
+        for line in &events {
+            // The funnel's own route lines carry the `funnel` marker;
+            // any other line with these prefixes is the old proposal
+            // machinery running on a funnel-claimed prompt.
+            assert!(
+                !line.starts_with("route_proposed:") || line.contains("funnel"),
+                "old proposal machinery ran on a funnel-claimed prompt: {line}"
+            );
+            assert!(
+                !line.starts_with("route_fallback:"),
+                "old search fallback ran on a funnel-claimed prompt: {line}"
+            );
+            assert!(
+                !line.starts_with("route_resolution_miss:"),
+                "old resolution miss ran on a funnel-claimed prompt: {line}"
+            );
+        }
         Ok(())
     }
 
