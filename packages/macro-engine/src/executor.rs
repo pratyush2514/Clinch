@@ -1610,6 +1610,11 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // already re-snapshotted and re-ranked between attempts, so re-looping
     // would only re-examine candidates it exhausted.
     let mut clicks_used: usize = 0;
+    // Whether the previous menu-opening attempt reported a menu open: the
+    // revealed-destination search found nothing in it, so it is the wrong
+    // menu (or a false positive) and must be dismissed before the next
+    // attempt clicks — otherwise its light-dismiss swallows that click.
+    let mut menu_maybe_open = false;
 
     while clicks_used < CHROME_ACTION_MAX_CLICKS {
         // Full snapshot, not the navigator slice: a revealed menu renders at
@@ -1674,7 +1679,15 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
         }
 
         // 2. No revealed destination: spend the remaining budget on the
-        // shared menu primitive in a single call.
+        // shared menu primitive in a single call. A wrong menu left open
+        // by the previous attempt light-dismisses on the next click —
+        // swallowing it instead of letting it reach the next candidate —
+        // so Escape first (best-effort no-op when nothing is open).
+        if menu_maybe_open {
+            browser.menu_dismiss().await;
+            tried.push("dismissed possibly-open menu before next attempt".to_owned());
+            menu_maybe_open = false;
+        }
         let opened = open_menu_within_budget(
             browser,
             origin,
@@ -1688,6 +1701,7 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
         if !opened {
             break;
         }
+        menu_maybe_open = true;
         previously_seen = currently_seen;
     }
     Err(IntentError::NoMatch(chrome_action_miss_diagnostic(
@@ -1991,6 +2005,12 @@ pub trait MenuBrowser {
         &self,
         element: &AxElement,
     ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send;
+    /// Dismiss any open popup layer (Escape keypress). A wrong menu left
+    /// open by an earlier attempt light-dismisses on the next click —
+    /// swallowing it instead of letting it reach the next candidate — so
+    /// the worker calls this before spending another menu-opening click.
+    /// Best-effort: implementations must not fail when nothing is open.
+    fn menu_dismiss(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 impl MenuBrowser for ManagedBrowser {
@@ -2013,6 +2033,12 @@ impl MenuBrowser for ManagedBrowser {
     async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
         click_element(self, element).await.map(|_| ())
     }
+
+    async fn menu_dismiss(&self) {
+        // Best-effort Escape: a popup light-dismisses; with nothing open
+        // the keypress is a harmless no-op. Failures never fail the run.
+        let _ = self.press_escape().await;
+    }
 }
 
 /// Per-invocation click cap for the shared menu primitive: one candidate
@@ -2022,20 +2048,27 @@ impl MenuBrowser for ManagedBrowser {
 /// can't burn the run.
 const MENU_OPEN_MAX_TRIES: usize = 3;
 
-/// Ordered menu-opening candidates, pure decision: (a) landmarked
-/// banner/navigation buttons, then (b) account-worded buttons
-/// ([`mentions_account_word`]), then (c) blank-named buttons inside the
-/// header strip — the unlabeled-avatar case, structural (empty name +
-/// header geometry), never a control-name string — then (d) the
-/// remaining unclicked buttons inside the header strip, rightmost first.
-/// Tier (d) folds in the rightmost-geometry fallback both lanes already
-/// had (`select_identity_control`'s second tier and
-/// [`select_rightmost_button`]), so sharing the primitive doesn't drop
-/// the named-but-wordless header button case; blank-named avatars still
-/// outrank arbitrary named buttons. `rects` carries the
+/// Ordered menu-opening candidates, pure decision. Two passes: the header
+/// strip first, then below-strip content — account chrome lives in page
+/// headers, and a feed-content button carrying a navigation landmark must
+/// not outrank the header's account button (caught live on Reddit: the
+/// worker clicked a post's "Open user actions" menu first, and the open
+/// popup's light-dismiss then swallowed the avatar-menu click, so "log
+/// out" never executed). Within each pass the legacy sub-order holds:
+/// (a) landmarked banner/navigation buttons, then (b) account-worded
+/// buttons ([`mentions_account_word`]), then — strip pass only —
+/// (c) blank-named buttons inside the header strip — the unlabeled-avatar
+/// case, structural (empty name + header geometry), never a control-name
+/// string — then (d) the remaining unclicked buttons inside the header
+/// strip, rightmost first. Tier (d) folds in the rightmost-geometry
+/// fallback both lanes already had (`select_identity_control`'s second
+/// tier and [`select_rightmost_button`]), so sharing the primitive doesn't
+/// drop the named-but-wordless header button case; blank-named avatars
+/// still outrank arbitrary named buttons. `rects` carries the
 /// boundary-measured `(backend_node_id, x, y)` of the unclicked buttons;
 /// `strip_bottom` is the viewport-relative header cutoff (`None` when
-/// the viewport won't read — geometry tiers stay empty, fail closed).
+/// the viewport won't read — the strip pass stays empty and the
+/// below-strip pass ranks in the legacy order, fail closed).
 /// Already-clicked controls are excluded in every tier; each control
 /// appears once, at its highest tier. CDP stays in the callers; this
 /// stays unit-testable like [`pick_rightmost`].
@@ -2058,44 +2091,55 @@ pub fn rank_menu_candidates<'a>(
             ranked.push(element);
         }
     };
-    // (a) landmarked header chrome.
-    for element in elements.iter().filter(|element| {
-        element.role == "button"
-            && !already_clicked(clicked, element)
-            && matches!(element.landmark.as_deref(), Some("banner" | "navigation"))
-    }) {
-        push(element);
-    }
-    // (b) account-worded buttons anywhere.
-    for element in elements.iter().filter(|element| {
-        element.role == "button"
-            && !already_clicked(clicked, element)
-            && mentions_account_word(element)
-    }) {
-        push(element);
-    }
-    // (c) + (d): in-strip buttons, blank-named first, each rightmost first.
-    let mut strip_buttons: Vec<(&'a AxElement, f64)> = elements
-        .iter()
-        .filter(|element| {
+    // Header strip first, then page content: the account-menu trigger is
+    // header chrome, never feed content.
+    for strip_pass in [true, false] {
+        let in_pass =
+            |element: &AxElement| in_strip.contains_key(&element.backend_node_id) == strip_pass;
+        // (a) landmarked header chrome.
+        for element in elements.iter().filter(|element| {
             element.role == "button"
                 && !already_clicked(clicked, element)
-                && in_strip.contains_key(&element.backend_node_id)
-        })
-        .map(|element| (element, in_strip[&element.backend_node_id].0))
-        .collect();
-    strip_buttons.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut blank: Vec<(&'a AxElement, f64)> = Vec::new();
-    let mut named: Vec<(&'a AxElement, f64)> = Vec::new();
-    for entry in strip_buttons {
-        if entry.0.name.trim().is_empty() {
-            blank.push(entry);
-        } else {
-            named.push(entry);
+                && matches!(element.landmark.as_deref(), Some("banner" | "navigation"))
+                && in_pass(element)
+        }) {
+            push(element);
         }
-    }
-    for (element, _) in blank.into_iter().chain(named) {
-        push(element);
+        // (b) account-worded buttons.
+        for element in elements.iter().filter(|element| {
+            element.role == "button"
+                && !already_clicked(clicked, element)
+                && mentions_account_word(element)
+                && in_pass(element)
+        }) {
+            push(element);
+        }
+        if !strip_pass {
+            continue;
+        }
+        // (c) + (d): in-strip buttons, blank-named first, each rightmost first.
+        let mut strip_buttons: Vec<(&'a AxElement, f64)> = elements
+            .iter()
+            .filter(|element| {
+                element.role == "button"
+                    && !already_clicked(clicked, element)
+                    && in_strip.contains_key(&element.backend_node_id)
+            })
+            .map(|element| (element, in_strip[&element.backend_node_id].0))
+            .collect();
+        strip_buttons.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut blank: Vec<(&'a AxElement, f64)> = Vec::new();
+        let mut named: Vec<(&'a AxElement, f64)> = Vec::new();
+        for entry in strip_buttons {
+            if entry.0.name.trim().is_empty() {
+                blank.push(entry);
+            } else {
+                named.push(entry);
+            }
+        }
+        for (element, _) in blank.into_iter().chain(named) {
+            push(element);
+        }
     }
     ranked
 }
@@ -2698,6 +2742,10 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
     let mut clicked: Vec<ClickedControl> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     let mut last_label: Option<String> = None;
+    // Neutral acting state: the deterministic phase may have left a wrong
+    // menu open, whose light-dismiss would swallow the loop's first click.
+    // Best-effort no-op when nothing is open.
+    browser.menu_dismiss().await;
     // Page-revealed username candidate for the identity verifier: read from
     // a clicked control's href or label BEFORE the click, never derived
     // from the landed URL (that would make the check circular).
@@ -2940,7 +2988,7 @@ fn model_goal_text(goal: &str, spec: Option<&VerbSpec>) -> String {
     match spec {
         None => goal.to_owned(),
         Some(spec) => format!(
-            "{goal} [verb hint: {}; destination words: {}]",
+            "{goal} [verb hint: {}; destination words: {}; prefer header/account chrome (top of the page) over feed content controls]",
             spec.kind.as_str(),
             spec.vocabulary.join(", ")
         ),

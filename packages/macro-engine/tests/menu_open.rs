@@ -1,14 +1,16 @@
 //! Shared menu-opening primitive: pure candidate ranking plus the async
 //! click → poll-for-evidence → retry loop.
 //!
-//! `rank_menu_candidates` orders (a) landmarked banner/navigation
-//! buttons, (b) account-worded buttons, (c) blank-named buttons inside
-//! the header strip (rightmost first), (d) remaining in-strip buttons
-//! (rightmost first). The loop itself is driven against a scripted
-//! [`MenuBrowser`] fake — no Chromium needed: the fake serves one steady
-//! snapshot tree (a poll that outlasts the script sees a steady tree
-//! instead of hanging), records clicks, and flips scripted page state,
-//! proving the retry order, the evidence poll, and the timing bounds.
+//! `rank_menu_candidates` orders the header strip first, then page
+//! content: within each pass, (a) landmarked banner/navigation buttons,
+//! (b) account-worded buttons, and — strip pass only — (c) blank-named
+//! buttons inside the header strip (rightmost first), (d) remaining
+//! in-strip buttons (rightmost first). The loop itself is driven against
+//! a scripted [`MenuBrowser`] fake — no Chromium needed: the fake serves
+//! one steady snapshot tree (a poll that outlasts the script sees a steady
+//! tree instead of hanging), records clicks, and flips scripted page
+//! state, proving the retry order, the evidence poll, and the timing
+//! bounds.
 
 use browser_driver::{AxElement, AxResyncCheck, BrowserError, Highlight};
 use macro_engine::{
@@ -41,19 +43,30 @@ fn ids(ranked: &[&AxElement]) -> Vec<i64> {
 }
 
 #[test]
-fn tier_order_landmarked_then_account_worded_then_blank_then_named() {
+fn header_strip_outranks_content() {
+    // The live Reddit shape: a feed-content button carrying a navigation
+    // landmark must not outrank the header's account button — the worker
+    // clicked the post's "Open user actions" menu first, and the open
+    // popup's light-dismiss then swallowed the avatar-menu click.
     let elements = vec![
-        el(1, "button", "Open user actions", None),
-        el(2, "button", "Sections", Some("navigation")),
+        el(1, "button", "Open user actions", Some("navigation")),
+        el(2, "button", "User Avatar Expand user menu", None),
         el(3, "button", "", None),
         el(4, "button", "Chat", None),
         el(5, "link", "User profile", None),
     ];
-    let rects = vec![(3, 100.0, 50.0), (4, 900.0, 60.0)];
+    // Avatar in the header strip; the post button below it.
+    let rects = vec![
+        (2, 1100.0, 40.0),
+        (3, 100.0, 50.0),
+        (4, 900.0, 60.0),
+        (1, 1100.0, 600.0),
+    ];
     let ranked = rank_menu_candidates(&elements, &[], &rects, Some(200.0));
-    // (a) landmarked, (b) account-worded, (c) blank in strip,
-    // (d) named in strip. The account-worded link is never a candidate.
-    assert_eq!(ids(&ranked), vec![2, 1, 3, 4]);
+    // Strip pass: (b) account-worded avatar, (c) blank, (d) named;
+    // content pass: (a) landmarked post button. The account-worded link
+    // is never a candidate.
+    assert_eq!(ids(&ranked), vec![2, 3, 4, 1]);
 }
 
 #[test]
@@ -65,13 +78,14 @@ fn already_clicked_excluded_in_every_tier() {
         el(4, "button", "Chat", None),
     ];
     let rects = vec![(3, 100.0, 50.0), (4, 900.0, 60.0)];
-    // Clicked landmarked + blank: both vanish, the rest keep their order.
+    // Clicked landmarked + blank: both vanish, the rest keep their order —
+    // header strip first, then content.
     let clicked = vec![
         ClickedControl::of(&elements[1]),
         ClickedControl::of(&elements[2]),
     ];
     let ranked = rank_menu_candidates(&elements, &clicked, &rects, Some(200.0));
-    assert_eq!(ids(&ranked), vec![1, 4]);
+    assert_eq!(ids(&ranked), vec![4, 1]);
     // Everything clicked: nothing left to try.
     let clicked_all: Vec<ClickedControl> = elements.iter().map(ClickedControl::of).collect();
     let ranked = rank_menu_candidates(&elements, &clicked_all, &rects, Some(200.0));
@@ -86,9 +100,11 @@ fn below_strip_excluded_from_geometry_tiers() {
         el(4, "button", "Chat", None),
     ];
     // Blank button below the strip: not tier (c), and not tier (d) either.
+    // The in-strip named button outranks the below-strip account-worded
+    // one — header chrome first.
     let rects = vec![(3, 100.0, 500.0), (4, 900.0, 60.0)];
     let ranked = rank_menu_candidates(&elements, &[], &rects, Some(200.0));
-    assert_eq!(ids(&ranked), vec![1, 4]);
+    assert_eq!(ids(&ranked), vec![4, 1]);
 }
 
 #[test]
@@ -265,6 +281,8 @@ impl MenuBrowser for FakeMenuBrowser {
         self.clicks.lock().await.push(element.backend_node_id);
         Ok(())
     }
+
+    async fn menu_dismiss(&self) {}
 }
 
 fn baseline_check() -> AxResyncCheck {

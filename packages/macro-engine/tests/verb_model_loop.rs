@@ -131,6 +131,8 @@ impl MenuBrowser for LoopBrowser {
         });
         Ok(())
     }
+
+    async fn menu_dismiss(&self) {}
 }
 
 impl SettingsBrowser for LoopBrowser {

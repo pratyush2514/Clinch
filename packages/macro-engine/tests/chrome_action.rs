@@ -73,6 +73,7 @@ struct FakeChromeActionBrowser {
     tree: Vec<AxElement>,
     raw_nodes: usize,
     clicks: Mutex<Vec<i64>>,
+    dismisses: Mutex<usize>,
     expanded: HashMap<i64, bool>,
     opens_menu_on_click: Option<i64>,
     menu_tree: Vec<AxElement>,
@@ -93,6 +94,7 @@ impl FakeChromeActionBrowser {
             tree,
             raw_nodes: 10,
             clicks: Mutex::new(Vec::new()),
+            dismisses: Mutex::new(0),
             expanded: HashMap::new(),
             opens_menu_on_click: None,
             menu_tree: Vec::new(),
@@ -218,6 +220,10 @@ impl MenuBrowser for FakeChromeActionBrowser {
             *self.auth.lock().await = state;
         }
         Ok(())
+    }
+
+    async fn menu_dismiss(&self) {
+        *self.dismisses.lock().await += 1;
     }
 }
 
@@ -491,6 +497,45 @@ async fn settings_flow_never_clicks_wrong_revealed_item() {
     // The avatar was tried as a menu candidate; the revealed Profile item
     // (id 10) and the footer Settings link (id 5) were never touched.
     assert_eq!(fake.clicks().await, vec![1]);
+}
+
+#[tokio::test]
+async fn logout_flow_dismisses_wrong_menu_before_next_attempt() {
+    // Live Reddit logout shape: the first candidate opens a menu whose
+    // items carry no logout vocabulary. The worker must dismiss the open
+    // popup before spending its next menu-opening click — otherwise the
+    // popup's light-dismiss swallows that click instead of letting it
+    // reach the next candidate, and logout never executes.
+    let avatar = el(1, "button", "User Avatar Expand user menu", None);
+    let baseline = vec![
+        avatar,
+        el(2, "button", "Notifications", None),
+        el(3, "link", "Home", None),
+    ];
+    let mut wrong_menu = baseline.clone();
+    wrong_menu.push(el(10, "menuitem", "Profile", None));
+    let fake = FakeChromeActionBrowser::new(baseline)
+        .with_rect(1, 950.0, 50.0)
+        .with_rect(2, 850.0, 50.0)
+        .with_menu_on_click(1, wrong_menu);
+
+    match pursue_chrome_action(&fake, &origin(), log_out_spec()).await {
+        Err(IntentError::NoMatch(diagnostic)) => {
+            assert!(
+                diagnostic.contains("dismissed possibly-open menu"),
+                "got: {diagnostic}"
+            );
+        }
+        other => panic!("expected NoMatch miss, got {other:?}"),
+    }
+    // The account-worded header button was tried first (not the
+    // feed-content menu), the wrong menu was dismissed, and the next
+    // candidate got its click.
+    assert_eq!(fake.clicks().await, vec![1, 2]);
+    assert!(
+        *fake.dismisses.lock().await >= 1,
+        "expected a dismiss between menu attempts"
+    );
 }
 
 // ---- pursue_chrome_action: full flow, account-home verb ----

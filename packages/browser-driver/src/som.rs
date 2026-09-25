@@ -8,7 +8,8 @@
 
 use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
 use chromiumoxide::cdp::browser_protocol::input::{
-    DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    MouseButton,
 };
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +146,28 @@ impl ManagedBrowser {
             .await
             .map_err(|_| BrowserError::Timeout)?
             .map_err(|_| BrowserError::Connection)?;
+        Ok(())
+    }
+
+    /// Dismiss any open popup layer with an Escape keypress (down + up).
+    /// Best-effort: with nothing open it is a harmless no-op.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] on CDP failure or timeout.
+    pub async fn press_escape(&self) -> Result<(), BrowserError> {
+        for event_type in [DispatchKeyEventType::KeyDown, DispatchKeyEventType::KeyUp] {
+            let key = DispatchKeyEventParams::builder()
+                .r#type(event_type)
+                .key("Escape")
+                .code("Escape")
+                .windows_virtual_key_code(27)
+                .build()
+                .map_err(|_| BrowserError::InvalidAction)?;
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(key))
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|_| BrowserError::Connection)?;
+        }
         Ok(())
     }
 
