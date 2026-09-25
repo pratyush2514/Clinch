@@ -1105,7 +1105,8 @@ fn already_clicked(clicked: &[ClickedControl], element: &AxElement) -> bool {
 /// live auth state before accepting that one too).
 ///
 /// [`IntentError::NoMatch`] with the tried-click journal when both gears
-/// miss; [`IntentError::Browser`] on CDP failure.
+/// miss — or, for the `LogOut` verb, after the deterministic cookie-clear
+/// backstop below has also missed; [`IntentError::Browser`] on CDP failure.
 ///
 /// # Errors
 /// Returns [`IntentError::NoMatch`] when the goal is not reached or not
@@ -1124,27 +1125,131 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
         Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
         Err(IntentError::NoMatch(diagnostic)) => diagnostic,
     };
-    let Some(navigator) = navigator else {
-        return Err(IntentError::NoMatch(deterministic_miss));
+    // The UI attempt's miss journal, from gear 1 alone or both gears: it
+    // rides along so the model phase — and the LogOut cookie fallback —
+    // keep the full tried-click story.
+    let ui_miss = match navigator {
+        Some(navigator) => {
+            // The deterministic tried-log rides along as prompt context: without
+            // it the model re-proposes (or fails to recognize) controls the
+            // deterministic phase already evaluated — e.g. concluding "no avatar
+            // present" while staring at the "Open user actions" button it tried.
+            let goal = format!(
+                "{}. Already tried without success: {deterministic_miss}",
+                verb_goal_text(spec)
+            );
+            match pursue_with_model(
+                browser,
+                origin,
+                &goal,
+                navigator,
+                Some(spec),
+                deterministic_miss,
+                escalation,
+            )
+            .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+                Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+            }
+        }
+        None => deterministic_miss,
     };
-    // The deterministic tried-log rides along as prompt context: without
-    // it the model re-proposes (or fails to recognize) controls the
-    // deterministic phase already evaluated — e.g. concluding "no avatar
-    // present" while staring at the "Open user actions" button it tried.
-    let goal = format!(
-        "{}. Already tried without success: {deterministic_miss}",
-        verb_goal_text(spec)
+    // `LogOut`-only deterministic backstop: both UI gears failed to reach a
+    // verified signed-out state. Clearing the managed profile's session
+    // cookies ends the session without depending on the page's menu
+    // cooperating; the verifier still decides COMPLETED.
+    if spec.kind == VerbKind::LogOut {
+        return logout_cookie_fallback(browser, origin, &ui_miss).await;
+    }
+    Err(IntentError::NoMatch(ui_miss))
+}
+
+/// Registrable-host approximation for the `LogOut` cookie fallback:
+/// `www.example.com` → `example.com` — the last two dot-separated labels
+/// after stripping a `www.` prefix; hosts with fewer than two labels keep
+/// the whole host.
+///
+/// Deliberately NOT a public-suffix list (the same documented
+/// approximation the routing layer uses for plausibility checks):
+/// `example.co.uk` labels as `co.uk`. Acceptable here because the label
+/// only scopes `clear_host_cookies`' dot-boundary suffix match, the host
+/// always comes from the live page URL (never user input), and the full
+/// host would miss the registrable-domain cookies that actually hold the
+/// session.
+fn registrable_host(host: &str) -> &str {
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let mut parts = host.rsplitn(3, '.');
+    match (parts.next(), parts.next()) {
+        (Some(tld), Some(sld)) => {
+            let start = host.len() - sld.len() - 1 - tld.len();
+            &host[start..]
+        }
+        _ => host,
+    }
+}
+
+/// `LogOut`-only deterministic backstop, run after both UI gears missed:
+/// delete the managed profile's session cookies for the live page's
+/// registrable domain (derived from the page URL — never a hardcoded
+/// domain list), re-load the page so the auth probe reads post-clear
+/// state, and let the verifier decide.
+///
+/// Ordering: UI → verify (both gears) → clear → verify → COMPLETED or
+/// the honest miss. The verification wall does not move: COMPLETED
+/// requires the auth probe to read signed out after the clear, exactly
+/// as it does after a UI click. The daily browser is never touched.
+///
+/// [`IntentError::NoMatch`] carries the UI tried-journal plus the
+/// distinct fallback line (`log_out: UI path missed; cleared N session
+/// cookies for <domain>; verifier: <signed-out|still-unknown>`);
+/// [`IntentError::Browser`] on CDP failure (fail fast, like the gears).
+async fn logout_cookie_fallback<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    ui_miss: &str,
+) -> Result<PageGoalOutcome, IntentError> {
+    let page_url = browser.settings_current_url().await;
+    let host = page_url
+        .as_ref()
+        .unwrap_or(origin)
+        .host_str()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let registrable = registrable_host(&host);
+    if registrable.is_empty() || registrable.contains(['/', ':', '@', '?', '#', ' ']) {
+        return Err(IntentError::NoMatch(format!(
+            "{ui_miss}; log_out: UI path missed; cookie-clear fallback skipped (unusable page host)"
+        )));
+    }
+    let cleared = browser.chrome_clear_host_cookies(registrable).await?;
+    // The pre-clear DOM still renders the signed-in page until reloaded;
+    // re-navigate so the auth probe reads post-clear state.
+    let reload_url = page_url.unwrap_or_else(|| origin.clone());
+    browser.chrome_navigate(&reload_url).await?;
+    let signed_out = verify_verb(browser, origin, &LOG_OUT_SPEC, None, None).await;
+    let state = if signed_out {
+        "signed-out"
+    } else {
+        "still-unknown"
+    };
+    let line = format!(
+        "log_out: UI path missed; cleared {cleared} session cookies for {registrable}; verifier: {state}"
     );
-    pursue_with_model(
-        browser,
-        origin,
-        &goal,
-        navigator,
-        Some(spec),
-        deterministic_miss,
-        escalation,
-    )
-    .await
+    if signed_out {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        return Ok(PageGoalOutcome::Verified {
+            label: "session cookies cleared".to_string(),
+            landed,
+            username: None,
+        });
+    }
+    Err(IntentError::NoMatch(format!("{ui_miss}; {line}")))
 }
 
 /// Goal sentence for the generalist loop, per verb: what the destination
@@ -1332,6 +1437,26 @@ pub trait ChromeActionBrowser: SettingsBrowser {
         &self,
         url: &url::Url,
     ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send;
+    /// Delete the managed profile's cookies for `host` — the same
+    /// revocation the "Forget this site" control uses (registrable domain
+    /// with dot-boundary subdomain matching, httpOnly included). The
+    /// `LogOut` verb's deterministic backstop: ends the session without
+    /// depending on the page's menu cooperating. Managed profile only;
+    /// the daily browser is untouched. Returns the number of cookies
+    /// deleted.
+    ///
+    /// The default is inert (`Ok(0)`): scripted fakes that do not model
+    /// cookie state keep it; production overrides it with the real CDP
+    /// call.
+    ///
+    /// # Errors
+    /// Returns [`IntentError::Browser`] on CDP failure.
+    fn chrome_clear_host_cookies(
+        &self,
+        _host: &str,
+    ) -> impl std::future::Future<Output = Result<usize, IntentError>> + Send {
+        std::future::ready(Ok(0))
+    }
 }
 
 impl ChromeActionBrowser for ManagedBrowser {
@@ -1341,6 +1466,12 @@ impl ChromeActionBrowser for ManagedBrowser {
 
     async fn chrome_navigate(&self, url: &url::Url) -> Result<(), IntentError> {
         self.navigate(url).await.map_err(IntentError::Browser)
+    }
+
+    async fn chrome_clear_host_cookies(&self, host: &str) -> Result<usize, IntentError> {
+        self.clear_host_cookies(host)
+            .await
+            .map_err(IntentError::Browser)
     }
 }
 
