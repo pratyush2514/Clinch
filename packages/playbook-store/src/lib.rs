@@ -608,6 +608,22 @@ pub async fn initialize(path: &Path) -> Result<SqlitePool, StoreError> {
             .execute(&pool)
             .await?;
     }
+    // Third additive migration: run scoping for the failure journal. A
+    // FAILED card's journal must show only the failed run's lines — the old
+    // unscoped read leaked earlier runs' and restarts' lines into the card.
+    // Nullable, so rows journaled outside a dispatch (the boot line, session
+    // sync) stay NULL and are never attributed to a run. PRAGMA-guarded
+    // like the columns above, so reopening is idempotent.
+    let has_run_id: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('session_events') WHERE name = 'run_id'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if !has_run_id {
+        sqlx::query("ALTER TABLE session_events ADD COLUMN run_id TEXT")
+            .execute(&pool)
+            .await?;
+    }
     // Run journal for POC metrics (reuse rates, sync outcomes). Additive and
     // idempotent like every table here: existing databases gain it on next
     // open, no ALTER or data migration involved. `completed_at` stays NULL

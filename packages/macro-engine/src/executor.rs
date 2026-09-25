@@ -1519,7 +1519,11 @@ async fn pursue_deterministic(
 ) -> Result<PageGoalOutcome, IntentError> {
     let mut clicked: Vec<ClickedControl> = Vec::new();
     for _ in 0..PAGE_GOAL_MAX_STEPS {
-        let (elements, _, _) = browser.ax_snapshot(origin).await;
+        // Untruncated: a revealed menu renders at document end (React
+        // portal), past the 300-element head the capped snapshot keeps —
+        // "open the Settings on reddit" failed intermittently because the
+        // menu item was invisible to this selector.
+        let (elements, _, _) = browser.ax_snapshot_untruncated(origin).await;
         // 1. Direct hit: actionable control mentioning the noun.
         if let Some(target) = select_page_control(&elements, noun, &clicked) {
             let label = target.name.clone();

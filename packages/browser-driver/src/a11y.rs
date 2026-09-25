@@ -768,6 +768,32 @@ mod tests {
     }
 
     #[test]
+    fn untruncated_variant_sees_past_the_cap() -> Result<(), Box<dyn std::error::Error>> {
+        // Regression guard for the generic in-page pursuit lane: a revealed
+        // menu renders at document end (React portal), past the 300-element
+        // head the capped snapshot keeps. The deterministic selector must
+        // see it, so that lane snapshots via the untruncated variant.
+        let mut nodes = Vec::new();
+        for id in 0..=MAX_ELEMENTS {
+            let backend = i64::try_from(id).map_err(std::io::Error::other)?;
+            nodes.push(node(Some("button"), Some("filler"), false, Some(backend))?);
+        }
+        nodes.push(node(
+            Some("menuitem"),
+            Some("Settings"),
+            false,
+            Some(9_999),
+        )?);
+        let capped = interactive_elements(&nodes);
+        assert_eq!(capped.len(), MAX_ELEMENTS);
+        assert!(!capped.iter().any(|element| element.name == "Settings"));
+        let full = interactive_elements_all(&nodes);
+        assert_eq!(full.len(), MAX_ELEMENTS + 2);
+        assert_eq!(full[MAX_ELEMENTS + 1].name, "Settings");
+        Ok(())
+    }
+
+    #[test]
     fn container_text_comes_from_the_parent_graph() -> Result<(), Box<dyn std::error::Error>> {
         // Two identical "Download" buttons in one card: the card name and the
         // adjacent text node tell them apart. No tags or classes involved —

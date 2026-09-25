@@ -50,6 +50,8 @@ Plural dispatch snapshots candidates, asks for batch approval, and checks approv
 
 A prompt naming the current site with an artifact noun to pursue on it ("open my profile on reddit") resolves through `dispatch_in_page_goal`. When the browser already shows the site, an already-on-origin fast path takes over the live portal (`route: already_on_origin (…) · ladder skipped`) with no routing; otherwise the prompt grounds the site itself through the cold-start lane — the artifact is pursued on the live page, never searched, and the site's own origin becomes the run portal.
 
+A direct-open the ladder cannot ground as a site ("open settings for me"), issued while a page is already live, is tried in-page on the live origin before search or the miss error (`in_page_goal_fallback: 'setting' on …`); an in-page miss falls through to the normal flow.
+
 Identity artifact nouns (`profile`, `account`) map via a closed noun table to `GoalClass::AccountHome`, journaled as `in_page_goal_class: account_home`; every other noun keeps the generic noun-hunt lane. The account-home lane is deliberately generic: no site names, no URL templates, no selectors, no usernames anywhere in it.
 
 1. **Memory.** The `identity_memory` table (origin, goal class, username, href, source) recalls a profile URL the live page revealed on an earlier run. Keys are www/case-normalized; recall journals `in_page_goal_memory: hit/miss/stale` and a stale row is deleted. A recalled href is Rust-validated (absolute https, non-root path, no embedded credentials, same-site host as the portal, username segment when one was recorded) and the live landing must still agree — a redirect to login or the homepage reads as stale and the worker runs.

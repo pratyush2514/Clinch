@@ -526,6 +526,15 @@ pub struct AppService {
     /// (`lend-<n>`) for runs whose `run_id` is `None` — pure direct opens
     /// are deliberately not remembered for save-as-workflow.
     next_lend_id: AtomicU64,
+    /// Monotonic counter backing journal run ids (`journal-<n>`), the same
+    /// idiom as `next_lend_id`: each dispatch gets a fresh one at entry so
+    /// a FAILED card's journal can be scoped to the run that failed.
+    next_journal_run: AtomicU64,
+    /// The current dispatch's journal run id. Stamped on every `record()`
+    /// line so `recent_journal` filters to this run only. `None` outside a
+    /// dispatch (boot, session sync) — those rows stay unscoped and never
+    /// leak into a FAILED card.
+    journal_run: Mutex<Option<String>>,
     /// Fenced structured-intent parser consulted only when the deterministic
     /// grammar parse is not confident, and only for slots — never for URLs,
     /// selectors, or code.
@@ -631,6 +640,8 @@ impl AppService {
             session_lends: Mutex::new(VecDeque::new()),
             next_playbook_run: AtomicU64::new(1),
             next_lend_id: AtomicU64::new(1),
+            next_journal_run: AtomicU64::new(1),
+            journal_run: Mutex::new(None),
             intent_parser: Arc::new(orchestration_engine::StubIntentParser),
         }
     }
@@ -916,29 +927,60 @@ impl AppService {
         Ok(restarted)
     }
 
+    /// Stamp a fresh journal run id for the dispatch starting now. Every
+    /// `record()` line from here on carries it, so `recent_journal` shows
+    /// only this run's lines — never earlier runs', restarts', or
+    /// out-of-band journaling. Session-lend ids use the same
+    /// counter-synthesis idiom (`lend-<n>`).
+    fn begin_journal_run(&self) -> Result<(), AppError> {
+        let id = format!(
+            "journal-{}",
+            self.next_journal_run.fetch_add(1, Ordering::Relaxed)
+        );
+        *self.journal_run.lock().map_err(|_| AppError::Internal)? = Some(id);
+        Ok(())
+    }
+
     async fn record(&self, outcome: &str) -> Result<(), AppError> {
-        sqlx::query("INSERT INTO session_events (outcome) VALUES (?)")
+        let run_id = self
+            .journal_run
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .clone();
+        sqlx::query("INSERT INTO session_events (outcome, run_id) VALUES (?, ?)")
             .bind(outcome)
+            .bind(run_id)
             .execute(self.database().await?)
             .await
             .map_err(|_| AppError::StorageUnavailable)?;
         Ok(())
     }
 
-    /// Oldest-first recent journal lines for a failed run's error payload.
-    /// The operation semaphore serializes dispatches, so the newest lines
-    /// belong to the run that just failed. Best-effort: a failed read
-    /// yields an empty journal, never a second error.
+    /// Oldest-first recent journal lines for a failed run's error payload,
+    /// scoped to the current dispatch's journal run id: `record()` stamps
+    /// the id at dispatch entry, so the card carries only the failed run's
+    /// lines. The old comment claimed the operation semaphore made the
+    /// unscoped newest-N read safe — false across restarts and consecutive
+    /// runs, which is exactly what leaked `startup_build` and earlier runs'
+    /// lines into FAILED cards. Best-effort: a failed read yields an empty
+    /// journal, never a second error.
     async fn recent_journal(&self, limit: usize) -> Vec<String> {
         let Ok(database) = self.database().await else {
             return Vec::new();
         };
-        let lines: Vec<String> =
-            sqlx::query_scalar("SELECT outcome FROM session_events ORDER BY rowid DESC LIMIT ?")
-                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-                .fetch_all(database)
-                .await
-                .unwrap_or_default();
+        let Ok(run_id) = self.journal_run.lock().map(|guard| guard.clone()) else {
+            return Vec::new();
+        };
+        // A `None` id binds NULL, which `= NULL` never matches: journaling
+        // outside a dispatch can never surface in a FAILED card.
+        let lines: Vec<String> = sqlx::query_scalar(
+            "SELECT outcome FROM session_events WHERE run_id = ? ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(run_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(database)
+        .await
+        .unwrap_or_default();
         lines.into_iter().rev().collect()
     }
 
@@ -1985,6 +2027,11 @@ impl AppService {
         prompt: String,
         emit: impl FnMut(PlaybookEvent) + Send,
     ) -> Result<DispatchOutcome, AppError> {
+        // Fresh journal run id first — before any journaling — so a FAILED
+        // card's `recent_journal` shows only this dispatch's lines. This is
+        // the single entry point for every dispatch lane (saved, single,
+        // batch, app command, ad-hoc auto-acquire).
+        self.begin_journal_run()?;
         if prompt.trim().is_empty() {
             return Err(AppError::InvalidInput(
                 "Describe what to run, for example 'download the monthly site report'.",
@@ -2177,6 +2224,22 @@ impl AppService {
         Some((portal, artifact))
     }
 
+    /// Live portal for the search-tier fallback: the current browser URL
+    /// with the path reset to the origin, recorded as the session origin
+    /// like `follow_up_in_page_goal` does so the run machinery's origin
+    /// check passes. `None` when no page is live, so the caller falls
+    /// through to the normal flow.
+    async fn live_portal(&self) -> Option<url::Url> {
+        let browser = self.browser(BrowserIntent::Background).await.ok()?;
+        let current = browser.current_url().await.ok()??;
+        let mut portal = current;
+        portal.set_path("/");
+        portal.set_query(None);
+        portal.set_fragment(None);
+        *self.session_origin.lock().ok()? = Some(portal.clone());
+        Some(portal)
+    }
+
     /// Already-on-origin follow-up: journal the skipped ladder, pursue the
     /// artifact noun in-page on the live portal, then settle. Extracted so
     /// `dispatch_adhoc_auto_acquire` stays within the line budget.
@@ -2293,6 +2356,32 @@ impl AppService {
         // still owes a follow-through click.
         let proposed = self.propose_entry_url(&prompt, &mut intent, None).await;
         let route_log = proposed.log.clone();
+        // Muse-style follow-up: the ladder could not ground this
+        // direct-open and a page is already live. Try the target noun
+        // in-page on the live origin before falling back to search or
+        // the miss error.
+        if let Some(noun) = Self::live_page_fallback_noun(&prompt, intent.is_plural, &proposed)
+            && let Some(portal) = self.live_portal().await
+        {
+            let _ = self
+                .record(&format!(
+                    "in_page_goal_fallback: '{noun}' on {} · trying live page before search",
+                    portal.host_str().unwrap_or("?")
+                ))
+                .await;
+            match self
+                .dispatch_in_page_goal(portal, prompt.clone(), noun, |_| {})
+                .await
+            {
+                Ok(mut outcome) => {
+                    self.settle_ephemeral_outcome(&mut outcome).await;
+                    return Ok(outcome);
+                }
+                // In-page miss: continue the normal flow.
+                Err(AppError::WorkflowFailed(_)) => {}
+                Err(other) => return Err(other),
+            }
+        }
         // Ask-and-learn: the ladder could not ground this direct open.
         // Fail here with guidance instead of the generic "not runnable"
         // or, worse, a scraped search page.
@@ -2750,6 +2839,34 @@ impl AppService {
     /// when the ladder ran and found nothing; `None` otherwise. When the
     /// grounder was never configured, the guidance says so — the fix is
     /// setup, not rephrasing the prompt.
+    /// Gate for the live-page fallback: only a high-confidence verb-led
+    /// direct-open whose target the ladder could NOT ground as a site —
+    /// search-tier proposals and full ladder misses — gets a chance at the
+    /// live page. Grounded prompts ("open claude for me") keep today's
+    /// behavior, low-confidence prompts ("what are the settings") and
+    /// plurals stay out.
+    fn live_page_fallback_noun(
+        prompt: &str,
+        is_plural: bool,
+        proposed: &ProposedEntry,
+    ) -> Option<String> {
+        if is_plural {
+            return None;
+        }
+        let grammar = orchestration_engine::parse_grammar(prompt, None);
+        if !orchestration_engine::is_direct_open(prompt, &grammar) {
+            return None;
+        }
+        if !(proposed.needs_search_follow() || proposed.direct_open_miss) {
+            return None;
+        }
+        let noun = grammar.target_noun?.trim().to_string();
+        if noun.is_empty() {
+            return None;
+        }
+        Some(noun)
+    }
+
     fn direct_open_miss_error(proposed: &ProposedEntry) -> Option<AppError> {
         if proposed.direct_open_miss {
             let message = if proposed.grounder_configured {
@@ -5804,6 +5921,59 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn live_page_fallback_noun_targets_the_ladder_miss() {
+        // Pure unit coverage for the live-page fallback gate: only a
+        // high-confidence direct-open whose target the ladder could NOT
+        // ground (search tier or full miss) is tried in-page on the live
+        // origin. Grounded prompts keep today's behavior; low-confidence
+        // prompts and plurals never take this path.
+        let search_tier = ProposedEntry {
+            source: Some(orchestration_engine::RouteSource::SearchFallback),
+            ..ProposedEntry::default()
+        };
+        assert_eq!(
+            AppService::live_page_fallback_noun("open settings for me", false, &search_tier),
+            Some("setting".to_string()),
+            "search-tier direct open tries the noun in-page"
+        );
+        let miss = ProposedEntry {
+            direct_open_miss: true,
+            ..ProposedEntry::default()
+        };
+        assert_eq!(
+            AppService::live_page_fallback_noun("open settings for me", false, &miss),
+            Some("setting".to_string()),
+            "full ladder miss tries the noun in-page"
+        );
+        let grounded = ProposedEntry {
+            source: Some(orchestration_engine::RouteSource::Shortcut),
+            ..ProposedEntry::default()
+        };
+        assert!(
+            AppService::live_page_fallback_noun("open claude for me", false, &grounded).is_none(),
+            "grounded direct open keeps the routing-ladder behavior"
+        );
+        assert!(
+            AppService::live_page_fallback_noun("open settings for me", false, &grounded).is_none(),
+            "grounded site-name prompt never falls back to the live page"
+        );
+        assert!(
+            AppService::live_page_fallback_noun("open settings for me", true, &search_tier)
+                .is_none(),
+            "plural prompts never take the fallback"
+        );
+        assert!(
+            AppService::live_page_fallback_noun(
+                "what are the settings for me",
+                false,
+                &search_tier
+            )
+            .is_none(),
+            "low-confidence prompt never takes the fallback"
+        );
+    }
+
     #[tokio::test]
     async fn ephemeral_dispatch_attaches_proposed_route_to_task_step()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6758,6 +6928,52 @@ pub(crate) mod tests {
         );
         assert_eq!(metrics.runs_by_status.get("completed"), Some(&1));
         pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_card_journal_is_scoped_to_the_failed_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A FAILED card's journal must contain only the failed run's lines:
+        // the boot `startup_build` line (journaled with no run id) and an
+        // earlier synthetic run's lines must not leak in.
+        let dir = tempfile::tempdir()?;
+        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
+        service.initialize().await.map_err(|_| "initialize")?;
+        service.begin_journal_run().map_err(|_| "begin run 1")?;
+        service
+            .record("run_one_line")
+            .await
+            .map_err(|_| "record run 1")?;
+        service.begin_journal_run().map_err(|_| "begin run 2")?;
+        service
+            .record("run_two_first")
+            .await
+            .map_err(|_| "record run 2a")?;
+        service
+            .record("run_two_second")
+            .await
+            .map_err(|_| "record run 2b")?;
+        let journal = service.recent_journal(16).await;
+        assert_eq!(
+            journal,
+            vec!["run_two_first".to_owned(), "run_two_second".to_owned()],
+            "only the current run's lines, oldest first, got {journal:?}"
+        );
+        // The store still holds everything (Session Activity is unscoped);
+        // only the failed-run payload is run-scoped.
+        let events = service.test_session_events().await.map_err(|_| "events")?;
+        assert_eq!(
+            events.len(),
+            4,
+            "boot + run 1 + run 2 lines, got {events:?}"
+        );
+        assert!(
+            events
+                .first()
+                .is_some_and(|line| line.starts_with("startup_build")),
+            "boot line is still journaled first, got {events:?}"
+        );
         Ok(())
     }
 
