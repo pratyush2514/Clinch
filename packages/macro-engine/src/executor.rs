@@ -1134,7 +1134,12 @@ async fn pursue_identity_chrome(
     let mut previously_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     for _ in 0..IDENTITY_MAX_CLICKS {
-        let (elements, _, _) = browser.ax_snapshot(origin).await;
+        // Full snapshot, not the navigator slice: a revealed menu renders
+        // at the end of the document (React portal), past the 300-element
+        // head truncation — the capped view reported "no new controls"
+        // for a menu that plainly opened. Before/after id sets share the
+        // same full-list semantics so "genuinely new" stays correct.
+        let (elements, check_before, _) = browser.ax_snapshot_untruncated(origin).await;
         let actionable_before = count_actionable(&elements);
         let currently_seen: std::collections::HashSet<i64> =
             elements.iter().map(|el| el.backend_node_id).collect();
@@ -1182,12 +1187,14 @@ async fn pursue_identity_chrome(
         click_element(browser, control).await?;
         clicked.push(tried_key);
         wait_for_menu(browser).await;
-        let (after, _, _) = browser.ax_snapshot(origin).await;
+        let (after, check_after, _) = browser.ax_snapshot_untruncated(origin).await;
         let actionable_after = count_actionable(&after);
         // Name what actually appeared: on the next miss the journal shows
         // whether the menu opened with unexpected roles, or at all. Node
         // ids churn on dynamic pages, so "new" here is informational —
-        // the retry exclusion above keys on stable identity, not ids.
+        // the retry exclusion above keys on stable identity, not ids. The
+        // raw AX node delta distinguishes "menu rendered past the old head
+        // truncation" from "the click changed nothing at all".
         let before_ids: std::collections::HashSet<i64> =
             elements.iter().map(|el| el.backend_node_id).collect();
         let new_nodes: Vec<String> = after
@@ -1196,10 +1203,18 @@ async fn pursue_identity_chrome(
             .take(6)
             .map(|el| format!("{} '{}'", el.role, el.name))
             .collect();
+        let raw_before = check_before.node_count;
+        let raw_after = check_after.node_count;
         let effect = if new_nodes.is_empty() {
-            format!("no new controls (actionable {actionable_before} → {actionable_after})")
+            format!(
+                "no new controls (actionable {actionable_before} → {actionable_after}; raw AX nodes {raw_before} → {raw_after})"
+            )
         } else {
-            format!("+{} new [{}]", new_nodes.len(), new_nodes.join(", "))
+            format!(
+                "+{} new [{}] (raw AX nodes {raw_before} → {raw_after})",
+                new_nodes.len(),
+                new_nodes.join(", ")
+            )
         };
         tried.push(format!("{role} '{name}' → {effect}"));
         previously_seen = currently_seen;

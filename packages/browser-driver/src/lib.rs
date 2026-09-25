@@ -11,13 +11,15 @@ mod session;
 mod som;
 pub mod test_utils;
 pub use a11y::{
-    AX_TARGET_RESYNC_LINE, AxElement, AxResyncCheck, interactive_elements, render_semantic_list,
+    AX_TARGET_RESYNC_LINE, AxElement, AxResyncCheck, interactive_elements,
+    interactive_elements_all, render_semantic_list,
 };
 pub use actions::{Action, ActionOutput, DownloadedFile, Highlight, SelectorIssue, WaitCondition};
 /// Raw accessibility node: the wire shape [`interactive_elements`] flattens.
 /// Re-exported so integration tests can parse scripted trees without
 /// reaching into the CDP bindings directly.
-pub use chromiumoxide::cdp::browser_protocol::accessibility::AxNode;
+pub use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, AxValueType};
+pub use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
 use chromiumoxide::{
     Browser, Page,
     cdp::browser_protocol::network::{

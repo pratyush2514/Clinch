@@ -101,6 +101,23 @@ fn truncate(text: &str, limit: usize) -> String {
 /// (unlocatable) are skipped.
 #[must_use]
 pub fn interactive_elements(nodes: &[AxNode]) -> Vec<AxElement> {
+    interactive_elements_inner(nodes, MAX_ELEMENTS)
+}
+
+/// Flatten a full AX tree into interactive elements without the
+/// [`MAX_ELEMENTS`] head truncation. The account-home worker's post-click
+/// re-snapshot uses this: a revealed menu typically renders at the end of
+/// the document (React portal), past the 300-element head the navigator
+/// slice keeps, so the truncated view reports "no new controls" for a
+/// menu that plainly opened (caught live on Reddit: `actionable 300 → 300`
+/// after opening the user menu). The model navigator keeps the truncated
+/// slice; only the worker's revealed-candidate search sees the full list.
+#[must_use]
+pub fn interactive_elements_all(nodes: &[AxNode]) -> Vec<AxElement> {
+    interactive_elements_inner(nodes, usize::MAX)
+}
+
+fn interactive_elements_inner(nodes: &[AxNode], limit: usize) -> Vec<AxElement> {
     use std::borrow::Borrow;
     use std::collections::HashMap;
     let index: HashMap<String, usize> = nodes
@@ -113,7 +130,7 @@ pub fn interactive_elements(nodes: &[AxNode]) -> Vec<AxElement> {
         .collect();
     let mut elements = Vec::new();
     for (position, node) in nodes.iter().enumerate() {
-        if elements.len() >= MAX_ELEMENTS || node.ignored {
+        if elements.len() >= limit || node.ignored {
             continue;
         }
         let Some(role) = ax_text(node.role.as_ref()) else {
@@ -478,6 +495,35 @@ impl ManagedBrowser {
     /// portal, and the error names the active anchor. Unsolicited drift
     /// fails closed here with no targeted retry.
     pub async fn ax_snapshot(&self, origin: &url::Url) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        let (nodes, check, resyncs) = self.ax_fetched_nodes(origin).await;
+        let mut elements = interactive_elements(&nodes);
+        self.enrich_empty_containers(&mut elements).await;
+        (elements, check, resyncs)
+    }
+
+    /// Post-click re-snapshot for the account-home worker: the full
+    /// interactive-element list without the [`MAX_ELEMENTS`] head
+    /// truncation. A revealed menu renders at the end of the document,
+    /// past the head the navigator slice keeps — the truncated view
+    /// cannot see it. Every other caller keeps the truncated slice.
+    pub async fn ax_snapshot_untruncated(
+        &self,
+        origin: &url::Url,
+    ) -> (Vec<AxElement>, AxResyncCheck, u64) {
+        let (nodes, check, resyncs) = self.ax_fetched_nodes(origin).await;
+        let mut elements = interactive_elements_all(&nodes);
+        self.enrich_empty_containers(&mut elements).await;
+        (elements, check, resyncs)
+    }
+
+    /// Raw AX node fetch behind [`ax_snapshot`] and
+    /// [`ax_snapshot_untruncated`]: drift guard, accessibility enablement,
+    /// and the targeted re-attach retry. Separated so both snapshot flavors
+    /// share one fetch policy.
+    async fn ax_fetched_nodes(
+        &self,
+        origin: &url::Url,
+    ) -> (Vec<crate::AxNode>, AxResyncCheck, u64) {
         let page_url = self.current_url().await.ok().flatten();
         let anchor = self.portal_anchor();
         let drifted = match &page_url {
@@ -502,9 +548,7 @@ impl ManagedBrowser {
             )
             .await
         };
-        let mut elements = interactive_elements(&nodes);
-        self.enrich_empty_containers(&mut elements).await;
-        (elements, check, resyncs)
+        (nodes, check, resyncs)
     }
 }
 
