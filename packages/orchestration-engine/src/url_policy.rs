@@ -1,9 +1,9 @@
 #![deny(unsafe_code)]
 //! Allowlist validation for machine-proposed navigation targets. Every
-//! resolver tier — account entities, the grounded search template, even a
-//! future LLM adapter — funnels through [`validate_proposed_url`], so a
-//! compromised directory response or an untrusted model can never yield a
-//! navigable URL outside the contract below.
+//! resolver tier — account entities, even a future LLM adapter — funnels
+//! through [`validate_proposed_url`], so a compromised directory response
+//! or an untrusted model can never yield a navigable URL outside the
+//! contract below.
 //!
 //! Scope note: this guards *proposed* URLs only. A Stage-2 destination is
 //! observed from a real click on a live search result, not proposed, so it
@@ -12,9 +12,9 @@
 use super::route_proposer::RouteSource;
 
 /// Hosts navigation may target. Exact matches only.
-/// `www.google.com` / `google.com` back the grounded search tier
-/// (`/search?q=…` template, never guessed TLDs); the entity tier resolves
-/// solely to portal hosts.
+/// `www.google.com` / `google.com` stay allowlisted for adapter-proposed
+/// URLs (validated as untrusted input); the entity tier resolves solely to
+/// portal hosts.
 const ALLOWED_HOSTS: &[&str] = &["github.com", "www.google.com", "google.com"];
 
 /// Why a proposed URL was rejected. Variants stay coarse on purpose: the
@@ -61,8 +61,8 @@ pub fn validate_proposed_url(url: &str) -> Result<url::Url, UrlRejected> {
 /// credentials — the same structural bar as [`validate_proposed_url`], but
 /// with no host allowlist.
 ///
-/// The allowlist guards *machine-proposed* URLs (entity tier, LLM tier,
-/// search template) against a compromised proposer inventing destinations.
+/// The allowlist guards *machine-proposed* URLs (entity tier, LLM tier)
+/// against a compromised proposer inventing destinations.
 /// Here the user is the authority for where they asked to go: refusing
 /// `https://amazon.in` because no tier predicted it would make direct opens
 /// impossible by construction. Approval gates still guard submits and
@@ -175,9 +175,10 @@ mod tests {
     }
 
     #[test]
-    fn url_policy_allows_grounded_search_but_rejects_its_abuse() {
-        // Tier 4 template host passes; credentials and non-https fail even
-        // on the search host, and lookalikes never pass.
+    fn url_policy_allows_google_hosts_but_rejects_their_abuse() {
+        // Google hosts stay allowlisted for adapter-proposed URLs;
+        // credentials and non-https fail even on those hosts, and
+        // lookalikes never pass.
         assert!(
             validate_proposed_url("https://www.google.com/search?q=open+amazon+for+me").is_ok()
         );
@@ -227,11 +228,11 @@ mod tests {
         ));
         // Machine-proposed tiers keep the allowlist.
         assert!(!entry_url_valid(
-            Some(RouteSource::SearchFallback),
+            Some(RouteSource::LlmFallback),
             "https://www.amazon.in/"
         ));
         assert!(entry_url_valid(
-            Some(RouteSource::SearchFallback),
+            Some(RouteSource::LlmFallback),
             "https://www.google.com/search?q=open+amazon"
         ));
         // The structural bar still applies to user-directed URLs.

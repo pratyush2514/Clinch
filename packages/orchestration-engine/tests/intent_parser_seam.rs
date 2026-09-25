@@ -6,8 +6,8 @@
 //! 1. Crisp commands never pay for a parser call.
 //! 2. Irregular phrasing that grammar misreads defers to the seam, and the
 //!    returned slots are what search-and-follow then grounds on.
-//! 2. A stalled or absent parser degrades to raw search inside the timeout
-//!    instead of hanging or failing the run.
+//! 2. A stalled or absent parser degrades to an honest miss inside the
+//!    timeout instead of hanging or failing the run.
 //! 4. A saved run turns its prompt into a tier-1 hit on the next invocation.
 
 use browser_driver::AxElement;
@@ -148,9 +148,10 @@ fn test_low_confidence_prompt_defers_to_parser() {
 }
 
 #[test]
-fn test_parser_timeout_degrades_to_raw_search() {
+fn test_parser_timeout_degrades_to_honest_miss() {
     // A wedged provider costs the timeout and nothing more. The run neither
-    // hangs nor fails: it lands on the raw search page.
+    // hangs nor fails: entry resolution degrades to an honest miss — there
+    // is no search page to land on anymore.
     let double = Arc::new(TestDoubleIntentParser::stalling(Duration::from_millis(
         PARSER_TIMEOUT_MS * 4,
     )));
@@ -164,16 +165,13 @@ fn test_parser_timeout_degrades_to_raw_search() {
         elapsed < Duration::from_millis(PARSER_TIMEOUT_MS * 3),
         "bounded wait, took {elapsed:?}"
     );
-    // Tier 2C: the raw search template still resolves, so navigation happens.
+    // Tier 2C: no entry URL is produced, so no navigation happens.
     let ctx = ctx_with(Some(&parser));
-    let Some(route) = orchestration_engine::resolve_entry_url(IRREGULAR, None, &ctx) else {
-        panic!("raw search still resolves");
-    };
     assert_eq!(
-        route.source,
-        orchestration_engine::RouteSource::SearchFallback
+        orchestration_engine::resolve_entry_url(IRREGULAR, None, &ctx),
+        None,
+        "degradation is a miss, not a search page"
     );
-    assert_eq!(route.url.host_str(), Some("www.google.com"));
     // Offline in the other sense — no parser configured at all, and the
     // shipped stub — behave identically. Degradation is the default, not an
     // error path.

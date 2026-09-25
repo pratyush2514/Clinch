@@ -412,7 +412,7 @@ mod tests {
         // ephemeral dispatch path: route proposal runs before any browser
         // attach, so even though no Chromium exists here
         // (`browser_unavailable`), `session_events` still carries the
-        // grounded search proposal step 1 would have navigated to.
+        // honest route miss the ladder journaled.
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "init")?;
@@ -447,19 +447,27 @@ mod tests {
             .err()
             .ok_or("expected browser_unavailable past proposal")?;
         assert_eq!(error["code"], "browser_unavailable");
-        // Proposal ran on the IPC path before the browser attach failed.
+        // Proposal ran on the IPC path before the browser attach failed:
+        // the ladder missed honestly — no destination invented, no search
+        // page proposed.
         let events = app
             .state::<AppService>()
             .test_session_events()
             .await
             .map_err(|_| "events")?;
         assert!(
-            events.iter().any(|outcome| outcome
-                == "route_fallback: search q='all invoices from github' · url=https://www.google.com/search?q=all+invoices+from+github"),
-            "grounded search proposal logged, got {events:?}"
+            events
+                .iter()
+                .any(|outcome| outcome.contains("route_resolution_miss")),
+            "honest route miss logged, got {events:?}"
         );
-        // No fabricated deep link reaches the journal: the destination is
-        // grounded by Stage 2 from a real click, never guessed here.
+        assert!(
+            !events
+                .iter()
+                .any(|outcome| outcome.starts_with("route_fallback:")),
+            "no search fallback proposed, got {events:?}"
+        );
+        // No fabricated deep link reaches the journal.
         assert!(
             !events
                 .iter()

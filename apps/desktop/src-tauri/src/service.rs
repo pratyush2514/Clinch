@@ -309,11 +309,10 @@ struct RunScope {
 }
 
 /// Outcome of one entry-route proposal: the exact journaled line (so the UI
-/// can render it without polling) plus which tier answered.
-///
-/// The tier matters because the search tier only reaches a results page.
-/// A `SearchFallback` entry still owes a Stage-2 follow before the intent
-/// can run against its real destination.
+/// can render it without polling) plus which tier answered. Every tier names
+/// a real destination now: the resolver never proposes a search page, so a
+/// proposal either grounds or misses honestly — there is no follow-up click
+/// owed to any tier.
 #[derive(Clone, Debug, Default)]
 struct ProposedEntry {
     log: Option<String>,
@@ -356,22 +355,6 @@ struct BatchPreamble {
     steps: Vec<playbook_store::Step>,
     route_log: Option<String>,
     shortcut_offer: Option<String>,
-}
-
-impl ProposedEntry {
-    /// Whether this proposal landed on a search page rather than the
-    /// destination, and therefore needs a follow-through click.
-    fn needs_search_follow(&self) -> bool {
-        self.source == Some(orchestration_engine::RouteSource::SearchFallback)
-    }
-}
-
-/// Where a Stage-2 follow landed: the origin-normalized run portal plus the
-/// journaled line naming the destination.
-#[derive(Clone, Debug)]
-struct FollowedDestination {
-    portal: url::Url,
-    log: String,
 }
 
 /// Which execution lane a resolved command takes. Plural ephemeral intents
@@ -670,44 +653,6 @@ impl AppService {
     }
 
     /// Swap the intent-parser seam. Builder-style so the field stays
-    /// immutable at runtime — a parser is chosen at construction, never
-    /// mid-session.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_intent_parser(
-        mut self,
-        parser: Arc<dyn orchestration_engine::IntentParser>,
-    ) -> Self {
-        self.intent_parser = parser;
-        self
-    }
-
-    /// Resolve the slots search-and-follow grounds on for `prompt`.
-    ///
-    /// Routes through the confidence gate: a crisp command is answered by
-    /// grammar alone (zero tokens), an irregular one gets one bounded parser
-    /// shot, and anything unanswered degrades to ungrounded slots plus raw
-    /// search. Shared by Stage 2 and its tests so both exercise the same
-    /// cascade.
-    ///
-    /// Tier-2B lane split: this parser only names Stage 2's *follow noun*
-    /// on an already-searching page — it never decides routing. Routing
-    /// belongs to the funnel's Tier 2B call site
-    /// (`execute_funnel_ask_parser`), which asks the same fenced parser for
-    /// a *site slot* on the aside-cleaned prompt.
-    fn follow_slots(&self, prompt: &str) -> orchestration_engine::ResolvedSlots {
-        let ctx = orchestration_engine::ResolutionContext {
-            account_dir: None,
-            llm: None,
-            parser: Some(&self.intent_parser),
-            shortcuts: None,
-            site_search: None,
-            domain_grounder: None,
-            region_hint: "",
-        };
-        orchestration_engine::resolve_slots(prompt, None, &ctx)
-    }
-
     async fn database(&self) -> Result<&sqlx::SqlitePool, AppError> {
         self.db
             .get_or_try_init(|| async {
@@ -2051,6 +1996,11 @@ impl AppService {
     /// and run it with the same approvals and streaming as stored playbooks.
     /// Plural prompts bypass saved single-step replays at resolution time,
     /// so they always land in the batch lane below instead of clicking once.
+    ///
+    /// Multi-action prompts ("log out me from the reddit and re-open the
+    /// reddit") split deterministically into verb-led segments and run
+    /// sequentially through the same single-prompt dispatch, sharing one
+    /// journal run so a FAILED card shows every segment's lines.
     pub async fn dispatch_natural_command(
         &self,
         prompt: String,
@@ -2059,7 +2009,9 @@ impl AppService {
         // Fresh journal run id first — before any journaling — so a FAILED
         // card's `recent_journal` shows only this dispatch's lines. This is
         // the single entry point for every dispatch lane (saved, single,
-        // batch, app command, ad-hoc auto-acquire).
+        // batch, app command, ad-hoc auto-acquire, compound): segments of
+        // one compound prompt share this run id, keeping their lines
+        // attributable to the single user prompt that produced them.
         self.begin_journal_run()?;
         if prompt.trim().is_empty() {
             return Err(AppError::InvalidInput(
@@ -2073,18 +2025,111 @@ impl AppService {
         if let Some(command) = orchestration_engine::resolve_app_command(&prompt) {
             return self.dispatch_app_command(command, emit).await;
         }
+        let mut emit = emit;
         let saved = self
             .playbooks()
             .await?
             .list_playbooks()
             .await
             .map_err(|_| AppError::StorageUnavailable)?;
+        // A saved replay of the FULL prompt wins over splitting: a taught
+        // compound workflow is more specific than any dispatch-time
+        // decomposition, and splitting a saved prompt would silently change
+        // what the user taught. Only a prompt no saved workflow claims is
+        // split into sequential segments. (An ephemeral match on the full
+        // prompt does not block the split — each segment re-resolves on its
+        // own inside `dispatch_one_prompt`.)
+        let full_prompt_saved = {
+            let connected = self
+                .session_origin
+                .lock()
+                .map_err(|_| AppError::Internal)?
+                .clone();
+            matches!(
+                orchestration_engine::resolve_command(&prompt, connected.as_ref(), &saved),
+                Some(orchestration_engine::CommandMatch::Saved { .. })
+            )
+        };
+        if !full_prompt_saved && let Some(segments) = orchestration_engine::split_compound(&prompt)
+        {
+            return self.dispatch_compound(&saved, segments, &mut emit).await;
+        }
+        self.dispatch_one_prompt(&saved, prompt, &mut emit).await
+    }
+
+    /// Run a multi-action prompt's segments sequentially through
+    /// [`Self::dispatch_one_prompt`]. Deterministic: the split itself comes
+    /// from the engine's [`orchestration_engine::split_compound`] — no LLM
+    /// step planning, no site names in this code.
+    ///
+    /// Stops at the first segment that errors or does not COMPLETE and
+    /// fails the run honestly with the run journal — a partial run never
+    /// reports COMPLETED. A segment that needs a portal with none connected
+    /// fails exactly like a lone prompt would
+    /// ([`AppError::SessionRequired`]), because it *is* dispatched as one.
+    async fn dispatch_compound(
+        &self,
+        saved: &[playbook_store::PlaybookSummary],
+        segments: Vec<String>,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
+        // `split_compound` promises at least two verb-led segments; an
+        // empty vec would be a contract break, not a user error.
+        if segments.is_empty() {
+            return Err(AppError::Internal);
+        }
+        let total = segments.len();
+        let _ = self.record(&format!("compound: {total} segments")).await;
+        // The full decomposition lands in the journal up front, so a FAILED
+        // card shows every segment even when segment 1 fails and the run
+        // stops there.
+        for (index, segment) in segments.iter().enumerate() {
+            let _ = self
+                .record(&format!(
+                    "compound_segment: {}/{} '{segment}'",
+                    index + 1,
+                    total
+                ))
+                .await;
+        }
+        let mut last: Option<DispatchOutcome> = None;
+        for segment in segments {
+            match self
+                .dispatch_one_prompt(saved, segment.clone(), &mut *emit)
+                .await
+            {
+                Err(error) => return Err(error),
+                Ok(outcome) => {
+                    if outcome.result.status != orchestration_engine::SequenceStatus::Completed {
+                        let journal = self.recent_journal(64).await;
+                        return Err(AppError::WorkflowFailed(journal));
+                    }
+                    last = Some(outcome);
+                }
+            }
+        }
+        // Every segment completed, so the run settles on the last segment's
+        // outcome — already settled by its own lane.
+        last.ok_or(AppError::Internal)
+    }
+
+    /// Dispatch one prompt down the saved/single/batch lanes (or the ad-hoc
+    /// auto-acquire lane with no portal connected). The live portal is
+    /// re-read here rather than threaded from the caller, so compound
+    /// segments after the first see whatever portal the previous segment
+    /// left behind.
+    async fn dispatch_one_prompt(
+        &self,
+        saved: &[playbook_store::PlaybookSummary],
+        prompt: String,
+        emit: &mut (impl FnMut(PlaybookEvent) + Send),
+    ) -> Result<DispatchOutcome, AppError> {
         let connected = self
             .session_origin
             .lock()
             .map_err(|_| AppError::Internal)?
             .clone();
-        match orchestration_engine::resolve_command(&prompt, connected.as_ref(), &saved) {
+        match orchestration_engine::resolve_command(&prompt, connected.as_ref(), saved) {
             Some(matched) => match dispatch_lane(&matched) {
                 DispatchLane::Saved => {
                     let orchestration_engine::CommandMatch::Saved { id } = matched else {
@@ -2121,12 +2166,13 @@ impl AppService {
             None if connected.is_none() => {
                 // Ad-hoc without a connected portal: resolve against a
                 // synthetic search origin so free-form prompts still yield an
-                // ephemeral intent, then auto-acquire the browser and run
-                // via the grounded search-fallback tier. The Portal URL
-                // field stays an optional override, never a prerequisite.
+                // ephemeral intent, then auto-acquire the browser and run.
+                // The Portal URL field stays an optional override, never a
+                // prerequisite. (The origin is a grammar-parse hint only —
+                // it is never navigated to.)
                 let fallback_origin = url::Url::parse("https://www.google.com/").ok();
                 let fallback_ref = fallback_origin.as_ref();
-                match orchestration_engine::resolve_command(&prompt, fallback_ref, &saved) {
+                match orchestration_engine::resolve_command(&prompt, fallback_ref, saved) {
                     Some(matched) => match dispatch_lane(&matched) {
                         DispatchLane::Saved => Err(AppError::SessionRequired),
                         DispatchLane::Single | DispatchLane::Batch => {
@@ -2195,37 +2241,23 @@ impl AppService {
 
     /// Ad-hoc dispatch without a prior portal connection: auto-acquire the
     /// browser (lazy launch), resolve the entry via the tiered resolver
-    /// (entity → LLM → direct-open ladder → grounded search fallback),
-    /// journal the target, `ensure_at_entry_url`, then `reanchor_portal`
-    /// before running. The derived entry origin becomes the run portal, so
-    /// the Portal URL input stays an optional override.
-    ///
-    /// Two-stage when the search tier answered: Stage 1 lands the results
-    /// page, Stage 2 follows the top matching result through to the real
-    /// destination, and only then does the intent execute. The run reports
-    /// success only if Stage 2 landed somewhere.
-    ///
-    /// Trust boundary: the Stage-1 entry is a *machine-proposed* URL and is
-    /// allowlist-validated below. The Stage-2 destination is not — it is
-    /// observed from a real click on a real link rendered by the search
-    /// engine, so there is no proposed host to validate. Confinement moves to
-    /// that observed origin rather than trusting a predicted one.
+    /// (entity → LLM → direct-open ladder), journal the target,
+    /// `ensure_at_entry_url`, then `reanchor_portal` before running. The
+    /// derived entry origin becomes the run portal, so the Portal URL input
+    /// stays an optional override. The resolver never proposes a search
+    /// page: an ungroundable prompt misses honestly instead of landing the
+    /// browser on a results page.
     /// Cold-start in-page goal for the ad-hoc lane: the prompt names a site
     /// and carries an artifact noun, and the resolver grounded the site
-    /// itself rather than a search page. Returns the artifact noun to
-    /// pursue on the live page. A search-fallback (or missing) proposal is
-    /// never an in-page goal — searching the web is not navigating a site.
-    /// Plural prompts are excluded by the caller: batching owns those.
+    /// itself. Returns the artifact noun to pursue on the live page. A
+    /// missing proposal is never an in-page goal — with no destination
+    /// there is nothing to pursue it on. Plural prompts are excluded by the
+    /// caller: batching owns those.
     fn cold_in_page_goal(
         prompt: &str,
         source: Option<orchestration_engine::RouteSource>,
     ) -> Option<String> {
-        if matches!(
-            source,
-            None | Some(orchestration_engine::RouteSource::SearchFallback)
-        ) {
-            return None;
-        }
+        source?;
         let grammar = orchestration_engine::parse_grammar(prompt, None);
         match (grammar.site_context, grammar.artifact_noun) {
             (Some(_), Some(artifact)) => Some(artifact),
@@ -2253,7 +2285,7 @@ impl AppService {
         Some((portal, artifact))
     }
 
-    /// Live portal for the search-tier fallback: the current browser URL
+    /// Live portal for the live-page fallback: the current browser URL
     /// with the path reset to the origin, recorded as the session origin
     /// like `follow_up_in_page_goal` does so the run machinery's origin
     /// check passes. `None` when no page is live, so the caller falls
@@ -2389,9 +2421,9 @@ impl AppService {
         portal: Option<url::Url>,
         emit: &mut (impl FnMut(PlaybookEvent) + Send),
     ) -> Result<DispatchOutcome, AppError> {
-        // Tier-2B lane split: the funnel's parser decides *routing* (the
-        // `AskParser` arm below); `follow_slots`' parser only names Stage
-        // 2's *follow noun* on an already-searching page and never routes.
+        // The funnel's parser decides *routing* (the `AskParser` arm
+        // below): it names a site slot on the aside-cleaned prompt, which
+        // re-enters the site-only ladder — never a search page.
         match plan.decision {
             orchestration_engine::FunnelDecision::Declined => Err(AppError::Internal),
             orchestration_engine::FunnelDecision::AlreadyOnOrigin { site, object } => {
@@ -2720,9 +2752,7 @@ impl AppService {
     /// Tier 2B, routing lane: the fenced parser gets one bounded shot at
     /// the aside-cleaned prompt — asides never reach it. Only a
     /// `site_context` slot routes; anything else is the honest miss, never
-    /// a search fallback. (The Stage-2 `follow_slots` parser is the other
-    /// Tier 2B call site: it names the follow noun on an already-searching
-    /// page and never decides routing.)
+    /// a search page.
     async fn execute_funnel_ask_parser(
         &self,
         prompt: String,
@@ -2899,21 +2929,19 @@ impl AppService {
         // Tiered resolution first so the destination is journaled even when
         // the browser cannot start (mirrors the connected lane ordering).
         // `propose_entry_url` validates every tier (https, no credentials,
-        // allowlisted host) and journals `route_fallback: search` for the
-        // grounded template. Its reported tier decides whether Stage 2 below
-        // still owes a follow-through click.
+        // allowlisted host); an ungroundable prompt journals a miss and the
+        // lane fails honestly below instead of navigating anywhere.
         let proposed = self.propose_entry_url(&prompt, &mut intent, None).await;
         let route_log = proposed.log.clone();
         // Muse-style follow-up: the ladder could not ground this
         // direct-open and a page is already live. Try the target noun
-        // in-page on the live origin before falling back to search or
-        // the miss error.
+        // in-page on the live origin before the miss error.
         if let Some(noun) = Self::live_page_fallback_noun(&prompt, intent.is_plural, &proposed)
             && let Some(portal) = self.live_portal().await
         {
             let _ = self
                 .record(&format!(
-                    "in_page_goal_fallback: '{noun}' on {} · trying live page before search",
+                    "in_page_goal_fallback: '{noun}' on {} · trying live page before the miss error",
                     portal.host_str().unwrap_or("?")
                 ))
                 .await;
@@ -2981,28 +3009,10 @@ impl AppService {
         portal.set_query(None);
         portal.set_fragment(None);
         *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
-        // Stage 2. A search-tier entry only reaches a results page, which is
-        // not the destination the prompt asked for. Land Stage 1, follow the
-        // top matching result through, and rebind the run to wherever the
-        // click actually went — before any intent executes. Navigation is
-        // only "complete" once this returns.
-        let mut follow_log = None;
-        if proposed.needs_search_follow() {
-            let browser = self.browser(BrowserIntent::Background).await?;
-            // Stage 1: land the search page (headless, no window).
-            Self::pre_navigate_to_entry(&browser, &intent).await?;
-            let followed = self
-                .follow_search_to_destination(&browser, &portal, &mut intent)
-                .await?;
-            portal = followed.portal;
-            follow_log = Some(followed.log);
-        }
         // Delegate to the connected lanes: they reuse the attached browser,
         // journal the target, `ensure_at_entry_url` via pre-navigation, and
         // `reanchor_portal` before snapshotting. Batch intents keep the batch
-        // lane so plural prompts never truncate to one click. After a Stage-2
-        // follow, `entry_url` already names the landed page, so
-        // pre-navigation is a no-op instead of a trip back to the results.
+        // lane so plural prompts never truncate to one click.
         // The first proposal line is preserved because the delegate sees
         // `entry_url` already set and returns `route_log: None`.
         let mut outcome = if intent.is_plural {
@@ -3022,14 +3032,6 @@ impl AppService {
         // it carries no hit — the offer fires exactly once, from here.
         let offer = self.offer_shortcut_after_landing(&proposed).await;
         outcome.telemetry_log = Self::with_shortcut_offer(offer, outcome.telemetry_log.take());
-        // The follow line rides the same channel as snapshot telemetry so
-        // Session Activity shows the destination it landed on.
-        if let Some(line) = follow_log {
-            outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
-                Some(existing) => format!("{line}\n{existing}"),
-                None => line,
-            });
-        }
         self.settle_ephemeral_outcome(&mut outcome).await;
         Ok(outcome)
     }
@@ -3185,134 +3187,6 @@ impl AppService {
         }
     }
 
-    /// Stage 2 of search-and-follow: from a settled search landing, click the
-    /// top result matching the prompt's destination, then rebind the run to
-    /// where the click actually landed.
-    ///
-    /// Rebinding covers all three pieces of run state that name a location:
-    /// the driver's portal anchor (so confinement evaluates the destination),
-    /// the session origin (so the shared run machinery's origin check passes),
-    /// and step 1's `entry_url` (set to the landed page, which makes the
-    /// delegate lane's pre-navigation a no-op rather than a trip back to the
-    /// results page). The destination is read from the live target, never
-    /// predicted from the prompt, so no TLD is ever guessed.
-    async fn follow_search_to_destination(
-        &self,
-        browser: &Arc<ManagedBrowser>,
-        search_origin: &url::Url,
-        intent: &mut macro_engine::SemanticIntent,
-    ) -> Result<FollowedDestination, AppError> {
-        // Which word Stage 2 follows comes from the prompt's own grammar,
-        // not a portal list. A prepositional complement names the destination
-        // (`… invoices from github` → `github`), so the results page is
-        // matched on the site while the artifact noun stays on the intent for
-        // the batch gate once the destination loads. Without a complement the
-        // direct object *is* the destination (`open amazon for me`), and the
-        // noun falls back to the settle probe text.
-        //
-        // Irregular phrasing that grammar cannot read confidently gets one
-        // bounded shot at the fenced parser seam first; an absent or stalled
-        // parser simply leaves the slots ungrounded and the follow falls back
-        // to probe text, which is the offline path.
-        let slots = self.follow_slots(&intent.raw_prompt);
-        let noun = macro_engine::search_follow_noun(intent, slots.grammar.site_context.as_deref())
-            .to_owned();
-        // Journaled so a wrong follow is attributable to the tier that chose
-        // the noun. Prompt-derived words only — no URLs, no page text.
-        let slot_log = self
-            .journal_line(format!(
-                "follow_slots: tier={} noun='{noun}'",
-                slots.source.as_str()
-            ))
-            .await;
-        let followed = match macro_engine::follow_search_result(browser, search_origin, &noun).await
-        {
-            Ok(followed) => followed,
-            Err(error) => {
-                // Journal the evidence (which links the page did offer)
-                // before failing, so a miss is diagnosable.
-                let _ = self.record(&format!("search_follow_failed: {error}")).await;
-                let journal = self.recent_journal(16).await;
-                return Err(AppError::WorkflowFailed(journal));
-            }
-        };
-        // Goal verification for direct-open intents: the navigation IS the
-        // task, so a follow that never left the search page is a miss, not
-        // a landing — without this a pure direct open "completes" its zero
-        // steps on the results page, claiming a goal it never achieved.
-        // `intent.entry_url` still names the search template the dispatcher
-        // itself navigated to (it is overwritten below); the shape check
-        // derives from that URL, so no search engine is hardcoded.
-        //
-        // The guard is wider than pure direct opens on purpose: a
-        // funnel-claimed prompt (open-verb-led, non-plural, with a site
-        // slot) is goal-shaped, and so is any prompt whose grammar names a
-        // destination noun — a follow that never left the results page is a
-        // miss for all of them. Legitimate follows land off the search
-        // host and never trip the shape check, so widening cannot weaken
-        // them.
-        let grammar = orchestration_engine::parse_grammar(&intent.raw_prompt, None);
-        let direct_open = orchestration_engine::is_direct_open(&intent.raw_prompt, &grammar);
-        let funnel_claimed = !intent.is_plural
-            && orchestration_engine::funnel_claims(&intent.raw_prompt)
-            && orchestration_engine::split_slots(&intent.raw_prompt)
-                .site_slot
-                .is_some();
-        let names_destination = grammar.target_noun.is_some();
-        if (direct_open || funnel_claimed || names_destination)
-            && let Some(entry) = intent
-                .entry_url
-                .as_deref()
-                .and_then(|entry| url::Url::parse(entry).ok())
-            && orchestration_engine::still_on_search_page(&entry, &followed.landed)
-        {
-            let _ = self
-                .record(&format!(
-                    "search_follow_miss: still on search page after follow · landed {}{}",
-                    followed.landed.host_str().unwrap_or("?"),
-                    followed.landed.path()
-                ))
-                .await;
-            return Err(AppError::InvalidInput(
-                "The search didn't lead to the destination — I never left the results page. Try the full domain (for example 'open amazon.in'), or save a site shortcut and try again.",
-            ));
-        }
-        let mut portal = followed.landed.clone();
-        portal.set_path("/");
-        portal.set_query(None);
-        portal.set_fragment(None);
-        // Confinement first: every later snapshot is evaluated against the
-        // destination origin, not the search host it came from.
-        let previous = browser.reanchor_portal(&followed.landed);
-        if let Some(current) = browser.portal_anchor()
-            && previous.as_ref() != Some(&current)
-        {
-            self.journal_line(browser_driver::portal_reanchored_line(
-                previous.as_ref(),
-                &current,
-            ))
-            .await;
-        }
-        *self.session_origin.lock().map_err(|_| AppError::Internal)? = Some(portal.clone());
-        intent.entry_url = Some(followed.landed.as_str().to_owned());
-        // Host plus path only: a destination URL can carry tokens in its
-        // query string, and this line is persisted.
-        let line = self
-            .journal_line(format!(
-                "search_followed: '{}' → {}{}",
-                followed.label,
-                followed.landed.host_str().unwrap_or("?"),
-                followed.landed.path()
-            ))
-            .await;
-        // Slot tier first, then what it landed on: Session Activity reads the
-        // follow as a decision plus its result.
-        Ok(FollowedDestination {
-            portal,
-            log: format!("{slot_log}\n{line}"),
-        })
-    }
-
     /// Run a stored playbook by row id with the shared run machinery.
     async fn dispatch_saved(
         &self,
@@ -3430,11 +3304,10 @@ impl AppService {
     /// grounder was never configured, the guidance says so — the fix is
     /// setup, not rephrasing the prompt.
     /// Gate for the live-page fallback: only a high-confidence verb-led
-    /// direct-open whose target the ladder could NOT ground as a site —
-    /// search-tier proposals and full ladder misses — gets a chance at the
-    /// live page. Grounded prompts ("open claude for me") keep today's
-    /// behavior, low-confidence prompts ("what are the settings") and
-    /// plurals stay out.
+    /// direct-open whose target the ladder could NOT ground as a site
+    /// gets a chance at the live page. Grounded prompts ("open claude for
+    /// me") keep today's behavior, low-confidence prompts ("what are the
+    /// settings") and plurals stay out.
     fn live_page_fallback_noun(
         prompt: &str,
         is_plural: bool,
@@ -3447,7 +3320,7 @@ impl AppService {
         if !orchestration_engine::is_direct_open(prompt, &grammar) {
             return None;
         }
-        if !(proposed.needs_search_follow() || proposed.direct_open_miss) {
+        if !proposed.direct_open_miss {
             return None;
         }
         let noun = grammar.target_noun?.trim().to_string();
@@ -3487,7 +3360,7 @@ impl AppService {
         // (`CLINCH_BRAVE_API_KEY`); anything the ladder cannot ground stays
         // a miss instead of a scraped search page. The intent parser is
         // deliberately absent here: it resolves *slots*, never URLs, so it
-        // belongs to `follow_slots` rather than this tier.
+        // is never consulted by this tier.
         //
         // This function never fails outward: a store or thread failure is
         // journaled and yields a neutral proposal, so dispatch falls back
@@ -3570,32 +3443,6 @@ impl AppService {
             &orchestration_engine::parse_grammar(prompt, connected_origin),
         );
         if let Some(route) = resolved {
-            // Grounded search fallback journals its own line (query string
-            // included) so Session Activity shows the template, never a
-            // guessed TLD. Dispatcher navigates to the search page and
-            // grounds the top result link from the live AX tree.
-            if route.source == orchestration_engine::RouteSource::SearchFallback {
-                // The decoded `q` value, not the raw query string: the line
-                // reads `q='amazon'`, never `q='q=amazon'`.
-                let query = route
-                    .url
-                    .query_pairs()
-                    .find(|(key, _)| key == "q")
-                    .map(|(_, value)| value.into_owned())
-                    .unwrap_or_default();
-                let line = format!(
-                    "route_fallback: search q='{query}' · url={}",
-                    route.url.as_str()
-                );
-                let _ = self.record(&line).await;
-                intent.entry_url = Some(route.url.as_str().to_owned());
-                return ProposedEntry {
-                    log: Some(line),
-                    source: Some(route.source),
-                    direct_open_miss: false,
-                    ..ProposedEntry::default()
-                };
-            }
             let line = format!(
                 "route_proposed:{}{} · source: {:?}{}{}",
                 route.url.host_str().unwrap_or("?"),
@@ -6631,17 +6478,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn propose_entry_grounds_search_with_no_static_route_table()
+    async fn propose_entry_misses_honestly_with_no_static_route_table()
     -> Result<(), Box<dyn std::error::Error>> {
         // No browser: the tiered proposer reads the shortcut store (empty
         // here) and otherwise resolves purely, journaling through `record`,
         // which fails open without observers.
         //
-        // With the curated `(portal, class)` table deleted, a portal-shaped
-        // prompt no longer resolves to an invented deep link. It advances to
-        // the fixed search template and owes a Stage-2 follow, which grounds
-        // the real destination from a live click. Proven destinations come
-        // from saved playbooks (tier 1) instead, resolved before dispatch.
+        // With the curated `(portal, class)` table deleted and the search
+        // tier removed, a portal-shaped prompt the ladder cannot ground is
+        // an honest miss: no deep link is invented, no search page is
+        // proposed, and the journal names the miss — not a follow-up click.
+        // Proven destinations come from saved playbooks (tier 1) instead,
+        // resolved before dispatch.
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "initialize")?;
@@ -6659,11 +6507,18 @@ pub(crate) mod tests {
         let proposed = service
             .propose_entry_url("download all my invoices from github", &mut intent, None)
             .await;
-        assert_eq!(
-            intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=all+invoices+from+github")
+        // The intent leaves no entry URL: there is no invented destination
+        // and no search template to follow.
+        assert_eq!(intent.entry_url, None, "no destination invented");
+        assert!(proposed.source.is_none(), "no tier answered");
+        assert!(
+            proposed
+                .log
+                .as_deref()
+                .is_some_and(|line| line.contains("route_resolution_miss")),
+            "miss journaled, got {:?}",
+            proposed.log
         );
-        assert!(proposed.needs_search_follow());
         // No deep link is ever fabricated for the portal named in the prompt.
         assert!(
             !intent
@@ -6681,22 +6536,19 @@ pub(crate) mod tests {
         let proposed = service
             .propose_entry_url("find the dashboard", &mut other, None)
             .await;
-        // Filler (`the`) and action verbs (`find`) are stripped from the
-        // query by sanitization.
-        assert_eq!(
-            other.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=dashboard")
-        );
-        // A search entry still owes a Stage-2 follow before it can run.
-        assert!(proposed.needs_search_follow());
+        // A missing destination is a miss, never a search template.
+        assert_eq!(other.entry_url, None, "no destination invented");
+        assert!(proposed.source.is_none(), "no tier answered");
         assert!(
             proposed
                 .log
                 .as_deref()
-                .is_some_and(|line| line.starts_with("route_fallback: search"))
+                .is_some_and(|line| line.contains("route_resolution_miss")),
+            "miss journaled, got {:?}",
+            proposed.log
         );
         // An entry already present (a saved playbook's own route) proposes
-        // nothing and is never overwritten by a search template.
+        // nothing and is never overwritten.
         let mut preset = intent.clone();
         preset.entry_url = Some("https://github.com/account/billing/history".into());
         let proposed = service
@@ -6707,7 +6559,6 @@ pub(crate) mod tests {
             Some("https://github.com/account/billing/history")
         );
         assert!(proposed.log.is_none());
-        assert!(!proposed.needs_search_follow());
         Ok(())
     }
 
@@ -6732,7 +6583,7 @@ pub(crate) mod tests {
         let proposed = service.propose_entry_url(prompt, &mut intent, None).await;
         assert!(proposed.direct_open_miss, "ladder miss flagged");
         assert_eq!(intent.entry_url, None, "no destination invented");
-        assert!(!proposed.needs_search_follow(), "not a search page");
+        assert!(proposed.source.is_none(), "no tier answered");
         assert!(
             proposed
                 .log
@@ -6831,18 +6682,9 @@ pub(crate) mod tests {
     fn live_page_fallback_noun_targets_the_ladder_miss() {
         // Pure unit coverage for the live-page fallback gate: only a
         // high-confidence direct-open whose target the ladder could NOT
-        // ground (search tier or full miss) is tried in-page on the live
-        // origin. Grounded prompts keep today's behavior; low-confidence
-        // prompts and plurals never take this path.
-        let search_tier = ProposedEntry {
-            source: Some(orchestration_engine::RouteSource::SearchFallback),
-            ..ProposedEntry::default()
-        };
-        assert_eq!(
-            AppService::live_page_fallback_noun("open settings for me", false, &search_tier),
-            Some("setting".to_string()),
-            "search-tier direct open tries the noun in-page"
-        );
+        // ground (a full miss) is tried in-page on the live origin.
+        // Grounded prompts keep today's behavior; low-confidence prompts
+        // and plurals never take this path.
         let miss = ProposedEntry {
             direct_open_miss: true,
             ..ProposedEntry::default()
@@ -6865,17 +6707,12 @@ pub(crate) mod tests {
             "grounded site-name prompt never falls back to the live page"
         );
         assert!(
-            AppService::live_page_fallback_noun("open settings for me", true, &search_tier)
-                .is_none(),
+            AppService::live_page_fallback_noun("open settings for me", true, &miss).is_none(),
             "plural prompts never take the fallback"
         );
         assert!(
-            AppService::live_page_fallback_noun(
-                "what are the settings for me",
-                false,
-                &search_tier
-            )
-            .is_none(),
+            AppService::live_page_fallback_noun("what are the settings for me", false, &miss)
+                .is_none(),
             "low-confidence prompt never takes the fallback"
         );
     }
@@ -6909,12 +6746,10 @@ pub(crate) mod tests {
         service
             .propose_entry_url(prompt, &mut intent, Some(&portal))
             .await;
-        // Explicit propagation: the proposed route lands on both the intent
-        // and step 1 of the ephemeral task. With no static route table the
-        // proposal is the grounded search template; Stage 2 rewrites
-        // `entry_url` to the landed destination before the batch runs.
-        let expected = "https://www.google.com/search?q=all+invoices+from+github";
-        assert_eq!(intent.entry_url.as_deref(), Some(expected));
+        // Unresolved proposals attach nothing: with no search tier the
+        // intent carries no entry URL, and step 1 stays destination-free
+        // instead of inheriting an invented search page.
+        assert_eq!(intent.entry_url, None, "no destination invented");
         let steps = [playbook_store::Step::Semantic {
             intent: intent.clone(),
         }];
@@ -6924,14 +6759,8 @@ pub(crate) mod tests {
         else {
             panic!("step 1 is semantic");
         };
-        assert_eq!(step_intent.entry_url.as_deref(), Some(expected));
-        // Pre-navigation triggers from a foreign tab: step 1 differs from
-        // `google.com`, so `ensure_at_entry_url` would issue CDP navigation
-        // before the first `ax_snapshot`.
-        let current = url::Url::parse("https://google.com")?;
-        let entry = url::Url::parse(step_intent.entry_url.as_deref().ok_or("entry")?)?;
-        assert!(macro_engine::entry_url_mismatched(&current, &entry));
-        // Session Activity carries the proposal.
+        assert_eq!(step_intent.entry_url, None, "step 1 carries no route");
+        // Session Activity carries the honest miss, never a search line.
         let pool = service.database().await.map_err(|_| "database")?;
         let rows: Vec<(String,)> = sqlx::query_as("SELECT outcome FROM session_events")
             .fetch_all(pool)
@@ -6939,8 +6768,14 @@ pub(crate) mod tests {
             .map_err(|_| "events")?;
         assert!(
             rows.iter()
-                .any(|(outcome,)| outcome.starts_with("route_fallback: search")),
-            "route_fallback logged, got {rows:?}"
+                .any(|(outcome,)| outcome.contains("route_resolution_miss")),
+            "miss journaled, got {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(outcome,)| outcome.starts_with("route_fallback:")),
+            "no search fallback journaled, got {rows:?}"
         );
         Ok(())
     }
@@ -6975,15 +6810,13 @@ pub(crate) mod tests {
         service
             .propose_entry_url(prompt, &mut intent, Some(&portal))
             .await;
-        // Ad-hoc prompts resolve through grounded search now that no static
-        // route table exists; Stage 2 replaces this with the landed
-        // destination at run time. Grammar slots survive persistence: the
-        // artifact noun anchors the batch, the `github` complement was the
-        // destination cue and is not the batch anchor.
-        assert_eq!(
-            intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=all+invoices+from+github")
-        );
+        // With no static route table and no search tier, the ladder misses
+        // and the saved intent carries no destination — an ungrounded prompt
+        // persists honestly instead of persisting a search template. Grammar
+        // slots survive persistence: the artifact noun anchors the batch,
+        // the `github` complement was the destination cue and is not the
+        // batch anchor.
+        assert_eq!(intent.entry_url, None, "no destination invented");
         assert!(intent.is_plural);
         assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
         // Terminal completion records the exact executed graph, as the batch
@@ -7022,119 +6855,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_fallback_auto_clicks_first_result()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use browser_driver::test_utils::fake_cdp::{
-            FakeCdpClient, FakeCdpServer, ScriptStep, search_results_tree,
-        };
-        use std::time::Duration;
-        // End-to-end Stage 1 → Stage 2 over scripted CDP traffic, with no
-        // Chromium binary: search landing → candidate link selection →
-        // re-anchored destination navigation.
-        let dir = tempfile::tempdir()?;
-        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
-        service.initialize().await.map_err(|_| "initialize")?;
-
-        // Stage 1: the prompt resolves to the search template, not a guessed
-        // TLD, and reports that a follow is still owed. ("find amazon", not
-        // "open amazon for me": a bare direct open is a ladder miss now —
-        // see `direct_open_miss_is_guidance_not_search` — so the
-        // search-and-follow path is exercised with a non-direct prompt.)
-        let prompt = "find amazon";
-        let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
-            orchestration_engine::resolve_command(
-                prompt,
-                url::Url::parse("https://www.google.com/").ok().as_ref(),
-                &[],
-            )
-        else {
-            panic!("ad-hoc prompt resolves ephemeral");
-        };
-        let proposed = service.propose_entry_url(prompt, &mut intent, None).await;
-        assert!(proposed.needs_search_follow(), "search tier answered");
-        let search_entry = intent.entry_url.clone().ok_or("search entry")?;
-        assert_eq!(
-            search_entry, "https://www.google.com/search?q=amazon",
-            "sanitized query, fixed host"
-        );
-        for guess in ["amazon.com", "amazon.in"] {
-            assert!(!search_entry.contains(guess), "no TLD guessing: {guess}");
-        }
-
-        // Stage 2 selection, over the real AX tree the results page returns.
-        let fake = FakeCdpServer::start(vec![ScriptStep::reply(
-            "Accessibility.getFullAXTree",
-            search_results_tree(),
-        )])
-        .await
-        .map_err(|error| format!("fake server failed to start: {error}"))?;
-        // Stage 2's noun comes from the same cascade the live lane uses. This
-        // prompt is a crisp direct action, so grammar answers it on the fast
-        // path and the parser seam is never consulted.
-        let slots = service.follow_slots(&intent.raw_prompt);
-        assert_eq!(
-            slots.source,
-            orchestration_engine::SlotSource::GrammarFastPath
-        );
-        let noun = macro_engine::search_follow_noun(&intent, slots.grammar.site_context.as_deref())
-            .to_owned();
-        assert_eq!(noun, "amazon", "target noun drives the follow");
-        let run = async {
-            let mut client = FakeCdpClient::connect(fake.url()).await?;
-            let tree = client
-                .call("Accessibility.getFullAXTree", serde_json::json!({}))
-                .await?;
-            let nodes: Vec<browser_driver::AxNode> =
-                serde_json::from_value(tree.get("nodes").cloned().unwrap_or_default())
-                    .map_err(|error| format!("bad tree: {error}"))?;
-            let elements = browser_driver::interactive_elements(&nodes);
-            let picked = macro_engine::select_search_result(&elements, &noun)
-                .ok_or("a result must be selected")?;
-            // The engine's own nav links come first in document order and
-            // also say "Amazon": the landmark gate must skip them.
-            assert_eq!(picked.name, "Amazon.in - Online Shopping");
-            assert_eq!(picked.backend_node_id, 2);
-            assert!(picked.landmark.is_none(), "never page chrome");
-            // The non-matching competitor ahead of it is skipped by the noun
-            // gate, so this is not merely "first organic link".
-            assert!(
-                elements
-                    .iter()
-                    .any(|element| element.name == "Flipkart Online Shopping"),
-                "competitor present but not chosen"
-            );
-            // An absent noun fails closed instead of clicking something.
-            assert!(macro_engine::select_search_result(&elements, "nonexistentbrand").is_none());
-            assert!(macro_engine::select_search_result(&elements, "").is_none());
-            assert_eq!(fake.received_methods(), vec!["Accessibility.getFullAXTree"]);
-            assert!(fake.violations().is_empty());
-            client.close().await;
-            Ok::<_, Box<dyn std::error::Error>>(())
-        };
-        let outcome = tokio::time::timeout(Duration::from_secs(10), run).await;
-        fake.shutdown();
-        outcome.map_err(|_| "fake CDP roundtrip timed out")??;
-
-        // Stage 2 landing: confinement re-anchors to the observed
-        // destination, so the destination page is no longer "drift" even
-        // though the run was requested against the search origin.
-        let search_origin = url::Url::parse("https://www.google.com/")?;
-        let landed = url::Url::parse("https://www.amazon.in/ref=nav_logo")?;
-        assert!(
-            browser_driver::portal_reanchored_line(Some(&search_origin), &landed)
-                .starts_with("portal_reanchored: https://www.google.com/ → "),
-            "transition journaled"
-        );
-        // The run portal becomes the landed origin, query/fragment stripped.
-        let mut portal = landed.clone();
-        portal.set_path("/");
-        portal.set_query(None);
-        portal.set_fragment(None);
-        assert_eq!(portal.as_str(), "https://www.amazon.in/");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_persist_ephemeral_run_to_playbook_and_replay()
     -> Result<(), Box<dyn std::error::Error>> {
         use browser_driver::test_utils::fake_cdp::{FakeCdpClient, FakeCdpServer, ScriptStep};
@@ -7150,10 +6870,7 @@ pub(crate) mod tests {
             .await
             .map_err(|_| "load")?;
         assert_eq!(playbook.origin, portal);
-        assert_eq!(
-            saved.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=all+invoices+from+github")
-        );
+        assert_eq!(saved.entry_url, None, "no destination invented");
         assert!(saved.is_plural);
         assert_eq!(saved.primary_target_noun.as_deref(), Some("invoice"));
         let listed = service
@@ -7302,45 +7019,6 @@ pub(crate) mod tests {
                 .await,
             Err(AppError::InvalidInput(_))
         ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn intent_parser_seam_is_wired_but_declines_by_default()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Shipped posture: the seam exists and is consulted, but the default
-        // adapter declines, so no model is required, no key is needed, and no
-        // prompt leaves the machine. Low-confidence prompts degrade to raw
-        // search rather than failing.
-        let dir = tempfile::tempdir()?;
-        let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
-        let irregular = "pull up what I owe on aws";
-        let slots = service.follow_slots(irregular);
-        assert_eq!(
-            slots.source,
-            orchestration_engine::SlotSource::Ungrounded,
-            "the stub declines, so slots stay ungrounded"
-        );
-        // Crisp prompts never reach the seam at all.
-        assert_eq!(
-            service.follow_slots("download invoices from github").source,
-            orchestration_engine::SlotSource::GrammarFastPath
-        );
-        // Swapping in an adapter is the only change needed to light up tier
-        // 2B — the plumbing above it is already live.
-        let double = std::sync::Arc::new(orchestration_engine::TestDoubleIntentParser::answering(
-            orchestration_engine::ParsedSlots {
-                action: "link".into(),
-                artifact_noun: Some("bill".into()),
-                site_context: Some("aws".into()),
-            },
-        ));
-        let wired = AppService::new(dir.path().to_owned(), dir.path().to_owned())
-            .with_intent_parser(double.clone());
-        let slots = wired.follow_slots(irregular);
-        assert_eq!(slots.source, orchestration_engine::SlotSource::IntentParser);
-        assert_eq!(slots.grammar.site_context.as_deref(), Some("aws"));
-        assert_eq!(double.calls(), 1);
         Ok(())
     }
 
@@ -7603,43 +7281,48 @@ pub(crate) mod tests {
             service.dispatch_natural_command("   ".into(), |_| {}).await,
             Err(AppError::InvalidInput(_))
         ));
-        // No connected portal: ad-hoc prompts auto-acquire the browser via
-        // the grounded search fallback instead of dying as a miss. With no
-        // Chromium present the launch fails closed, but the fallback is
-        // already journaled and the session points at the search origin.
+        // No connected portal: an ungroundable non-direct prompt fails
+        // honestly instead of being routed to a search page. With no
+        // Chromium present the lane would fail even earlier, but the
+        // browser is never reached — the proposal misses before any
+        // auto-acquire attempt, and the session origin stays unset.
         let _chromium = ChromiumEnvGuard::hold_bogus();
         assert!(matches!(
             service
                 .dispatch_natural_command("download my report".into(), |_| {})
                 .await,
-            Err(AppError::BrowserUnavailable)
+            Err(AppError::InvalidInput(_))
         ));
         let events = service.test_session_events().await.map_err(|_| "events")?;
         assert!(
             events
                 .iter()
-                .any(|outcome| outcome.starts_with("route_fallback: search")),
-            "route_fallback logged, got {events:?}"
+                .any(|outcome| outcome.contains("route_resolution_miss")),
+            "honest miss journaled, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|outcome| outcome.starts_with("route_fallback:")),
+            "no search fallback journaled, got {events:?}"
         );
         let connected = service
             .session_origin
             .lock()
             .map_err(|_| "session")?
             .clone();
-        assert_eq!(
-            connected.as_ref().and_then(|url| url.host_str()),
-            Some("www.google.com")
-        );
+        assert!(connected.is_none(), "no portal invented");
         Ok(())
     }
 
     #[tokio::test]
-    async fn adhoc_search_fallback_never_guesses_tlds() -> Result<(), Box<dyn std::error::Error>> {
-        // Hermetic proof: unknown prompts advance to the fixed search
-        // template without inventing amazon.com / amazon.in. No browser
-        // needed — pure tiered resolution plus journaling. ("find amazon",
-        // not "open amazon for me": a bare direct open is a ladder miss —
-        // see `direct_open_miss_is_guidance_not_search`.)
+    async fn adhoc_proposal_never_invents_a_destination() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Hermetic proof: unknown prompts are an honest miss — no invented
+        // amazon.com / amazon.in and no search template. No browser needed —
+        // pure tiered resolution plus journaling. ("find amazon", not "open
+        // amazon for me": a bare direct open is a ladder miss — see
+        // `direct_open_miss_is_guidance_not_search`.)
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "initialize")?;
@@ -7657,20 +7340,14 @@ pub(crate) mod tests {
         let proposed = service
             .propose_entry_url("find amazon", &mut intent, None)
             .await;
-        // Sanitized query with no guessed amazon TLD.
-        assert_eq!(
-            intent.entry_url.as_deref(),
-            Some("https://www.google.com/search?q=amazon")
-        );
-        assert!(proposed.needs_search_follow());
+        // No destination attached: neither a guessed TLD nor a search page.
+        assert_eq!(intent.entry_url, None, "no destination invented");
+        assert!(proposed.source.is_none(), "no tier answered");
         let line = proposed.log.ok_or("route line")?;
-        assert!(line.starts_with("route_fallback: search"), "got {line:?}");
-        // The decoded query reads cleanly — never a doubled `q=q=`.
         assert!(
-            line.contains("q='amazon'"),
-            "decoded query journaled, got {line:?}"
+            line.contains("route_resolution_miss"),
+            "honest miss journaled, got {line:?}"
         );
-        assert!(!line.contains("q='q="), "no doubled prefix, got {line:?}");
         assert!(
             !intent
                 .entry_url
@@ -7689,74 +7366,49 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn adhoc_dispatch_auto_acquires_navigates_and_reanchors()
+    async fn adhoc_dispatch_fails_honestly_when_ungrounded()
     -> Result<(), Box<dyn std::error::Error>> {
         // Hermetic ad-hoc proof without a real Chromium binary:
-        // - `dispatch_natural_command` with no session auto-acquires (lazy
-        //   launch attempted → `BrowserUnavailable` with bogus executable),
-        // - the grounded search entry is journaled (`route_fallback`),
-        // - the session re-anchors to the new origin (`portal_reanchored`
-        //   journaled via the same `journal_line` + `reanchor_portal` path
-        //   the live lane uses after `ensure_at_entry_url`).
-        // CDP navigation itself needs a real browser (covered by the
-        // Chromium-gated fixtures); here we prove the dispatch wiring that
-        // precedes and follows it.
+        // - `dispatch_natural_command` with no session never launches the
+        //   browser for an ungroundable prompt — the proposal misses before
+        //   any auto-acquire attempt,
+        // - the run fails with the honest "not runnable" input error, never
+        //   by navigating a search page and calling it complete,
+        // - the session is never anchored to an invented origin.
+        // ("find amazon", not "open amazon for me": a bare direct open
+        // stops earlier as a direct-open miss — see
+        // `direct_open_miss_is_guidance_not_search`.)
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "initialize")?;
         let _chromium = ChromiumEnvGuard::hold_bogus();
-        // A non-direct prompt exercises the search-fallback dispatch wiring;
-        // "open amazon for me" would stop earlier as a direct-open miss.
         assert!(matches!(
             service
                 .dispatch_natural_command("find amazon".into(), |_| {})
                 .await,
-            Err(AppError::BrowserUnavailable)
+            Err(AppError::InvalidInput(_))
         ));
         let events = service.test_session_events().await.map_err(|_| "events")?;
         assert!(
-            events.iter().any(|outcome| outcome
-                == "route_fallback: search q='amazon' · url=https://www.google.com/search?q=amazon"),
-            "sanitized search fallback journaled, got {events:?}"
-        );
-        // Stage 2 never ran here (the browser could not launch), so no
-        // destination was claimed: the run failed instead of reporting the
-        // search page as the completed navigation.
-        assert!(
-            !events
+            events
                 .iter()
-                .any(|outcome| outcome.starts_with("search_followed:")),
-            "no destination claimed without a browser, got {events:?}"
+                .any(|outcome| outcome.contains("route_resolution_miss")),
+            "honest miss journaled, got {events:?}"
         );
-        // Session auto-anchored to the search origin (Portal URL was never
-        // required).
+        // No search navigation was ever attempted, so no destination was
+        // claimed and nothing re-anchored the session.
+        for prefix in ["route_fallback:", "search_followed:", "portal_reanchored:"] {
+            assert!(
+                !events.iter().any(|outcome| outcome.starts_with(prefix)),
+                "no {prefix} without a destination, got {events:?}"
+            );
+        }
         let connected = service
             .session_origin
             .lock()
             .map_err(|_| "session")?
             .clone();
-        let connected = connected.ok_or("session auto-set")?;
-        assert_eq!(connected.host_str(), Some("www.google.com"));
-        // Re-anchor emission uses the driver helper every dynamic
-        // navigation runs: journal one transition and prove it lands.
-        let previous: Option<url::Url> = None;
-        let line = service
-            .journal_line(browser_driver::portal_reanchored_line(
-                previous.as_ref(),
-                &connected,
-            ))
-            .await;
-        assert!(
-            line.starts_with("portal_reanchored: none → "),
-            "got {line:?}"
-        );
-        let events = service.test_session_events().await.map_err(|_| "events")?;
-        assert!(
-            events
-                .iter()
-                .any(|outcome| outcome.starts_with("portal_reanchored:")),
-            "portal_reanchored emitted, got {events:?}"
-        );
+        assert!(connected.is_none(), "no portal invented");
         Ok(())
     }
 
@@ -7929,9 +7581,10 @@ pub(crate) mod tests {
     async fn proposal_alone_never_journals_shortcut_offer() -> Result<(), Box<dyn std::error::Error>>
     {
         // Regression guard for the old behavior (the suggestion was
-        // journaled at proposal time): running the ladder alone — search
-        // fallback and direct-open miss — must never produce the offer line.
-        // Only a post-landing call to `offer_shortcut_after_landing` may.
+        // journaled at proposal time): running the ladder alone — an
+        // honest miss and a direct-open miss — must never produce the offer
+        // line. Only a post-landing call to `offer_shortcut_after_landing`
+        // may.
         let dir = tempfile::tempdir()?;
         let service = AppService::new(dir.path().to_owned(), dir.path().to_owned());
         service.initialize().await.map_err(|_| "initialize")?;
@@ -7949,7 +7602,7 @@ pub(crate) mod tests {
         let proposed = service
             .propose_entry_url("find amazon", &mut intent, None)
             .await;
-        assert!(proposed.needs_search_follow(), "search fallback proposed");
+        assert!(proposed.source.is_none(), "honest miss, no tier answered");
         let origin = url::Url::parse("https://www.google.com/").ok();
         let Some(orchestration_engine::CommandMatch::Ephemeral { mut intent }) =
             orchestration_engine::resolve_command("open amazon for me", origin.as_ref(), &[])

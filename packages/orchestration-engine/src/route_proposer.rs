@@ -21,20 +21,20 @@
 //!    site directory (Brave Search API when keyed, keyless `DuckDuckGo`
 //!    otherwise), then a fenced domain grounder (site slot + region hint →
 //!    bare domain, validated in Rust). An ungrounded direct open is a miss
-//!    the UI can act on — it never falls through to the search template,
-//!    because a guessed SERP click is worse than asking. In-page goals
-//!    (site + artifact noun) ground only the site through the same ladder
-//!    and may fall through to tier 6 when no rung knows it.
-//! 6. Grounded search-and-follow — fixed `https://www.google.com/search?q=…`
-//!    template over the raw prompt. Never guesses TLDs; the dispatcher
-//!    navigates to the search page and grounds the destination host from a
-//!    real click on the live AX tree. Only for prompts that are not
-//!    direct opens.
+//!    the UI can act on — it never falls through to a search page, because
+//!    a guessed SERP click is worse than asking. In-page goals (site +
+//!    artifact noun) ground only the site through the same ladder and may
+//!    fall through to tier 6 when no rung knows it.
+//! 6. Site-ladder retry — the grammar's site slots (`site_context`, then
+//!    `target_noun`) through the same site-only ladder, for prompts no
+//!    earlier tier grounded. First hit wins; a total miss is an honest
+//!    miss. The engine never navigates to a visible search page: no search
+//!    template, no guessed TLDs, no SERP scraping.
 //!
 //! There is deliberately no static route table between them: a curated
 //! `(portal, class) → URL` list needed a portal whitelist to stay
 //! meaningful, and both of its jobs are now covered — proven routes by
-//! tier 1, unknown ones by tiers 2, 5, and 6.
+//! tier 1, unknown ones by tiers 2 and 5.
 //!
 //! Validation follows provenance, not tier order. User-directed targets —
 //! the typed domain (tier 2), saved shortcuts, and the site-directory and
@@ -42,22 +42,21 @@
 //! only resolved the name — face structural validation only (absolute
 //! `https`, no credentials, parseable):
 //! [`crate::url_policy::validate_user_directed_url`]. Machine-invented
-//! targets — the account entity (tier 3), the LLM fallback (tier 4), and
-//! the grounded search template (tier 6) — face the host allowlist:
+//! targets — the account entity (tier 3) and the LLM fallback (tier 4) —
+//! face the host allowlist:
 //! [`crate::url_policy::validate_proposed_url`]. The grounder output
 //! additionally passes [`validate_grounded_domain`] first, so it is a
 //! Rust-checked bare domain before it becomes a URL at all. Any
 //! validation failure returns `None` immediately — a corrupt tier never
-//! falls through to a weaker one. The search tier only runs when no
-//! stronger tier proposed anything; an invalid stronger proposal still
-//! fails closed without falling through.
+//! falls through to a weaker one. The last tier only runs when no stronger
+//! tier proposed anything; an invalid stronger proposal still fails closed
+//! without falling through.
 //!
 //! # Slot resolution runs alongside URL resolution
 //!
 //! The tiers above answer *where to start*. [`resolve_slots`] answers *what
-//! to look for once there* — the noun search-and-follow grounds on — and it
-//! has its own sub-cascade, because the search template is the same URL
-//! whether the slots came from grammar, a parser, or nowhere:
+//! to look for once there* — the noun the dispatcher grounds on — and it
+//! has its own sub-cascade:
 //!
 //! * **Tier 2A** — the deterministic grammar parse reports
 //!   [`crate::Confidence::High`], so it is used as-is at zero token cost.
@@ -66,8 +65,8 @@
 //!   [`crate::PARSER_TIMEOUT_MS`].
 //! * **Tier 2C** — no parser, a declined parse, a timeout, or output that
 //!   failed the slot fence: the low-confidence grammar slots stand, and
-//!   Stage 2 falls back to the intent's own probe text over the raw search
-//!   page. Degradation, never failure — offline is a normal outcome.
+//!   Stage 2 falls back to the intent's own probe text. Degradation, never
+//!   failure — offline is a normal outcome.
 
 use crate::{
     entity_resolver::{AccountDirectory, resolve_repo_entity},
@@ -84,7 +83,6 @@ use zeroize::Zeroizing;
 pub enum RouteSource {
     AccountEntity,
     LlmFallback,
-    SearchFallback,
     /// The prompt named a domain or URL outright (`open amazon.in`).
     ExplicitDomain,
     /// A user-saved site shortcut matched the target noun.
@@ -96,60 +94,6 @@ pub enum RouteSource {
     /// hint. The domain is validated in Rust before navigation; see
     /// [`validate_grounded_domain`].
     DomainGrounded,
-}
-
-/// Fixed grounded search entry: the only dynamic URL the resolver ever
-/// invents, and it invents no host — always `www.google.com/search`.
-/// The raw prompt becomes the `q` value; downstream grounding clicks a
-/// real AX result link, never a guessed TLD.
-const SEARCH_BASE: &str = "https://www.google.com/search";
-
-/// Strip conversational filler from an ad-hoc prompt before it becomes a
-/// search query: `"open amazon for me."` → `"amazon"`.
-///
-/// Reuses the resolver's existing stopword vocabulary
-/// ([`crate::intent_resolver::content_tokens`]) instead of introducing a
-/// second filler list, so the words dropped here are exactly the words that
-/// already never identify a target anywhere else in the pipeline. Action
-/// verbs (`open`, `show`, `find`) are dropped too: the grounder fence
-/// already refuses to ground them, so `q='open profile reddit'` could never
-/// have answered anything — the query keeps only the words that can
-/// identify a destination.
-/// Tokenization splits on non-alphanumerics, so trailing punctuation never
-/// reaches the query either. Falls back to the trimmed prompt when filtering
-/// would leave nothing, keeping the tier total on non-empty input.
-#[must_use]
-pub fn sanitize_search_query(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    let sanitized = crate::intent_resolver::content_tokens(trimmed)
-        .into_iter()
-        .filter(|token| !crate::intent_resolver::is_action_verb(token))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if sanitized.is_empty() {
-        trimmed.to_owned()
-    } else {
-        sanitized
-    }
-}
-
-/// Build the grounded search-fallback URL for an ad-hoc prompt.
-/// `None` for empty prompts (no query to ground), so callers keep the
-/// `route_resolution_miss` dead-end instead of navigating to an empty
-/// search. Never derives hosts from prompt words — the host is fixed.
-#[must_use]
-pub fn search_fallback_url(prompt: &str) -> Option<String> {
-    let sanitized = sanitize_search_query(prompt);
-    if sanitized.is_empty() {
-        return None;
-    }
-    // `form_urlencoded` byte-serializes spaces as `+`, matching the
-    // `?q=amazon` contract.
-    let query: String = url::form_urlencoded::byte_serialize(sanitized.as_bytes()).collect();
-    if query.is_empty() {
-        return None;
-    }
-    Some(format!("{SEARCH_BASE}?q={query}"))
 }
 
 /// A validated navigation target plus its provenance.
@@ -173,8 +117,8 @@ pub struct ResolvedRoute {
 /// Optional resolution inputs. Every one is inert when unset, which is the
 /// production default: no account directory is wired (no stored GitHub
 /// credential exists to back one), no URL adapter is configured, and the
-/// shipped intent parser declines. Unset inputs degrade the cascade to
-/// grounded search rather than failing it.
+/// shipped intent parser declines. Unset inputs degrade the cascade to the
+/// honest miss rather than failing it.
 pub struct ResolutionContext<'a> {
     pub account_dir: Option<&'a dyn AccountDirectory>,
     pub llm: Option<&'a dyn LlmUrlProposer>,
@@ -669,7 +613,7 @@ fn directory_step(
 /// A vetoed directory hit rides the grounder's route on
 /// [`ResolvedRoute::directory_veto`] so the journal reads as a veto, not a
 /// silent miss. `None` when no rung knows the site — the caller owns the
-/// honest miss or the Tier 4 search fallback, this function never searches.
+/// honest miss; this function never searches.
 #[must_use]
 pub fn resolve_site_entry_url(site: &str, ctx: &ResolutionContext<'_>) -> Option<ResolvedRoute> {
     // User-saved site shortcut. A corrupt saved URL is skipped — stale
@@ -951,8 +895,8 @@ pub fn explicit_url_in_prompt(prompt: &str) -> Option<String> {
     None
 }
 
-/// Which sub-tier produced the search-and-follow slots. Journaled so a
-/// wrong follow is attributable to grammar, a parser, or neither.
+/// Which sub-tier produced the follow slots. Journaled so a wrong follow
+/// is attributable to grammar, a parser, or neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotSource {
     /// Tier 2A: deterministic grammar, high confidence, zero tokens.
@@ -984,7 +928,7 @@ pub struct ResolvedSlots {
     pub source: SlotSource,
 }
 
-/// Resolve the slots search-and-follow grounds on, deferring to the parser
+/// Resolve the slots the dispatcher grounds on, deferring to the parser
 /// seam only when the deterministic parse is not confident.
 ///
 /// Total by construction — there is no failure mode, only progressively
@@ -997,9 +941,9 @@ pub struct ResolvedSlots {
 /// 3. A missing, declining, stalled, or fence-failing parser leaves the
 ///    low-confidence grammar in place (tier 2C).
 ///
-/// Step 3 is why an offline machine still works: the raw search page is the
-/// same destination either way, and Stage 2 simply grounds on the intent's
-/// probe text instead of a parsed site name.
+/// Step 3 is why an offline machine still works: the low-confidence
+/// grammar still travels, and Stage 2 grounds on the intent's probe
+/// text instead of a parsed site name.
 #[must_use]
 pub fn resolve_slots(
     prompt: &str,
@@ -1050,9 +994,12 @@ pub fn resolve_slots(
 ///    reddit") ground the site alone through the same ladder; the artifact
 ///    is pursued on the live page, never searched. A site no rung knows
 ///    falls through to Tier 4 below.
-/// 4. Grounded search fallback for prompts that are neither direct opens
-///    nor grounded site+artifact goals, so `None` otherwise still means
-///    only an empty prompt or fail-closed validation.
+/// 4. Site-ladder retry: the grammar's site slots (`site_context`, then
+///    `target_noun`, deduped, non-empty) through the normal site-only
+///    ladder ([`resolve_site_entry_url`]); first hit wins. On total miss
+///    returns `None` — the honest miss. The engine never navigates to a
+///    visible search page: no search template, no guessed TLDs, no SERP
+///    scraping.
 #[must_use]
 pub fn resolve_entry_url(
     prompt: &str,
@@ -1079,7 +1026,7 @@ pub fn resolve_entry_url(
     }
     // Tier 3: direct-open grounding ladder — the shared site-only ladder
     // ([`resolve_site_entry_url`]) over the target noun. High-confidence
-    // single-target opens never touch the search template: the destination
+    // single-target opens never touch a search page: the destination
     // comes from the user's own data, a structured directory, a fenced
     // grounder, or nowhere. An ungrounded site returns `None` so the caller
     // can ask the user instead of scraping a search page.
@@ -1101,9 +1048,10 @@ pub fn resolve_entry_url(
     // grounds. Ground ONLY the site through the shared site-only ladder
     // ([`resolve_site_entry_url`]); the artifact is pursued on the live
     // page by the dispatcher, never searched. When no rung knows the site,
-    // fall through to Tier 4: with nothing to navigate to, the grounded
-    // search template is the designed last resort (and in production the
-    // directory rung below is always live, so this corner is theoretical).
+    // fall through to Tier 4: with nothing to navigate to, the grammar's
+    // site slots get one more pass through the site-only ladder (and in
+    // production the directory rung below is always live, so this corner
+    // is theoretical).
     //
     // Coordinator veto mirrors `is_direct_open`: "open my profile on
     // reddit and twitter" is a multi-target prompt and must not silently
@@ -1121,13 +1069,38 @@ pub fn resolve_entry_url(
         return Some(route);
     }
     // 3d. Site ungrounded (or coordinator, or no artifact): fall through
-    // to the Tier 4 search template below.
-    // Tier 4: grounded search fallback — fixed template, no TLD guessing.
-    // Only runs when no stronger tier proposed anything and the prompt is
-    // not a direct open; invalid stronger proposals already returned `None`
-    // above without falling through.
-    if let Some(url) = search_fallback_url(prompt) {
-        return accept(&url, RouteSource::SearchFallback);
+    // to the Tier 4 site-ladder retry below.
+    // Tier 4: site-ladder retry over the already-parsed grammar — no
+    // visible search page, no guessed TLDs. The grammar's site slots
+    // (`site_context`, then `target_noun`, deduped, non-empty) each run
+    // the normal site-only ladder; the first hit wins. On total miss
+    // return `None`: the caller already renders "try the full domain or
+    // save a site shortcut" guidance for ungrounded prompts. Only runs
+    // when no stronger tier proposed anything; invalid stronger proposals
+    // already returned `None` above without falling through.
+    //
+    // Multi-target veto, mirroring tier 3b: a prompt naming two sites
+    // ("open my profile on reddit and twitter") must not silently pursue
+    // one of its targets — honest miss instead of one site's home page.
+    if coordinator {
+        return None;
+    }
+    let mut tried: Vec<&str> = Vec::new();
+    for site in [
+        grammar.site_context.as_deref(),
+        grammar.target_noun.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|site| !site.trim().is_empty())
+    {
+        if tried.contains(&site) {
+            continue;
+        }
+        tried.push(site);
+        if let Some(route) = resolve_site_entry_url(site, ctx) {
+            return Some(route);
+        }
     }
     None
 }
@@ -1178,9 +1151,9 @@ mod tests {
     }
 
     #[test]
-    fn tier_order_prefers_account_entity_over_search() {
-        // A connected repo named like the prompt's artifact must win over the
-        // grounded search tier below it.
+    fn tier_order_prefers_account_entity_over_later_tiers() {
+        // A connected repo named like the prompt's artifact must win over
+        // the tiers below it.
         let dir = FixtureDirectory {
             repos: vec![
                 repo("fixture-owner", "invoices"),
@@ -1208,20 +1181,14 @@ mod tests {
     }
 
     #[test]
-    fn entity_resolver_falls_through_to_search_without_connected_account() {
-        // No directory wired: entity-dependent prompts fall past tier 2 to
-        // grounded search instead of terminating as a miss.
-        let Some(resolved) =
-            resolve_entry_url("check out my portopsy on github", None, &empty_ctx())
-        else {
-            panic!("search fallback resolves");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
-        assert!(
-            resolved
-                .url
-                .as_str()
-                .starts_with("https://www.google.com/search?q=")
+    fn entity_resolver_falls_through_to_honest_miss_without_connected_account() {
+        // No directory wired, and no ladder rung grounds the site slot
+        // either: an entity-dependent prompt is an honest miss, not a
+        // search page. The caller turns the miss into "try the full domain
+        // or save a site shortcut".
+        assert_eq!(
+            resolve_entry_url("check out my portopsy on github", None, &empty_ctx()),
+            None
         );
     }
 
@@ -1237,51 +1204,15 @@ mod tests {
             None
         );
         assert_eq!(resolve_entry_url("open amazon", None, &empty_ctx()), None);
-        // Non-direct-open prompts keep the grounded search fallback.
-        let Some(resolved) =
-            resolve_entry_url("download all my invoices from github", None, &empty_ctx())
-        else {
-            panic!("retrieval prompt keeps search fallback");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
-        // Search template helper is pure and total on non-empty prompts.
-        // Action verbs never reach the query: only words that can identify
-        // a destination do.
+        // Non-direct-open prompts are no different: with no rung grounding
+        // the grammar's site slots, they miss honestly too — there is no
+        // search page to fall back to.
         assert_eq!(
-            search_fallback_url("open amazon for me").as_deref(),
-            Some("https://www.google.com/search?q=amazon")
+            resolve_entry_url("download all my invoices from github", None, &empty_ctx()),
+            None
         );
-        assert_eq!(search_fallback_url("   "), None);
-        assert_eq!(search_fallback_url(""), None);
         // Empty prompts keep the miss dead-end (no empty search navigation).
         assert_eq!(resolve_entry_url("   ", None, &empty_ctx()), None);
-    }
-
-    #[test]
-    fn search_query_sanitization_strips_filler_and_punctuation() {
-        // The reported formatting bug: conversational filler and trailing
-        // punctuation must never reach `?q=`. Action verbs (`open`, `show`)
-        // are dropped too: they never identify a destination.
-        assert_eq!(sanitize_search_query("open amazon for me."), "amazon");
-        assert_eq!(sanitize_search_query("  please open amazon!  "), "amazon");
-        // Only conversational filler goes (`my`). Prepositions that read
-        // naturally in a query (`from`) are left alone: this strips noise,
-        // it does not rewrite the user's search.
-        assert_eq!(
-            sanitize_search_query("download my invoices from github"),
-            "invoices from github"
-        );
-        // Casing normalizes; multi-space collapses.
-        assert_eq!(sanitize_search_query("Open   AMAZON"), "amazon");
-        // A prompt made only of filler still searches something rather than
-        // producing an empty query (keeps the tier total on non-empty input).
-        assert_eq!(sanitize_search_query("please the"), "please the");
-        assert_eq!(sanitize_search_query(""), "");
-        // And the URL built from it carries the sanitized form verbatim.
-        assert_eq!(
-            search_fallback_url("open amazon for me.").as_deref(),
-            Some("https://www.google.com/search?q=amazon")
-        );
     }
 
     struct StubSiteSearch {
@@ -1328,35 +1259,36 @@ mod tests {
     }
 
     #[test]
-    fn in_page_goal_with_ungrounded_site_keeps_search_fallback() {
+    fn in_page_goal_with_ungrounded_site_is_a_miss() {
         // No rung knows the site and there is nowhere to navigate: the
-        // prompt keeps the grounded search template, the designed last
-        // resort. (In production the directory rung is always live via the
-        // keyless DDG fallback, so this corner is theoretical.)
+        // prompt is an honest miss — no search page stands in for a
+        // destination. (In production the directory rung is always live via
+        // the keyless DDG fallback, so this corner is theoretical.)
         let search = StubSiteSearch { answer: None };
-        let Some(resolved) =
-            resolve_entry_url("open my profile on the reddit", None, &in_page_ctx(&search))
-        else {
-            panic!("ungrounded site keeps search fallback");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
+        assert_eq!(
+            resolve_entry_url("open my profile on the reddit", None, &in_page_ctx(&search)),
+            None
+        );
     }
 
     #[test]
-    fn in_page_goal_vetoes_coordinated_prompts() {
-        // "open my profile on reddit and twitter" is multi-target: it must
-        // not silently pursue one of its targets in-page.
+    fn coordinated_prompt_is_honest_miss_in_tier_4() {
+        // "open my profile on reddit and twitter" is multi-target: tier 3b
+        // refuses the in-page goal and tier 4 now vetoes the site ladder
+        // too — no silent pursuit of one target's site, honest miss
+        // instead of a search page or one site's home page.
         let search = StubSiteSearch {
             answer: Some("https://www.reddit.com/".to_owned()),
         };
-        let Some(resolved) = resolve_entry_url(
-            "open my profile on reddit and twitter",
-            None,
-            &in_page_ctx(&search),
-        ) else {
-            panic!("coordinated prompt keeps a route");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
+        assert!(
+            resolve_entry_url(
+                "open my profile on reddit and twitter",
+                None,
+                &in_page_ctx(&search),
+            )
+            .is_none(),
+            "multi-target prompt must miss honestly"
+        );
     }
 
     #[test]
@@ -1413,25 +1345,22 @@ mod tests {
             );
         }
         // A direct open the ladder cannot ground fails closed — it never
-        // falls back to the search template. "open amazon for me" names a
+        // falls back to a search page. "open amazon for me" names a
         // destination, so a miss asks the user rather than scraping a SERP.
         assert_eq!(
             resolve_entry_url("open amazon for me", None, &empty_ctx()),
             None,
             "ungrounded direct open must miss, never search"
         );
-        // Search tier itself never emits credentials or non-https: fixed
-        // https template over an allowlisted host. This tier only serves
-        // prompts that are not direct opens (retrieval verbs like
-        // "download" keep the search-grounded path).
-        let Some(resolved) =
-            resolve_entry_url("download the monthly site report", None, &empty_ctx())
-        else {
-            panic!("search resolves");
-        };
-        assert_eq!(resolved.url.scheme(), "https");
-        assert!(resolved.url.username().is_empty());
-        assert!(crate::url_policy::validate_proposed_url(resolved.url.as_str()).is_ok());
+        // The site-ladder retry is the last tier and it never invents a
+        // destination either: an ungrounded non-direct-open prompt is a
+        // miss, not a search page — nothing here can emit credentials,
+        // non-https, or a guessed host.
+        assert_eq!(
+            resolve_entry_url("download the monthly site report", None, &empty_ctx()),
+            None,
+            "ungrounded non-direct-open prompt must miss, never search"
+        );
     }
 
     #[test]
@@ -1505,22 +1434,20 @@ mod tests {
 
     #[test]
     fn resolution_is_prompt_only_with_no_static_route_table() {
-        // Nothing between the entity tier and grounded search: a portal-shaped
-        // prompt that the deleted table used to answer now advances to the
-        // search template, where Stage 2 grounds the real destination from a
-        // live click instead of a curated deep link.
+        // Nothing between the entity tier and the honest miss: a
+        // portal-shaped prompt that the deleted table used to answer now
+        // misses instead of inventing a deep link — no static route table,
+        // no search page standing in for a destination.
         let ctx = empty_ctx();
         for prompt in [
             "download all my invoices from github",
             "download my github billing invoices",
         ] {
-            let Some(resolved) = resolve_entry_url(prompt, None, &ctx) else {
-                panic!("{prompt} resolves");
-            };
-            assert_eq!(resolved.source, RouteSource::SearchFallback);
-            assert_eq!(resolved.url.host_str(), Some("www.google.com"));
-            // No invented deep link survives anywhere in the proposal.
-            assert!(!resolved.url.path().contains("billing"));
+            assert_eq!(
+                resolve_entry_url(prompt, None, &ctx),
+                None,
+                "{prompt} misses honestly"
+            );
         }
     }
 
@@ -1799,18 +1726,21 @@ mod tests {
     #[test]
     fn ladder_skips_multi_target_and_retrieval_prompts() {
         // "open amazon and flipkart" must never silently open one target:
-        // it is not a direct open, so the search tier (and its batch
-        // consent downstream) still applies.
+        // it is not a direct open, and with no rung grounding the grammar's
+        // site slots it misses honestly instead of searching.
         let ctx = empty_ctx();
-        let Some(resolved) = resolve_entry_url("open amazon and flipkart", None, &ctx) else {
-            panic!("multi-target keeps search fallback");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
-        // A retrieval verb is not an open: "find amazon" searches.
-        let Some(resolved) = resolve_entry_url("find amazon", None, &ctx) else {
-            panic!("retrieval verb keeps search fallback");
-        };
-        assert_eq!(resolved.source, RouteSource::SearchFallback);
+        assert_eq!(
+            resolve_entry_url("open amazon and flipkart", None, &ctx),
+            None,
+            "multi-target misses, never searches"
+        );
+        // A retrieval verb is not an open: "find amazon" misses the same
+        // way when no rung knows the site.
+        assert_eq!(
+            resolve_entry_url("find amazon", None, &ctx),
+            None,
+            "retrieval verb misses, never searches"
+        );
     }
 
     #[test]

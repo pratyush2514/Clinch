@@ -14,10 +14,11 @@
 //!   domain, a user-saved shortcut, or a structured directory — and an
 //!   ungrounded site is a miss the caller turns into ask-and-learn guidance,
 //!   never a fabricated destination.
-//! * **Search-and-follow** — prompts that are not direct opens (retrieval
-//!   verbs like `"find"`) still advance to the grounded search template,
-//!   and the prompt's own grammar (never a site list) supplies the noun
-//!   that picks the destination link out of a live results tree.
+//! * **Honest miss** — prompts that are not direct opens (retrieval
+//!   verbs like `"find"`) and that no ladder rung grounds resolve to
+//!   `None`, the miss the caller turns into ask-and-learn guidance. The
+//!   prompt's own grammar (never a site list) still supplies the noun that
+//!   Stage 2 would have picked out of a live results tree.
 
 use browser_driver::AxElement;
 use orchestration_engine::{CommandMatch, ResolutionContext, RouteSource};
@@ -153,13 +154,14 @@ async fn direct_open_miss_replaces_search_scrape() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn search_and_follow_survives_for_non_direct_opens() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn honest_miss_for_non_direct_opens_without_grounding()
+-> Result<(), Box<dyn std::error::Error>> {
     let (_dir, store) = store().await?;
     let saved = store.list_playbooks().await?;
     let search_origin = url::Url::parse("https://www.google.com/")?;
     // "find" is a retrieval verb, not an open verb, so this prompt is not a
-    // direct open and keeps the grounded search path.
+    // direct open — and with no ladder rung grounding the grammar's site
+    // slot, it misses honestly instead of landing on a search page.
     let prompt = "find amazon";
     // No stored workflow claims this prompt, so it resolves as ephemeral.
     let Some(CommandMatch::Ephemeral { intent }) =
@@ -167,19 +169,15 @@ async fn search_and_follow_survives_for_non_direct_opens() -> Result<(), Box<dyn
     else {
         return Err("unclaimed prompt resolves ephemeral".into());
     };
-    // The fixed search template, never an invented host.
-    let Some(route) = orchestration_engine::resolve_entry_url(prompt, None, &offline_ctx()) else {
-        return Err("grounded search resolves".into());
-    };
-    assert_eq!(route.source, RouteSource::SearchFallback);
-    // Action verbs never reach the query: only the words that can
-    // identify a destination do.
-    assert_eq!(route.url.as_str(), "https://www.google.com/search?q=amazon");
-    for guess in ["amazon.com", "amazon.in"] {
-        assert!(!route.url.as_str().contains(guess), "no TLD guessing");
-    }
-    // Stage 2 noun comes from the prompt's grammar. This prompt has no
-    // prepositional complement, so the direct object drives the follow.
+    // No invented host, no guessed TLD: the miss carries no URL at all.
+    assert_eq!(
+        orchestration_engine::resolve_entry_url(prompt, None, &offline_ctx()),
+        None,
+        "ungrounded non-direct-open prompt misses, never searches"
+    );
+    // The follow machinery itself is unchanged: the noun still comes from
+    // the prompt's grammar. This prompt has no prepositional complement,
+    // so the direct object drives the follow.
     let site_context = orchestration_engine::parse_grammar(&intent.raw_prompt, None).site_context;
     assert_eq!(site_context, None);
     let noun = macro_engine::search_follow_noun(&intent, site_context.as_deref());

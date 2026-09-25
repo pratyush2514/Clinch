@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 //! Task → Plan → Step execution with durable boundaries and typed progress.
+mod compound;
 mod domain_grounder;
 mod entity_resolver;
 mod funnel_slots;
@@ -14,6 +15,7 @@ mod store;
 mod task;
 mod url_policy;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
+pub use compound::split_compound;
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
 pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
 pub use funnel_slots::{
@@ -40,8 +42,7 @@ pub use route_proposer::{
     LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,
     SiteHit, SiteSearchClient, SlotSource, StubDomainGrounder, explicit_url_in_prompt,
     region_hint_from_timezone, resolve_entry_url, resolve_site_entry_url, resolve_slots,
-    sanitize_search_query, search_fallback_url, site_matches_host, system_region_hint,
-    validate_grounded_domain,
+    site_matches_host, system_region_hint, validate_grounded_domain,
 };
 pub use runner::{
     IntentApproval, SequenceEvent, SequenceOutcome, SequencePhase, SequenceStatus, StepError,
