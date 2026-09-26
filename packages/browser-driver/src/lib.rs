@@ -99,11 +99,20 @@ pub fn pick_free_port() -> std::io::Result<u16> {
 /// Issues `GET /json/version` over plain HTTP/1.1 and extracts
 /// `webSocketDebuggerUrl` from the JSON body. Returns `None` while the
 /// server is still starting, when the status is not 200, or when the body
-/// is not the expected JSON — the caller polls until the server is ready.
+/// is not the expected JSON - the caller polls until the server is ready.
+///
+/// The body is delimited by `Content-Length`, never by EOF: Chromium's
+/// `DevTools` HTTP server keeps the connection open even when asked for
+/// `Connection: close`, so waiting for EOF would burn the whole probe
+/// timeout on every poll. Responses without `Content-Length` fall back to
+/// close-delimited reads.
 pub async fn probe_devtools_http(port: u16) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Bound for headers plus body; the version document is a few hundred bytes.
+    const MAX_RESPONSE: usize = 64 * 1024;
+
     let Ok(Ok(mut stream)) = tokio::time::timeout(
         PROBE_TIMEOUT,
         tokio::net::TcpStream::connect(("127.0.0.1", port)),
@@ -119,30 +128,83 @@ pub async fn probe_devtools_http(port: u16) -> Option<String> {
         Ok(Ok(())) => {}
         _ => return None,
     }
-    // The version document is a few hundred bytes; 64 KiB is a generous
-    // bound. `Connection: close` ends the response with EOF.
+    // Read until the header terminator; the server may never close the
+    // connection, so headers are located by `\r\n\r\n`, not by EOF.
     let mut raw = Vec::new();
-    {
-        let mut limited = stream.take(64 * 1024);
-        if tokio::time::timeout(PROBE_TIMEOUT, limited.read_to_end(&mut raw))
-            .await
-            .is_err()
-        {
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if raw.len() > MAX_RESPONSE {
             return None;
         }
-    }
-    let text = String::from_utf8(raw).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    let status = head.lines().next().unwrap_or("");
+        let n = match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => return None, // EOF before the headers completed.
+            Ok(Ok(n)) => n,
+            _ => return None,
+        };
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(end) = find_header_end(&raw) {
+            break end;
+        }
+    };
+    let head = std::str::from_utf8(&raw[..header_end]).ok()?;
+    let mut lines = head.lines();
+    let status = lines.next().unwrap_or("");
     if !status.starts_with("HTTP/1.0 200") && !status.starts_with("HTTP/1.1 200") {
         return None;
     }
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let content_length: Option<usize> = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok());
+
+    let mut body = raw[header_end..].to_vec();
+    match content_length {
+        Some(want) => {
+            if want > MAX_RESPONSE {
+                return None;
+            }
+            while body.len() < want {
+                let n = match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut chunk)).await {
+                    Ok(Ok(0)) => return None, // EOF before the full body arrived.
+                    Ok(Ok(n)) => n,
+                    _ => return None,
+                };
+                body.extend_from_slice(&chunk[..n]);
+                if body.len() > MAX_RESPONSE {
+                    return None;
+                }
+            }
+            body.truncate(want);
+        }
+        None => {
+            // Close-delimited body: read until the server hangs up.
+            loop {
+                if body.len() > MAX_RESPONSE {
+                    return None;
+                }
+                match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => body.extend_from_slice(&chunk[..n]),
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&body).ok()?;
     parsed
         .get("webSocketDebuggerUrl")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
+
+/// Locate the end of an HTTP header block (`\r\n\r\n`), returning the offset
+/// just past it.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
 /// Grace period for orderly Chromium shutdown (Browser.close, then process
 /// wait) before falling back to killing the child.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);

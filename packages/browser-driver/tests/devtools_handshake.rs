@@ -124,3 +124,39 @@ async fn probe_returns_none_when_ws_url_field_missing() {
     let port = serve_once(response);
     assert_eq!(probe_devtools_http(port).await, None);
 }
+
+/// Serve one canned HTTP response on a fresh loopback port, then KEEP the
+/// connection open instead of closing it — mirroring Chromium's `DevTools`
+/// server, which ignores `Connection: close`. Returns the port.
+fn serve_once_keep_open(response: Vec<u8>) -> u16 {
+    let listener = must(TcpListener::bind("127.0.0.1:0"), "bind mock server");
+    let port = must(listener.local_addr(), "mock addr").port();
+    thread::spawn(move || {
+        let (mut stream, _) = must(listener.accept(), "mock accept");
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf);
+        must(stream.write_all(&response), "mock write");
+        // Hold the socket open well past any EOF-wait: a probe that reads
+        // to EOF would hang here instead of returning the URL.
+        thread::sleep(Duration::from_secs(10));
+    });
+    // Let the server thread reach `accept()` before the probe connects.
+    thread::sleep(Duration::from_millis(50));
+    port
+}
+
+#[tokio::test]
+async fn probe_returns_ws_url_when_server_keeps_connection_open() {
+    let ws_url = "ws://127.0.0.1:39999/devtools/browser/keep-alive-1234";
+    let port = serve_once_keep_open(version_response(ws_url));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        probe_devtools_http(port).await.as_deref(),
+        Some(ws_url),
+        "probe must honor Content-Length instead of waiting for EOF"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "probe must return promptly rather than burning the read timeout"
+    );
+}
