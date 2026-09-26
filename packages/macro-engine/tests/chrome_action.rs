@@ -22,9 +22,9 @@ use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highligh
 use macro_engine::semantic::SemanticMatcher;
 use macro_engine::{
     ChromeActionBrowser, ClickedControl, IntentError, MenuBrowser, PageGoalOutcome,
-    SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic, pursue_chrome_action,
-    select_already_open_menu_target, select_revealed_action, semantic_opener_winner,
-    strong_openers,
+    SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic, logout_header_candidates,
+    pursue_chrome_action, select_already_open_menu_target, select_revealed_action,
+    semantic_opener_winner, strong_openers,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -708,6 +708,59 @@ async fn logout_flow_misses_when_still_signed_in() {
     assert_eq!(fake.clicks().await, vec![1, 10]);
 }
 
+// ---- LogOut opener retry (worker step 2) ----
+
+#[tokio::test]
+async fn logout_flow_retries_opener_once_after_menu_miss() {
+    hermetic_classifier();
+    // The avatar click never opens a menu (the live actuation miss: the
+    // click is recorded, no menu evidence appears). LogOut spends exactly
+    // one re-grounded retry of the SAME opener, then the second miss
+    // breaks to the miss diagnostic — no third click, no loop.
+    let fake = FakeChromeActionBrowser::new(vec![avatar()]).with_rect(1, 950.0, 50.0);
+
+    match pursue_chrome_action(&fake, &origin(), log_out_spec()).await {
+        Err(IntentError::NoMatch(diagnostic)) => {
+            assert!(
+                diagnostic.contains("logout opener retry"),
+                "the retry is journaled: {diagnostic}"
+            );
+            assert_eq!(
+                diagnostic.matches("logout opener retry").count(),
+                1,
+                "the retry fires exactly once per run: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("log out destination not reached"),
+                "the second miss breaks to the miss diagnostic: {diagnostic}"
+            );
+        }
+        other => panic!("expected NoMatch miss, got {other:?}"),
+    }
+    // Exactly two clicks, both the opener: the primitive's attempt plus
+    // the single retry. A second retry would be a third click.
+    assert_eq!(fake.clicks().await, vec![1, 1]);
+}
+
+#[tokio::test]
+async fn settings_flow_never_retries_opener_after_menu_miss() {
+    hermetic_classifier();
+    // Same actuation miss, settings verb: no retry — one opener click,
+    // then the honest miss, exactly as before this change.
+    let fake = FakeChromeActionBrowser::new(vec![avatar()]).with_rect(1, 950.0, 50.0);
+
+    match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
+        Err(IntentError::NoMatch(diagnostic)) => {
+            assert!(
+                !diagnostic.contains("logout opener retry"),
+                "non-LogOut verbs never retry: {diagnostic}"
+            );
+        }
+        other => panic!("expected NoMatch miss, got {other:?}"),
+    }
+    assert_eq!(fake.clicks().await, vec![1]);
+}
+
 // ---- already-open menu (worker step 1a): pure selector ----
 
 #[test]
@@ -827,6 +880,37 @@ fn strong_openers_excludes_clicked() {
     let strong = strong_openers(&elements, &clicked, &rects, Some(200.0));
     let ids: Vec<i64> = strong.iter().map(|el| el.backend_node_id).collect();
     assert_eq!(ids, vec![2]);
+}
+
+// ---- logout_header_candidates: LogOut model-phase filter (pure) ----
+
+#[test]
+fn logout_header_filter_keeps_header_controls() {
+    // Center-y at or above the strip bottom stays: the header avatar and
+    // the strip boundary itself.
+    let kept = logout_header_candidates(&[1, 2, 3], &[50.0, 200.0, 199.9], 200.0);
+    assert_eq!(kept, vec![1, 2, 3]);
+}
+
+#[test]
+fn logout_header_filter_drops_feed_and_ad_controls() {
+    // The live miss shape: the header avatar stays, the feed ad's options
+    // control is never a model candidate.
+    let kept = logout_header_candidates(&[1, 7], &[60.0, 900.0], 200.0);
+    assert_eq!(kept, vec![1], "below-strip controls never reach the model");
+}
+
+#[test]
+fn logout_header_filter_drops_unmeasurable_centers() {
+    // No geometry means no header placement: NaN never qualifies.
+    let kept = logout_header_candidates(&[1, 2], &[f64::NAN, 60.0], 200.0);
+    assert_eq!(kept, vec![2]);
+}
+
+#[test]
+fn logout_header_filter_empty_input_yields_empty() {
+    // Empty in, empty out — the caller falls back to the full list.
+    assert!(logout_header_candidates(&[], &[], 200.0).is_empty());
 }
 
 #[tokio::test]

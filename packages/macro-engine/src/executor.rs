@@ -1555,6 +1555,65 @@ async fn open_menu_within_budget<B: ChromeActionBrowser>(
     Ok(opened)
 }
 
+/// `LogOut`-only single opener retry for the chrome worker's step 2: the
+/// menu primitive missed with the gate's chosen opener. Re-snapshot,
+/// re-ground the SAME opener by stable identity
+/// ([`ClickedControl::matches`] — backend node ids churn, so the retry
+/// keys on role+name, never the id), click it once through the menu seam,
+/// and re-check with the existing [`menu_open_effect`] verdict against
+/// the fresh pre-click baseline. The retry spends at most one extra click
+/// beyond [`CHROME_ACTION_MAX_CLICKS`]; the caller's flag fires it at most
+/// once per run, and the loop's budget check still bounds whatever
+/// follows. Every outcome is journaled in `tried` — including a vanished
+/// opener, which spends no click. Returns whether a menu opened; the
+/// caller keeps its exact break/continue shape.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn logout_opener_retry<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    opener: &AxElement,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<bool, IntentError> {
+    let (elements, check, _) = browser.menu_snapshot(origin).await;
+    let key = ClickedControl::of(opener);
+    let Some(candidate) = elements.iter().find(|element| key.matches(element)) else {
+        let name: String = opener.name.chars().take(40).collect();
+        tried.push(format!(
+            "logout opener retry: {} '{name}' not in fresh snapshot, no click spent",
+            opener.role
+        ));
+        return Ok(false);
+    };
+    // Fresh pre-click baseline: the effect check compares the post-click
+    // controls against THIS snapshot, not the stale pre-primitive one.
+    let before_ids: std::collections::HashSet<i64> = elements
+        .iter()
+        .map(|element| element.backend_node_id)
+        .collect();
+    let actionable_before = count_actionable(&elements);
+    let raw_before = check.node_count;
+    browser.menu_click(candidate).await?;
+    clicked.push(ClickedControl::of(candidate));
+    *clicks_used += 1;
+    let (after, check_after, _) = browser.menu_snapshot(origin).await;
+    let (menu_opened, effect) = menu_open_effect(
+        &before_ids,
+        actionable_before,
+        raw_before,
+        &after,
+        check_after.node_count,
+    );
+    tried.push(format!(
+        "logout opener retry: {}",
+        tried_label(candidate, &effect)
+    ));
+    Ok(menu_opened)
+}
+
 /// Identity lane: navigate a page-revealed, Rust-validated href when the
 /// revealed control discloses one; otherwise click it and watch the URL.
 /// Either way the identity verifier decides. Returns `Some` on a decided
@@ -1953,7 +2012,11 @@ async fn chrome_action_prestate<B: ChromeActionBrowser>(
 /// 6. **Otherwise the shared [`open_identity_menu`] primitive** spends the
 ///    remaining click budget opening the account menu — its internal
 ///    rank → click → poll loop is not reimplemented here, and a Miss ends
-///    the worker instead of re-looping over candidates it exhausted.
+///    the worker instead of re-looping over candidates it exhausted — with
+///    one exception: the `LogOut` verb gets exactly one re-grounded retry
+///    of the same opener (same stable identity, never a new candidate)
+///    before the Miss, covering actuation misses where the click never
+///    landed.
 ///
 /// An honest miss beats a guessed click: the worker only clicks controls
 /// the revealed-gating selected, and [`IntentError::NoMatch`] carries the
@@ -1962,6 +2025,9 @@ async fn chrome_action_prestate<B: ChromeActionBrowser>(
 /// # Errors
 /// Returns [`IntentError::NoMatch`] with the tried-lines journal when the
 /// action is not verified, and [`IntentError::Browser`] on CDP failure.
+// The worker's six documented steps read as one function: splitting the
+// loop body would scatter the step ordering the doc comment narrates.
+#[allow(clippy::too_many_lines)]
 pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
@@ -1992,6 +2058,12 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // menu (or a false positive) and must be dismissed before the next
     // attempt clicks — otherwise its light-dismiss swallows that click.
     let mut menu_maybe_open = false;
+    // `LogOut`-only single opener retry (step 2): the menu primitive can
+    // spend its whole budget on an opener whose click never lands
+    // (recorded, but no menu evidence on a live page). Exactly one
+    // re-grounded retry of the SAME opener per run; any other verb keeps
+    // today's miss path.
+    let mut logout_opener_retried = false;
     // Per-run semantic matchers, created once: the verb's generic words
     // score revealed items when the closed vocabulary is inconclusive,
     // and "account menu" disambiguates the opener when several strong
@@ -2101,6 +2173,26 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
             Some(chosen_opener),
         )
         .await?;
+        // `LogOut`-only single retry: when the primitive missed, re-ground
+        // the SAME opener by stable identity and spend one more click on
+        // it. An actuation miss (click recorded, menu never opened) reads
+        // identically to a wrong-opener miss, and the retry distinguishes
+        // them. At most one per run; a second miss breaks exactly as
+        // before, and other verbs never enter this branch.
+        let opened = if !opened && spec.kind == VerbKind::LogOut && !logout_opener_retried {
+            logout_opener_retried = true;
+            logout_opener_retry(
+                browser,
+                origin,
+                chosen_opener,
+                &mut clicked,
+                &mut tried,
+                &mut clicks_used,
+            )
+            .await?
+        } else {
+            opened
+        };
         if !opened {
             break;
         }
@@ -2701,10 +2793,11 @@ pub async fn semantic_opener_winner<'a>(
 }
 
 /// Header-strip cutoff for opener geometry: the viewport-relative header
-/// boundary both [`open_identity_menu`] and the chrome worker's opener
-/// ambiguity gate derive — one definition, no drift. `None` when the
-/// viewport won't read: the strip pass stays empty and ranking fails
-/// closed, exactly like the primitive's inline version did.
+/// boundary [`open_identity_menu`], the chrome worker's opener ambiguity
+/// gate, and the `LogOut` model candidate filter derive — one definition,
+/// no drift. `None` when the viewport won't read: the strip pass stays
+/// empty and ranking fails closed, exactly like the primitive's inline
+/// version did.
 async fn header_strip_bottom<B: MenuBrowser>(browser: &B) -> Option<f64> {
     browser
         .menu_viewport_size()
@@ -3407,6 +3500,74 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
     .await
 }
 
+/// Click lane for [`model_loop_pass`]: grounds the navigator's pick
+/// against the full snapshot via [`model_loop_click`]. Returns `Some`
+/// when the click decided the run, `None` to keep looping.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] on an ungroundable pick, and
+/// [`IntentError::Browser`] on CDP failure.
+// Eight inputs: the click's own; the state's fields travel as one borrow
+// so the call site stays readable — the `too_many_arguments` shape this
+// crate already uses for its click helpers.
+#[allow(clippy::too_many_arguments)]
+async fn model_loop_click_arm<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    goal: &str,
+    spec: Option<&VerbSpec>,
+    elements: &[AxElement],
+    target: i64,
+    deterministic_miss: &str,
+    state: &mut ModelLoopState,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    model_loop_click(
+        browser,
+        origin,
+        goal,
+        spec,
+        elements,
+        target,
+        deterministic_miss,
+        &mut state.clicked,
+        &mut state.tried,
+        &mut state.last_label,
+        &mut state.revealed_username,
+    )
+    .await
+}
+
+/// Exit lane for [`model_loop_pass`]: every way out of the acting loop —
+/// a navigator decline, a give-up, a `Done` claim, or an exhausted step
+/// budget — runs the verification tail with the journal intact, so the
+/// verifier, never the model, decides completion.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the goal is not reached or not
+/// verified, and [`IntentError::Browser`] on CDP failure.
+async fn model_loop_exit<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: Option<&VerbSpec>,
+    goal: &str,
+    deterministic_miss: &str,
+    state: &ModelLoopState,
+    reason: &str,
+) -> Result<PageGoalOutcome, IntentError> {
+    model_loop_tail(
+        browser,
+        origin,
+        spec,
+        goal,
+        deterministic_miss,
+        &state.tried,
+        state.last_label.as_deref(),
+        state.revealed_username.as_deref(),
+        reason,
+    )
+    .await
+}
+
 /// One bounded model pass: the observe → propose → act loop shared by
 /// gear 2's main pass and the escalation pass, so the click/verify logic
 /// is not duplicated. `state` accumulates across passes; the pass ends in
@@ -3431,6 +3592,8 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
     // open, whose light-dismiss would swallow the pass's first click.
     // Best-effort no-op when nothing is open.
     browser.menu_dismiss().await;
+    // The LogOut filter's fail-safe line is journaled once per pass.
+    let mut logout_filter_fallback_journaled = false;
 
     for _ in 0..MODEL_GOAL_MAX_STEPS {
         // Untruncated: the pick is validated against the same full list
@@ -3440,12 +3603,30 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
         let prompt_goal = model_goal_text(goal, spec);
         // The navigator renders the head slice; zones describe exactly
         // that slice, best-effort — unzoned on failure.
-        let head: Vec<AxElement> = elements
+        let mut head: Vec<AxElement> = elements
             .iter()
             .take(crate::MAX_NAVIGATOR_ELEMENTS)
             .cloned()
             .collect();
-        let zones = model_zones(browser, &head).await;
+        // One measurement round feeds both the zones and the LogOut
+        // header filter — never a second CDP pass.
+        let points = model_zone_points(browser, &head).await;
+        let mut zones = zones_from_points(&points);
+        // `LogOut`-only guard: offer the model only header-strip
+        // candidates (see [`logout_model_filter`); the live miss clicked
+        // a feed ad's options button from this very turn.
+        if spec.is_some_and(|spec| spec.kind == VerbKind::LogOut)
+            && let Some(strip_bottom) = header_strip_bottom(browser).await
+        {
+            (head, zones) = logout_model_filter(
+                head,
+                zones,
+                &points,
+                strip_bottom,
+                &mut state.tried,
+                &mut logout_filter_fallback_journaled,
+            );
+        }
         // Phase 2: the visual turn — a best-effort viewport screenshot
         // accompanies the element list. The capture must never fail the
         // run: `None` degrades to the text-only turn.
@@ -3461,87 +3642,52 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
         .map_err(|_| {
             IntentError::NoMatch(format!("navigator task failed; {deterministic_miss}"))
         })?;
-        // A decline stops the acting loop and falls through to the
-        // verification tail — the verifier, never the model, decides
-        // completion. (A closure would borrow the state's fields across
-        // the click arm's mutations, so each site calls the tail
-        // directly.)
-        match action {
-            None => {
-                return model_loop_tail(
-                    browser,
-                    origin,
-                    spec,
-                    goal,
-                    deterministic_miss,
-                    &state.tried,
-                    state.last_label.as_deref(),
-                    state.revealed_username.as_deref(),
-                    "navigator declined",
-                )
-                .await;
-            }
-            Some(PageAction::GiveUp { reason }) => {
-                return model_loop_tail(
-                    browser,
-                    origin,
-                    spec,
-                    goal,
-                    deterministic_miss,
-                    &state.tried,
-                    state.last_label.as_deref(),
-                    state.revealed_username.as_deref(),
-                    &format!("navigator gave up ({reason})"),
-                )
-                .await;
-            }
-            Some(PageAction::Done) => {
-                // Done is a decline, not a completion claim: the model
-                // never declares the goal achieved. The tail still runs
-                // the verifier, so a correct page completes on evidence.
-                return model_loop_tail(
-                    browser,
-                    origin,
-                    spec,
-                    goal,
-                    deterministic_miss,
-                    &state.tried,
-                    state.last_label.as_deref(),
-                    state.revealed_username.as_deref(),
-                    "navigator done (treated as decline)",
-                )
-                .await;
-            }
-            Some(PageAction::Click { target }) => {
-                if let Some(outcome) = model_loop_click(
-                    browser,
-                    origin,
-                    goal,
-                    spec,
-                    &elements,
-                    target,
-                    deterministic_miss,
-                    &mut state.clicked,
-                    &mut state.tried,
-                    &mut state.last_label,
-                    &mut state.revealed_username,
-                )
-                .await?
-                {
-                    return Ok(outcome);
-                }
-            }
+        // A decline stops the acting loop; the verification tail — never
+        // the model — decides completion.
+        let decline_reason: Option<String> = match &action {
+            None => Some("navigator declined".to_owned()),
+            Some(PageAction::GiveUp { reason }) => Some(format!("navigator gave up ({reason})")),
+            // Done is a decline, not a completion claim: the model never
+            // declares the goal achieved. The tail still runs the
+            // verifier, so a correct page completes on evidence.
+            Some(PageAction::Done) => Some("navigator done (treated as decline)".to_owned()),
+            Some(PageAction::Click { .. }) => None,
+        };
+        if let Some(reason) = decline_reason {
+            return model_loop_exit(
+                browser,
+                origin,
+                spec,
+                goal,
+                deterministic_miss,
+                state,
+                &reason,
+            )
+            .await;
+        }
+        if let Some(PageAction::Click { target }) = action
+            && let Some(outcome) = model_loop_click_arm(
+                browser,
+                origin,
+                goal,
+                spec,
+                &elements,
+                target,
+                deterministic_miss,
+                state,
+            )
+            .await?
+        {
+            return Ok(outcome);
         }
     }
-    model_loop_tail(
+    model_loop_exit(
         browser,
         origin,
         spec,
         goal,
         deterministic_miss,
-        &state.tried,
-        state.last_label.as_deref(),
-        state.revealed_username.as_deref(),
+        state,
         &format!("navigator exhausted {MODEL_GOAL_MAX_STEPS} steps"),
     )
     .await
@@ -3681,24 +3827,20 @@ fn model_goal_text(goal: &str, spec: Option<&VerbSpec>) -> String {
     }
 }
 
-/// Coarse position zones for the model phase over the menu seam:
-/// distribution-relative zoning — each rendered control's center zoned
-/// against the bounding box of the measured control set, so the model can
-/// pick an unnamed avatar button by its header position instead of
-/// guessing. Measured through [`MenuBrowser::menu_node_rect`].
+/// Measured viewport centers for the model phase over the menu seam:
+/// one `(x, y)` center per element, in order; `(NaN, NaN)` when the rect
+/// won't resolve. Measured through [`MenuBrowser::menu_node_rect`].
 /// Best-effort and time-bounded — geometry that won't resolve degrades to
-/// unzoned lines, never a stall.
-async fn model_zones<B: MenuBrowser>(
-    browser: &B,
-    elements: &[AxElement],
-) -> Vec<Option<crate::navigator::PositionZone>> {
-    use crate::navigator::zone_for;
+/// unmeasured points, never a stall. Split out so the `LogOut` header
+/// filter reuses the same measurement round instead of paying a second
+/// CDP pass.
+async fn model_zone_points<B: MenuBrowser>(browser: &B, elements: &[AxElement]) -> Vec<(f64, f64)> {
     const ZONE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     let ids: Vec<i64> = elements
         .iter()
         .map(|element| element.backend_node_id)
         .collect();
-    let measured = tokio::time::timeout(ZONE_BUDGET, async {
+    tokio::time::timeout(ZONE_BUDGET, async {
         let mut points: Vec<(f64, f64)> = Vec::new();
         for id in &ids {
             if let Ok(highlight) = browser.menu_node_rect(*id).await {
@@ -3713,17 +3855,25 @@ async fn model_zones<B: MenuBrowser>(
         points
     })
     .await
-    .ok();
-    let Some(points) = measured else {
-        return vec![None; ids.len()];
-    };
+    .unwrap_or_else(|_| vec![(f64::NAN, f64::NAN); ids.len()])
+}
+
+/// Coarse position zones from measured viewport centers: the pure half of
+/// the model phase's geometry. Distribution-relative zoning — each
+/// rendered control's center zoned against the bounding box of the
+/// measured control set, so the model can pick an unnamed avatar button
+/// by its header position instead of guessing. An empty finite set (or a
+/// fully unmeasured round) degrades to unzoned lines, never a stall.
+#[must_use]
+fn zones_from_points(points: &[(f64, f64)]) -> Vec<Option<crate::navigator::PositionZone>> {
+    use crate::navigator::zone_for;
     let finite: Vec<(f64, f64)> = points
         .iter()
         .copied()
         .filter(|(x, y)| x.is_finite() && y.is_finite())
         .collect();
     if finite.is_empty() {
-        return vec![None; ids.len()];
+        return vec![None; points.len()];
     }
     let (min_x, max_x) = finite
         .iter()
@@ -3745,6 +3895,69 @@ async fn model_zones<B: MenuBrowser>(
             }
         })
         .collect()
+}
+
+/// `LogOut` model-phase candidate filter, pure: keep the head element ids
+/// whose rect center-y sits inside the header strip (at or above
+/// `strip_bottom`). The account menu renders near the header, so
+/// feed/ad/main-content controls below the strip are never `LogOut`
+/// candidates — this is the guard that keeps a generalist model from
+/// clicking a feed ad's options button when it should be opening the
+/// account menu. Unmeasurable centers (NaN) are excluded: a control with
+/// no geometry can't be placed in the header. Returns the kept ids; an
+/// empty result means the caller falls back to the unfiltered list —
+/// never blind the model.
+#[must_use]
+pub fn logout_header_candidates(ids: &[i64], y_centers: &[f64], strip_bottom: f64) -> Vec<i64> {
+    ids.iter()
+        .zip(y_centers.iter())
+        .filter(|(_, y)| y.is_finite() && **y <= strip_bottom)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// `LogOut` model-guard application for [`model_loop_pass`]: narrow the
+/// navigator's head slice (and its 1:1 zones) to header-strip candidates
+/// via [`logout_header_candidates`], so the generalist can't wander into
+/// feed/ad controls — the live miss clicked a feed ad's options button
+/// from this very turn. An emptied list keeps the full head and journals
+/// one line per pass (`fallback_journaled`) instead of blinding the
+/// model; the caller fails closed to the unfiltered head when the
+/// viewport won't read. Returns the (possibly filtered) head and zones,
+/// still aligned.
+fn logout_model_filter(
+    head: Vec<AxElement>,
+    zones: Vec<Option<crate::navigator::PositionZone>>,
+    points: &[(f64, f64)],
+    strip_bottom: f64,
+    tried: &mut Vec<String>,
+    fallback_journaled: &mut bool,
+) -> (Vec<AxElement>, Vec<Option<crate::navigator::PositionZone>>) {
+    let ids: Vec<i64> = head.iter().map(|element| element.backend_node_id).collect();
+    let y_centers: Vec<f64> = points.iter().map(|(_, y)| *y).collect();
+    let kept: std::collections::HashSet<i64> =
+        logout_header_candidates(&ids, &y_centers, strip_bottom)
+            .into_iter()
+            .collect();
+    if kept.is_empty() {
+        if !*fallback_journaled {
+            *fallback_journaled = true;
+            tried.push(
+                "logout model filter found no header-strip candidates; showing the full list"
+                    .to_owned(),
+            );
+        }
+        return (head, zones);
+    }
+    let mut filtered_head = Vec::with_capacity(kept.len());
+    let mut filtered_zones = Vec::with_capacity(kept.len());
+    for (element, zone) in head.into_iter().zip(zones) {
+        if kept.contains(&element.backend_node_id) {
+            filtered_head.push(element);
+            filtered_zones.push(zone);
+        }
+    }
+    (filtered_head, filtered_zones)
 }
 
 /// Verification tail of the generalist loop: runs after the budget is

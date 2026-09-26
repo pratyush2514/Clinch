@@ -52,6 +52,7 @@ struct LoopBrowser {
     auth: AuthState,
     land_on_click: HashMap<i64, Url>,
     screenshot: Option<String>,
+    rects: HashMap<i64, (f64, f64)>,
 }
 
 impl LoopBrowser {
@@ -63,11 +64,17 @@ impl LoopBrowser {
             auth,
             land_on_click: HashMap::new(),
             screenshot: None,
+            rects: HashMap::new(),
         }
     }
 
     fn with_screenshot(mut self, jpeg_b64: &str) -> Self {
         self.screenshot = Some(jpeg_b64.to_owned());
+        self
+    }
+
+    fn with_rect(mut self, id: i64, x: f64, y: f64) -> Self {
+        self.rects.insert(id, (x, y));
         self
     }
 
@@ -91,10 +98,15 @@ impl MenuBrowser for LoopBrowser {
         &self,
         backend_node_id: i64,
     ) -> impl std::future::Future<Output = Result<Highlight, BrowserError>> + Send {
+        let (x, y) = self
+            .rects
+            .get(&backend_node_id)
+            .copied()
+            .unwrap_or((backend_node_id as f64 * 10.0, 5.0));
         std::future::ready(Ok(Highlight {
             selector: format!("ax:{backend_node_id}"),
-            x: backend_node_id as f64 * 10.0,
-            y: 5.0,
+            x,
+            y,
             width: 40.0,
             height: 40.0,
             matches: 1,
@@ -429,6 +441,167 @@ async fn visual_turn_degrades_to_text_only_without_screenshot() {
     assert!(
         seen.iter().all(|screenshot| !screenshot),
         "no turn carried a screenshot: {seen:?}"
+    );
+}
+
+// ---- LogOut model-phase header filter ----
+
+/// Navigator spy for the `LogOut` header filter: records the head ids
+/// handed to each visual turn and asserts head/zones stay aligned after
+/// filtering, then declines.
+struct HeadRecordingNavigator {
+    heads: Mutex<Vec<Vec<i64>>>,
+}
+
+impl HeadRecordingNavigator {
+    fn new() -> Self {
+        Self {
+            heads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn heads(&self) -> Vec<Vec<i64>> {
+        self.heads
+            .lock()
+            .map(|heads| heads.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl PageNavigator for HeadRecordingNavigator {
+    fn next_action(&self, _goal: &str, _elements: &[AxElement]) -> Option<PageAction> {
+        None
+    }
+
+    fn next_action_visual(
+        &self,
+        goal: &str,
+        elements: &[AxElement],
+        zones: &[Option<PositionZone>],
+        _screenshot_jpeg_b64: Option<&str>,
+    ) -> Option<PageAction> {
+        assert_eq!(
+            elements.len(),
+            zones.len(),
+            "head and zones stay aligned after filtering"
+        );
+        if let Ok(mut heads) = self.heads.lock() {
+            heads.push(
+                elements
+                    .iter()
+                    .map(|element| element.backend_node_id)
+                    .collect(),
+            );
+        }
+        self.next_action(goal, elements)
+    }
+}
+
+#[tokio::test]
+async fn logout_model_turn_hides_below_strip_controls() {
+    // Header avatar (y-center 60) plus a feed control (y-center 900):
+    // the LogOut model turn offers only the header candidate — the live
+    // miss clicked a feed ad's options button from this very turn.
+    let tree = vec![button(1, "avatar"), button(7, "feed options")];
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated)
+        .with_rect(1, 950.0, 40.0)
+        .with_rect(7, 900.0, 880.0);
+    let navigator = Arc::new(HeadRecordingNavigator::new());
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        navigator.clone(),
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(IntentError::NoMatch(_))),
+        "the decline still misses honestly: {result:?}"
+    );
+    let heads = navigator.heads();
+    assert_eq!(heads.len(), 1, "the decline ends the pass after one turn");
+    assert_eq!(
+        heads[0],
+        vec![1],
+        "only the header control reaches the model: {:?}",
+        heads[0]
+    );
+}
+
+#[tokio::test]
+async fn logout_model_filter_falls_back_to_full_list_when_empty() {
+    // Every rect sits below the strip: the filter would empty the list,
+    // so the pass keeps the full head and journals one line instead of
+    // blinding the model.
+    let tree = vec![button(1, "avatar"), button(7, "feed options")];
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated)
+        .with_rect(1, 950.0, 800.0)
+        .with_rect(7, 900.0, 880.0);
+    let navigator = Arc::new(HeadRecordingNavigator::new());
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        navigator.clone(),
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    let heads = navigator.heads();
+    assert_eq!(heads.len(), 1, "the decline ends the pass after one turn");
+    assert_eq!(
+        heads[0],
+        vec![1, 7],
+        "the fallback keeps the full head: {:?}",
+        heads[0]
+    );
+    assert!(
+        diagnostic.contains("logout model filter found no header-strip candidates"),
+        "the fallback is journaled: {diagnostic}"
+    );
+    assert_eq!(
+        diagnostic
+            .matches("logout model filter found no header-strip candidates")
+            .count(),
+        1,
+        "exactly one journal line per pass: {diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn model_turn_keeps_full_list_for_other_verbs() {
+    // The header filter is LogOut-only: a settings turn still offers the
+    // full head, including below-strip controls.
+    let tree = vec![button(1, "avatar"), button(7, "feed options")];
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated)
+        .with_rect(1, 950.0, 40.0)
+        .with_rect(7, 900.0, 880.0);
+    let navigator = Arc::new(HeadRecordingNavigator::new());
+    let _ = pursue_with_model(
+        &browser,
+        &origin(),
+        "settings test goal",
+        navigator.clone(),
+        Some(settings_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    let heads = navigator.heads();
+    assert_eq!(heads.len(), 1, "the decline ends the pass after one turn");
+    assert_eq!(
+        heads[0],
+        vec![1, 7],
+        "other verbs see the unfiltered head: {:?}",
+        heads[0]
     );
 }
 

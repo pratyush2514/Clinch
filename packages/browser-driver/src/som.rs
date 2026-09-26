@@ -7,7 +7,8 @@
 //! markup: no tag names, class names, or pattern matching appear here.
 
 use crate::{
-    BrowserError, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, IO_TIMEOUT, ManagedBrowser,
+    BrowserError, CLICK_DWELL_MS, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, IO_TIMEOUT,
+    ManagedBrowser, WAYPOINT_INTERVAL_MS, travel_waypoints,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
@@ -15,6 +16,7 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Upper bound on badges per overlay; matches the AX snapshot cap so one
 /// snapshot always fits one overlay.
@@ -160,6 +162,13 @@ impl ManagedBrowser {
     /// Click the center of `mark` with a human-like hover → press → release
     /// through trusted CDP input events (never a synthetic DOM click).
     ///
+    /// The pointer first glides from its last known landing point through
+    /// intermediate `MouseMoved` dispatches (≈40px apart, capped, ~18ms
+    /// between them), then the strict hover → press → release sequence runs
+    /// with a constant 100ms dwell between press and release. The glide is
+    /// best-effort — a failed waypoint aborts it and the strict click still
+    /// runs — and the first move of a session (no last position) skips it.
+    ///
     /// # Errors
     /// Returns [`BrowserError`] on invalid geometry, CDP failure, or timeout.
     pub async fn click_mark(&self, mark: &Mark) -> Result<(), BrowserError> {
@@ -168,6 +177,41 @@ impl ManagedBrowser {
         // The live layout viewport is the exact coordinate space of the CDP
         // input events below; fall back to the launch size if the query fails.
         let viewport = self.viewport_size().await.unwrap_or(FALLBACK_VIEWPORT);
+        let session_id = self.cursor_session.load(Ordering::Relaxed);
+        // Travel the pointer from its last landing point so the overlay
+        // glides instead of teleporting. Best-effort: a failed waypoint
+        // stops the travel and the real click sequence (strict) runs next.
+        // Copy the position out of the lock first: the guard must not be
+        // held across the dispatches below.
+        let last: Option<(f64, f64)> = self.last_cursor.lock().map_or(None, |guard| *guard);
+        if let Some(from) = last {
+            for (wx, wy) in travel_waypoints(from, (x, y)) {
+                let moved = DispatchMouseEventParams::builder()
+                    .r#type(DispatchMouseEventType::MouseMoved)
+                    .x(wx)
+                    .y(wy)
+                    .build()
+                    .map_err(|_| BrowserError::InvalidAction)?;
+                let dispatched = matches!(
+                    tokio::time::timeout(IO_TIMEOUT, self.page.execute(moved)).await,
+                    Ok(Ok(_))
+                );
+                if !dispatched {
+                    break;
+                }
+                // Emit only after the dispatch succeeded: the cursor marks
+                // where input actually landed, never where it was merely
+                // aimed.
+                self.emit_cursor(CursorEvent::new(
+                    CursorEventKind::Move,
+                    wx,
+                    wy,
+                    viewport,
+                    session_id,
+                ));
+                tokio::time::sleep(Duration::from_millis(WAYPOINT_INTERVAL_MS)).await;
+            }
+        }
         // Zip the human-like phases onto the CDP events so the cursor overlay
         // shows exactly what the page just received, in order.
         let phases = [
@@ -182,13 +226,18 @@ impl ManagedBrowser {
                 .map_err(|_| BrowserError::Connection)?;
             // Emit only after the dispatch succeeded: the cursor marks where
             // input actually landed, never where it was merely aimed.
-            self.emit_cursor(CursorEvent::new(
-                kind,
-                x,
-                y,
-                viewport,
-                self.cursor_session.load(Ordering::Relaxed),
-            ));
+            self.emit_cursor(CursorEvent::new(kind, x, y, viewport, session_id));
+            // Deterministic dwell between press and release: a human holds
+            // the button briefly. Constant and bounded — no jitter, so
+            // replays stay reproducible.
+            if kind == CursorEventKind::Press {
+                tokio::time::sleep(Duration::from_millis(CLICK_DWELL_MS)).await;
+            }
+        }
+        // The pointer now rests on the click target: the next click travels
+        // from here.
+        if let Ok(mut guard) = self.last_cursor.lock() {
+            *guard = Some((x, y));
         }
         Ok(())
     }

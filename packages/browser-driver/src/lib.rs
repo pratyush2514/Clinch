@@ -31,7 +31,8 @@ use chromiumoxide::{
     cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
 };
 pub use cursor::{
-    CursorEmitter, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, NO_CURSOR_SESSION,
+    CLICK_DWELL_MS, CursorEmitter, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, MAX_WAYPOINTS,
+    NO_CURSOR_SESSION, WAYPOINT_INTERVAL_MS, WAYPOINT_SPACING_PX, travel_waypoints,
 };
 use futures::StreamExt;
 pub use picker::{
@@ -308,6 +309,12 @@ pub struct ManagedBrowser {
     /// ([`NO_CURSOR_SESSION`] before the first frame). Cursor events carry
     /// it so the UI can apply the same stale-session filter as frames.
     cursor_session: AtomicI64,
+    /// Last position (page CSS pixels) where trusted input landed.
+    /// [`ManagedBrowser::click_mark`] travels the pointer from here through
+    /// intermediate `MouseMoved` dispatches instead of teleporting. `None`
+    /// until the first click, and reset to `None` on L1 challenge restart:
+    /// the fresh page's pointer position is unknown.
+    last_cursor: Mutex<Option<(f64, f64)>>,
 }
 
 impl ManagedBrowser {
@@ -514,6 +521,7 @@ impl ManagedBrowser {
             anchored_portal: Mutex::new(None),
             cursor_emitter: Mutex::new(None),
             cursor_session: AtomicI64::new(NO_CURSOR_SESSION),
+            last_cursor: Mutex::new(None),
         };
         let mut script = AddScriptToEvaluateOnNewDocumentParams::new(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
@@ -635,6 +643,13 @@ impl ManagedBrowser {
         managed
             .cursor_session
             .store(NO_CURSOR_SESSION, Ordering::Relaxed);
+        // The fresh page's pointer position is unknown: reset explicitly so
+        // the next click skips travel rather than gliding from a stale
+        // position (the fresh launch inits `None`, this pins the L1
+        // contract against future init refactors).
+        if let Ok(mut guard) = managed.last_cursor.lock() {
+            *guard = None;
+        }
         tokio::time::timeout(IO_TIMEOUT, managed.browser.set_cookies(params))
             .await
             .map_err(|_| BrowserError::Timeout)?
