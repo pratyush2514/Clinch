@@ -12,7 +12,7 @@ pub enum BrowserSource {
     Edge,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SyncRequest {
     pub browser: BrowserSource,

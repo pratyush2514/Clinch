@@ -589,7 +589,7 @@ enum SessionLendOrigin {
 /// registry key for the pending lend; `source_connection_id` optionally
 /// picks one connected companion (the card's source picker) — `None`
 /// broadcasts to every connected companion.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LendRequest {
     lend_id: String,

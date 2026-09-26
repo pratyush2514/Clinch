@@ -1,0 +1,32 @@
+[package]
+name = "clinch-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "clinch-daemon"
+path = "src/main.rs"
+
+[dependencies]
+clinch-protocol = { path = "../clinch-protocol" }
+tokio.workspace = true
+serde.workspace = true
+serde_json = "1"
+futures = "0.3"
+thiserror.workspace = true
+zeroize.workspace = true
+async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"] }
+browser-driver = { path = "../browser-driver" }
+session-sync = { path = "../session-sync" }
+playbook-store = { path = "../playbook-store" }
+macro-engine = { path = "../macro-engine" }
+orchestration-engine = { path = "../orchestration-engine" }
+sqlx.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

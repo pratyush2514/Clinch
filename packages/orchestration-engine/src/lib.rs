@@ -148,7 +148,7 @@ impl TaskRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvent {
     pub task: Task,
@@ -168,7 +168,7 @@ impl TaskEvent {
 
 /// Service callers serialize access to the single managed browser. SQL revisions additionally
 /// prevent stale checkpoint writers; no database transaction spans browser I/O.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GateRequest {
     pub task_id: TaskId,

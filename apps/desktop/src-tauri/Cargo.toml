@@ -23,6 +23,7 @@ url.workspace = true
 zeroize.workspace = true
 futures = "0.3"
 async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"] }
+clinch-protocol = { path = "../../../packages/clinch-protocol" }
 browser-driver = { path = "../../../packages/browser-driver" }
 session-sync = { path = "../../../packages/session-sync" }
 playbook-store = { path = "../../../packages/playbook-store" }

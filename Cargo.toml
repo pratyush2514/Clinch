@@ -13,7 +13,7 @@ publish = false
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "sync", "io-util", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "sync", "io-util", "net", "signal"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 zeroize = { version = "1", features = ["derive"] }
 url = { version = "2", features = ["serde"] }
