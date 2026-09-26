@@ -129,6 +129,7 @@ export default function App() {
       <ActionThread
         entries={thread.entries}
         liveFrame={screencast.frame}
+        agentCursor={screencast.cursor}
         headless={screencast.status.headless}
         windowMode={screencast.status.windowMode}
         browserBusy={screencast.busy}

@@ -67,11 +67,19 @@ async fn acquire_browser_context<R: tauri::Runtime>(
     state: tauri::State<'_, AppService>,
 ) -> Result<ContextStatus, AppError> {
     // Frames stream over `browser-screencast-frame` until release, takeover
-    // re-acquire, or app exit; a closed listener simply ends the pump.
+    // re-acquire, or app exit; cursor positions ride `browser-cursor-moved`
+    // alongside so the UI can render the agent's pointer. A closed listener
+    // simply ends the pump.
+    let cursor_app = app.clone();
     state
-        .acquire_context(move |frame| {
-            let _ = app.emit(service::SCREENCAST_EVENT, frame);
-        })
+        .acquire_context(
+            move |frame| {
+                let _ = app.emit(service::SCREENCAST_EVENT, frame);
+            },
+            move |cursor| {
+                let _ = cursor_app.emit(service::CURSOR_EVENT, cursor);
+            },
+        )
         .await
 }
 #[tauri::command]

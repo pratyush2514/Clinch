@@ -1,5 +1,5 @@
-import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
-import type { ContextStatus } from "../lib/ipc";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import type { AgentCursor, ContextStatus } from "../lib/ipc";
 
 /**
  * Human wording for the session badge. Pure so the headed/off-screen/
@@ -26,6 +26,131 @@ export function sessionBadgeLabel(
 }
 
 /**
+ * The `object-fit: contain` content box of a frame img: where the page's
+ * pixels actually land inside the element box. `object-position: top` (see
+ * styles.css) centers the horizontal axis and pins the top.
+ * Pure so the letterbox math is unit-testable.
+ */
+export function contentRect(
+  boxWidth: number,
+  boxHeight: number,
+  naturalWidth: number,
+  naturalHeight: number,
+): { x: number; y: number; width: number; height: number } {
+  const natW = naturalWidth > 0 ? naturalWidth : 16;
+  const natH = naturalHeight > 0 ? naturalHeight : 9;
+  const scale = Math.min(boxWidth / natW, boxHeight / natH);
+  const width = natW * scale;
+  const height = natH * scale;
+  return { x: (boxWidth - width) / 2, y: 0, width, height };
+}
+
+/**
+ * Maps an agent cursor (page CSS pixels) onto the rendered content box.
+ * Pure so the scaling math is unit-testable.
+ */
+export function cursorOffset(
+  cursor: Pick<AgentCursor, "x" | "y" | "viewport_width" | "viewport_height">,
+  rect: { x: number; y: number; width: number; height: number },
+): { left: number; top: number } {
+  return {
+    left: rect.x + (cursor.x / cursor.viewport_width) * rect.width,
+    top: rect.y + (cursor.y / cursor.viewport_height) * rect.height,
+  };
+}
+
+/**
+ * A frame img with the agent's pointer drawn over it: an SVG arrow gliding
+ * between positions, plus an expanding ripple on every press — the click
+ * made visible. `cursor` is `null` (hidden) whenever the card is not live:
+ * settled cards show only their frozen frame, never a pointer over a moment
+ * that already passed.
+ */
+function FrameWithCursor({
+  cursor,
+  src,
+  alt,
+}: {
+  cursor: AgentCursor | null;
+  src: string;
+  alt: string;
+}) {
+  const imgRef = useRef<HTMLImageElement>(null);
+  const [box, setBox] = useState({ w: 0, h: 0, natW: 0, natH: 0 });
+  const [ripples, setRipples] = useState<{ id: number; left: number; top: number }[]>([]);
+  const rippleId = useRef(0);
+  const lastRippled = useRef<AgentCursor | null>(null);
+
+  const measure = () => {
+    const el = imgRef.current;
+    if (!el) return;
+    const next = {
+      w: el.clientWidth,
+      h: el.clientHeight,
+      natW: el.naturalWidth,
+      natH: el.naturalHeight,
+    };
+    setBox(prev =>
+      prev.w === next.w && prev.h === next.h && prev.natW === next.natW && prev.natH === next.natH
+        ? prev
+        : next,
+    );
+  };
+
+  useEffect(() => {
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    const el = imgRef.current;
+    if (el) ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const rect = box.w > 0 ? contentRect(box.w, box.h, box.natW, box.natH) : null;
+  const pos = cursor && rect ? cursorOffset(cursor, rect) : null;
+
+  // A press lands one ripple that expands and fades. Guarded on the event
+  // identity so a resize re-render never re-ripples a stale press.
+  useEffect(() => {
+    if (!cursor || cursor.kind !== "press" || !rect) return;
+    if (lastRippled.current === cursor) return;
+    lastRippled.current = cursor;
+    const at = cursorOffset(cursor, rect);
+    const id = (rippleId.current += 1);
+    setRipples(current => [...current.slice(-4), { id, ...at }]);
+    const timer = setTimeout(() => setRipples(current => current.filter(r => r.id !== id)), 650);
+    return () => clearTimeout(timer);
+  }, [cursor, rect]);
+
+  return (
+    <div className="frame-wrap">
+      <img ref={imgRef} src={src} alt={alt} onLoad={measure} />
+      {pos && (
+        <div className="agent-cursor" style={{ left: pos.left, top: pos.top }} aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M5.5 3.2 19.2 11.4l-7.1 1.7-2.7 7.1z"
+              fill="#141414"
+              stroke="#ffffff"
+              strokeWidth="1.6"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </div>
+      )}
+      {ripples.map(r => (
+        <span
+          key={r.id}
+          className="cursor-ripple"
+          style={{ left: r.left, top: r.top }}
+          aria-hidden="true"
+        />
+      ))}
+    </div>
+  );
+}
+
+/**
  * The managed browser's viewport, inline in the thread.
  *
  * The live card belongs to whichever entry is running; once an entry settles it
@@ -45,6 +170,7 @@ export function sessionBadgeLabel(
 export default function ScreencastCard({
   frame,
   live,
+  cursor,
   headless,
   windowMode,
   busy,
@@ -57,6 +183,12 @@ export default function ScreencastCard({
 }: {
   frame: string | null;
   live: boolean;
+  /**
+   * The agent's synthetic pointer. Rendered only while `live` — the card
+   * gates on it again internally, so a settled card never shows a cursor
+   * over its frozen frame even if the caller forgets to null it.
+   */
+  cursor: AgentCursor | null;
   headless: boolean;
   /** Window mode behind `headless`: drives the badge wording only. */
   windowMode: ContextStatus["windowMode"];
@@ -99,7 +231,11 @@ export default function ScreencastCard({
       </div>
       {frame ? (
         <div className="browser-frame">
-          <img src={`data:image/jpeg;base64,${frame}`} alt="Managed Chromium viewport" />
+          <FrameWithCursor
+            cursor={live ? cursor : null}
+            src={`data:image/jpeg;base64,${frame}`}
+            alt="Managed Chromium viewport"
+          />
         </div>
       ) : (
         <p className="cast-empty">
@@ -158,7 +294,8 @@ export default function ScreencastCard({
         </div>
         <div className="preview-viewport">
           {frame && (
-            <img
+            <FrameWithCursor
+              cursor={live ? cursor : null}
               src={`data:image/jpeg;base64,${frame}`}
               alt={
                 live

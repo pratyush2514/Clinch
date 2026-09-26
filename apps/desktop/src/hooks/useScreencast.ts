@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { SCREENCAST_EVENT, type ContextStatus, type ScreencastFrame } from "../lib/ipc";
+import { SCREENCAST_EVENT, CURSOR_EVENT, type AgentCursor, type ContextStatus, type ScreencastFrame } from "../lib/ipc";
 import { message } from "../lib/errors";
 
 const DORMANT: ContextStatus = { attached: false, headless: true, windowMode: "headless" };
@@ -19,6 +19,13 @@ type Screencast = {
   status: ContextStatus;
   /** Latest JPEG frame as base64, or `null` before the first one arrives. */
   frame: string | null;
+  /**
+   * The agent's synthetic pointer position, or `null` when it has nothing to
+   * show. Follows the same session latch as frames: positions from a
+   * previous session, or arriving before this session's first frame, are
+   * dropped at the handler.
+   */
+  cursor: AgentCursor | null;
   busy: boolean;
   /** Attach the background context if it is not already live. Throws on failure. */
   ensure: () => Promise<void>;
@@ -29,6 +36,7 @@ type Screencast = {
 export function useScreencast(ready: boolean, report: (text: string) => void): Screencast {
   const [status, setStatus] = useState<ContextStatus>(DORMANT);
   const [frame, setFrame] = useState<string | null>(null);
+  const [cursor, setCursor] = useState<AgentCursor | null>(null);
   const [busy, setBusy] = useState(false);
   // Mirrors `status.attached` so `ensure` can read it without being rebuilt on
   // every status change (and without re-arming the thread's callbacks).
@@ -109,13 +117,43 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
     };
   }, []);
 
+  // The agent's pointer: one lightweight event per synthetic input dispatch
+  // (move/press/release), not tied to frame paints. Gated on the same
+  // session latch as frames — a cursor without its stream must never render.
+  useEffect(() => {
+    let live = true;
+    let unlisten: UnlistenFn | undefined;
+    listen<AgentCursor>(CURSOR_EVENT, event => {
+      if (!attached.current) return;
+      // The frame stream latches the session first: a cursor arriving before
+      // any frame of this session, or carried over from a previous one
+      // (including the backend's -1 sentinel), is dropped here.
+      if (sessionId.current === null) return;
+      if (event.payload.session_id !== sessionId.current) return;
+      setCursor(event.payload);
+    })
+      .then(stop => {
+        if (live) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {
+        /* Without the event bus the thread still runs; it just shows no cursor. */
+      });
+    return () => {
+      live = false;
+      unlisten?.();
+    };
+  }, []);
+
   const ensure = useCallback(async () => {
     if (attached.current) return;
     const next = await invoke<ContextStatus>("acquire_browser_context");
     attached.current = next.attached;
     // A fresh attach starts a fresh session: the latch must not carry the
-    // previous session's id into the new stream.
+    // previous session's id into the new stream, and any lingering cursor
+    // belongs to that old session.
     sessionId.current = null;
+    setCursor(null);
     setStatus(next);
   }, []);
 
@@ -153,6 +191,7 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
       if (pending !== null) cancelAnimationFrame(pending);
       sessionId.current = null;
       setFrame(null);
+      setCursor(null);
       report("Background browser released — no Chrome process remains.");
     } catch (error) {
       report(message(error));
@@ -161,5 +200,5 @@ export function useScreencast(ready: boolean, report: (text: string) => void): S
     }
   }, [report]);
 
-  return { status, frame, busy, ensure, takeControl, release };
+  return { status, frame, cursor, busy, ensure, takeControl, release };
 }

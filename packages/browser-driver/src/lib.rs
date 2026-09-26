@@ -2,6 +2,7 @@
 //! One managed, isolated Chromium child; native CDP only.
 pub mod a11y;
 mod actions;
+mod cursor;
 #[cfg(windows)]
 mod offscreen;
 mod picker;
@@ -29,6 +30,9 @@ use chromiumoxide::{
     },
     cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
 };
+pub use cursor::{
+    CursorEmitter, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, NO_CURSOR_SESSION,
+};
 use futures::StreamExt;
 pub use picker::{
     PICKER_BINDING, PickedElement, PickerRect, parse_binding_payload, rank_selectors_from_attrs,
@@ -38,7 +42,15 @@ pub use screencast::{SCREENCAST_JPEG_QUALITY, ScreencastFrame};
 pub use session::{AuthSignal, AuthState, ChallengeKind, detect_auth_signal, href_from_attributes};
 use session_sync::{Cookie, CookieSameSite};
 pub use som::Mark;
-use std::{path::Path, process::Stdio, sync::Mutex, time::Duration};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     process::{Child, Command},
     task::JoinHandle,
@@ -288,6 +300,14 @@ pub struct ManagedBrowser {
     /// runs. `None` means legacy strict confinement against the call's
     /// requested origin.
     anchored_portal: Mutex<Option<Url>>,
+    /// UI cursor-event sink, installed by the service layer while the
+    /// screencast pump runs. `None` means no overlay is listening: input
+    /// dispatches normally, only the cursor stays invisible.
+    cursor_emitter: Mutex<Option<CursorEmitter>>,
+    /// Last CDP screencast session id observed by the frame pump
+    /// ([`NO_CURSOR_SESSION`] before the first frame). Cursor events carry
+    /// it so the UI can apply the same stale-session filter as frames.
+    cursor_session: AtomicI64,
 }
 
 impl ManagedBrowser {
@@ -492,6 +512,8 @@ impl ManagedBrowser {
             // Deliberately unset: the starting tab's incidental origin must
             // never confine later runs — only intentional navigation anchors.
             anchored_portal: Mutex::new(None),
+            cursor_emitter: Mutex::new(None),
+            cursor_session: AtomicI64::new(NO_CURSOR_SESSION),
         };
         let mut script = AddScriptToEvaluateOnNewDocumentParams::new(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
@@ -519,6 +541,33 @@ impl ManagedBrowser {
     /// The launch window mode.
     pub fn window_mode(&self) -> WindowMode {
         self.mode
+    }
+
+    /// Attach (or clear, with `None`) the UI cursor-event sink. The service
+    /// layer installs it when the screencast pump starts and clears it on
+    /// release, so a later session never inherits a stale emitter.
+    pub fn set_cursor_emitter(&self, emitter: Option<CursorEmitter>) {
+        if let Ok(mut guard) = self.cursor_emitter.lock() {
+            *guard = emitter;
+        }
+    }
+
+    /// Record the CDP screencast session id observed by the frame pump.
+    /// Cursor events carry it so the UI can apply the same stale-session
+    /// filter it uses for frames.
+    pub fn note_screencast_session(&self, session_id: i64) {
+        self.cursor_session.store(session_id, Ordering::Relaxed);
+    }
+
+    /// Forward one cursor position to the UI overlay, if a sink is attached.
+    /// Best-effort and synchronous: a missing or poisoned sink only means no
+    /// cursor event — input dispatch itself is never affected.
+    fn emit_cursor(&self, event: CursorEvent) {
+        if let Ok(guard) = self.cursor_emitter.lock()
+            && let Some(emit) = guard.as_ref()
+        {
+            emit(event);
+        }
     }
 
     /// Whether the session shows no *visible* window. Off-screen headed
@@ -574,6 +623,18 @@ impl ManagedBrowser {
         }
         self.shutdown().await?;
         let managed = Self::launch_with_options(executable, profile, options).await?;
+        // Carry the cursor sink across the restart so the overlay keeps
+        // working mid-run; the screencast session id resets because the new
+        // process will produce a new one (until the pump notes it, the UI
+        // drops cursor events through its session latch — exactly right).
+        if let Ok(guard) = self.cursor_emitter.lock()
+            && let Some(emitter) = guard.as_ref()
+        {
+            managed.set_cursor_emitter(Some(emitter.clone()));
+        }
+        managed
+            .cursor_session
+            .store(NO_CURSOR_SESSION, Ordering::Relaxed);
         tokio::time::timeout(IO_TIMEOUT, managed.browser.set_cookies(params))
             .await
             .map_err(|_| BrowserError::Timeout)?

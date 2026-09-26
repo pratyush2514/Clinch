@@ -5,7 +5,7 @@ import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
 import ShortcutCard from "./ShortcutCard";
 import { TIER_LABELS, type OutputChip, type ThreadEntry } from "../lib/thread";
-import type { ContextStatus } from "../lib/ipc";
+import type { AgentCursor, ContextStatus } from "../lib/ipc";
 import { needsSession, isPursuitMiss } from "../lib/errors";
 
 const STATUS_WORDS: Record<ThreadEntry["status"], string> = {
@@ -25,6 +25,7 @@ export default function ActionCard({
   entry,
   live,
   liveFrame,
+  agentCursor,
   headless,
   windowMode,
   browserBusy,
@@ -45,6 +46,8 @@ export default function ActionCard({
   /** Whether this is the entry the managed browser is currently working for. */
   live: boolean;
   liveFrame: string | null;
+  /** The agent's live pointer; shown only while this card is the live one. */
+  agentCursor: AgentCursor | null;
   headless: boolean;
   windowMode: ContextStatus["windowMode"];
   browserBusy: boolean;
@@ -79,6 +82,7 @@ export default function ActionCard({
         <ScreencastCard
           frame={frame}
           live={live}
+          cursor={live ? agentCursor : null}
           headless={headless}
           windowMode={windowMode}
           busy={browserBusy}

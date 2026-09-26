@@ -115,6 +115,7 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
     <ActionThread
       entries={entries}
       liveFrame={null}
+      agentCursor={null}
       headless
       windowMode="headless"
       browserBusy={false}

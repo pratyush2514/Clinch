@@ -121,6 +121,11 @@ pub struct ContextStatus {
 /// Tauri event carrying one base64 JPEG viewport frame to the preview card.
 pub const SCREENCAST_EVENT: &str = "browser-screencast-frame";
 
+/// Tauri event carrying one agent cursor position to the preview card, so
+/// the UI can render a visible pointer over the cursorless screencast
+/// frames. Payload is [`browser_driver::CursorEvent`].
+pub const CURSOR_EVENT: &str = "browser-cursor-moved";
+
 /// Why a managed-browser handle is being acquired.
 ///
 /// The window-visibility contract lives in this type rather than in a bare
@@ -5697,8 +5702,13 @@ impl AppService {
     pub async fn acquire_context(
         &self,
         emit: impl Fn(browser_driver::ScreencastFrame) + Send + 'static,
+        emit_cursor: impl Fn(browser_driver::CursorEvent) + Send + Sync + 'static,
     ) -> Result<ContextStatus, AppError> {
         let browser = self.browser(BrowserIntent::Background).await?;
+        // The cursor sink lives on the browser so input dispatch deep in the
+        // action engine can reach the UI; it is replaced on every acquire
+        // and cleared on release, so a later session never inherits it.
+        browser.set_cursor_emitter(Some(std::sync::Arc::new(emit_cursor)));
         // Subscribe before starting: the opening frames are lost to an
         // unregistered listener otherwise.
         let mut frames = browser
@@ -5716,6 +5726,10 @@ impl AppService {
             let forwarding = browser.clone();
             *pump = Some(tokio::spawn(async move {
                 while let Some(event) = frames.next().await {
+                    // Latch the session for the cursor filter before the frame
+                    // goes out: any cursor the agent emits from here on is
+                    // attributable to this stream.
+                    forwarding.note_screencast_session(event.session_id);
                     let frame = browser_driver::ScreencastFrame {
                         data: String::from(event.data.clone()),
                         session_id: event.session_id,
@@ -5745,6 +5759,9 @@ impl AppService {
         }
         let browser = self.browser.lock().map_err(|_| AppError::Internal)?.take();
         if let Some(browser) = browser {
+            // Drop the cursor sink first: no input dispatch after this point
+            // may address the UI, and the next acquire installs a fresh one.
+            browser.set_cursor_emitter(None);
             let _ = browser.stop_screencast().await;
             browser
                 .shutdown()
@@ -6392,7 +6409,7 @@ pub(crate) mod tests {
         // clean no-op.
         let _chromium = ChromiumEnvGuard::hold_bogus();
         assert!(matches!(
-            service.acquire_context(|_| {}).await,
+            service.acquire_context(|_| {}, |_| {}).await,
             Err(AppError::BrowserUnavailable)
         ));
         assert!(!service.context_status().map_err(|_| "status")?.attached);

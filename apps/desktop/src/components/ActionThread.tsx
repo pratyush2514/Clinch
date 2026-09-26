@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import ActionCard from "./ActionCard";
 import { activeEntry, type OutputChip, type ThreadEntry } from "../lib/thread";
-import type { ContextStatus } from "../lib/ipc";
+import type { AgentCursor, ContextStatus } from "../lib/ipc";
 
 /**
  * The whole workspace: one vertical thread of turns in the order they happened.
@@ -14,6 +14,7 @@ import type { ContextStatus } from "../lib/ipc";
 export default function ActionThread({
   entries,
   liveFrame,
+  agentCursor,
   headless,
   windowMode,
   browserBusy,
@@ -32,6 +33,8 @@ export default function ActionThread({
 }: {
   entries: ThreadEntry[];
   liveFrame: string | null;
+  /** The agent's live pointer; rendered only on the running entry's card. */
+  agentCursor: AgentCursor | null;
   headless: boolean;
   windowMode: ContextStatus["windowMode"];
   browserBusy: boolean;
@@ -88,6 +91,7 @@ export default function ActionThread({
               entry={entry}
               live={live?.id === entry.id}
               liveFrame={liveFrame}
+              agentCursor={agentCursor}
               headless={headless}
               windowMode={windowMode}
               browserBusy={browserBusy}

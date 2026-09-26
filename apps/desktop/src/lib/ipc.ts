@@ -8,12 +8,15 @@
  * `rename_all`, so its second field stays `session_id` on the wire.
  *
  * Progress and approvals never travel on the global event bus — they stream
- * over a `tauri::ipc::Channel` handed to the command as an argument. The one
- * global event is the screencast frame pump.
+ * over a `tauri::ipc::Channel` handed to the command as an argument. The
+ * global events are the screencast frame pump and the agent cursor positions.
  */
 
 /** The only global Tauri event the backend emits. */
 export const SCREENCAST_EVENT = "browser-screencast-frame";
+
+/** The agent's synthetic pointer position, emitted per input dispatch. */
+export const CURSOR_EVENT = "browser-cursor-moved";
 
 /** Notifies sibling views that the saved-playbook list changed. */
 export const PLAYBOOKS_CHANGED = "clinch:playbooks-changed";
@@ -36,6 +39,22 @@ export type ContextStatus = { attached: boolean; headless: boolean; windowMode: 
 
 /** No `rename_all` on the Rust struct, so the id stays snake_case. */
 export type ScreencastFrame = { data: string; session_id: number };
+
+/**
+ * One synthetic pointer position from the agent's trusted-input dispatch.
+ * Coordinates are page CSS pixels relative to the viewport origin;
+ * `viewport_width`/`viewport_height` name that space, and `session_id`
+ * matches the screencast frame latch (the backend sends -1 before the first
+ * frame, which the hook drops like a stale session).
+ */
+export type AgentCursor = {
+  x: number;
+  y: number;
+  kind: "move" | "press" | "release";
+  viewport_width: number;
+  viewport_height: number;
+  session_id: number;
+};
 
 type Highlight = {
   selector: string;

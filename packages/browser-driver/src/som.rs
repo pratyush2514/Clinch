@@ -6,12 +6,15 @@
 //! injected script creates its own overlay layer and never queries page
 //! markup: no tag names, class names, or pattern matching appear here.
 
-use crate::{BrowserError, IO_TIMEOUT, ManagedBrowser};
+use crate::{
+    BrowserError, CursorEvent, CursorEventKind, FALLBACK_VIEWPORT, IO_TIMEOUT, ManagedBrowser,
+};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 /// Upper bound on badges per overlay; matches the AX snapshot cap so one
 /// snapshot always fits one overlay.
@@ -162,11 +165,30 @@ impl ManagedBrowser {
     pub async fn click_mark(&self, mark: &Mark) -> Result<(), BrowserError> {
         mark.validate()?;
         let (x, y) = mark.click_point();
-        for event in click_event_sequence(x, y)? {
+        // The live layout viewport is the exact coordinate space of the CDP
+        // input events below; fall back to the launch size if the query fails.
+        let viewport = self.viewport_size().await.unwrap_or(FALLBACK_VIEWPORT);
+        // Zip the human-like phases onto the CDP events so the cursor overlay
+        // shows exactly what the page just received, in order.
+        let phases = [
+            CursorEventKind::Move,
+            CursorEventKind::Press,
+            CursorEventKind::Release,
+        ];
+        for (event, kind) in click_event_sequence(x, y)?.into_iter().zip(phases) {
             tokio::time::timeout(IO_TIMEOUT, self.page.execute(event))
                 .await
                 .map_err(|_| BrowserError::Timeout)?
                 .map_err(|_| BrowserError::Connection)?;
+            // Emit only after the dispatch succeeded: the cursor marks where
+            // input actually landed, never where it was merely aimed.
+            self.emit_cursor(CursorEvent::new(
+                kind,
+                x,
+                y,
+                viewport,
+                self.cursor_session.load(Ordering::Relaxed),
+            ));
         }
         Ok(())
     }
