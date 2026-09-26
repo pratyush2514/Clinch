@@ -79,6 +79,70 @@ const STDERR_TAIL_BYTES: u64 = 4096;
 fn log_launch_stage(stage: &str, detail: &dyn std::fmt::Debug) {
     eprintln!("[clinch:browser] launch failed at stage={stage}: {detail:?}");
 }
+
+/// Allocate a free loopback TCP port for Chromium's remote-debugging server.
+///
+/// Binds `127.0.0.1:0` and returns the assigned port, closing the listener
+/// immediately. The caller hands the port to Chromium's
+/// `--remote-debugging-port` promptly, before anything else can claim it.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if the loopback bind fails.
+pub fn pick_free_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Probe a Chromium `DevTools` HTTP endpoint and return the browser WebSocket URL.
+///
+/// Issues `GET /json/version` over plain HTTP/1.1 and extracts
+/// `webSocketDebuggerUrl` from the JSON body. Returns `None` while the
+/// server is still starting, when the status is not 200, or when the body
+/// is not the expected JSON — the caller polls until the server is ready.
+pub async fn probe_devtools_http(port: u16) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    let Ok(Ok(mut stream)) = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    else {
+        return None;
+    };
+    let request = format!(
+        "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    match tokio::time::timeout(PROBE_TIMEOUT, stream.write_all(request.as_bytes())).await {
+        Ok(Ok(())) => {}
+        _ => return None,
+    }
+    // The version document is a few hundred bytes; 64 KiB is a generous
+    // bound. `Connection: close` ends the response with EOF.
+    let mut raw = Vec::new();
+    {
+        let mut limited = stream.take(64 * 1024);
+        if tokio::time::timeout(PROBE_TIMEOUT, limited.read_to_end(&mut raw))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+    let text = String::from_utf8(raw).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let status = head.lines().next().unwrap_or("");
+    if !status.starts_with("HTTP/1.0 200") && !status.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
 /// Grace period for orderly Chromium shutdown (Browser.close, then process
 /// wait) before falling back to killing the child.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -318,18 +382,25 @@ pub struct ManagedBrowser {
 }
 
 impl ManagedBrowser {
-    /// Spawn Chromium and wait for its `DevTools` endpoint file.
+    /// Spawn Chromium and wait for its `DevTools` HTTP server to answer.
     ///
     /// Chromium's stderr is captured to a per-attempt temp file: a failed
     /// launch must leave diagnostics behind instead of failing silent.
     /// The file is removed best-effort on success; on timeout the tail is
     /// logged (a slow crash looks identical to a slow start from the
     /// outside) and the child is reaped by `kill_on_drop` on drop.
+    ///
+    /// The debugging port is allocated by us (a free loopback port) rather
+    /// than `--remote-debugging-port=0`: on some Linux builds Chrome binds
+    /// the ephemeral port but its `DevTools` HTTP server never answers
+    /// (observed on Chrome 154 + Xvfb + WSL2 — the `DevToolsActivePort`
+    /// file is written, `ss` shows LISTEN, `/json/version` stays mute).
+    /// Readiness is confirmed over HTTP (`/json/version` yields the exact
+    /// `webSocketDebuggerUrl`), which also removes the file-vs-bind race.
     async fn spawn_and_wait_endpoint(
         executable: &Path,
         profile: &Path,
         options: LaunchOptions,
-        endpoint_file: &Path,
     ) -> Result<(Child, String), BrowserError> {
         let stderr_path = std::env::temp_dir().join(format!(
             "clinch-chromium-{}.log",
@@ -341,10 +412,15 @@ impl ManagedBrowser {
             log_launch_stage("stderr_capture_create", &error);
             BrowserError::Launch
         })?;
+        let debug_port = pick_free_port().map_err(|error| {
+            log_launch_stage("debug_port_alloc", &error);
+            let _ = std::fs::remove_file(&stderr_path);
+            BrowserError::Launch
+        })?;
         let mut command = Command::new(executable);
         command
+            .arg(format!("--remote-debugging-port={debug_port}"))
             .args([
-                "--remote-debugging-port=0",
                 "--remote-debugging-address=127.0.0.1",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -370,15 +446,8 @@ impl ManagedBrowser {
         })?;
         let endpoint = tokio::time::timeout(ENDPOINT_TIMEOUT, async {
             loop {
-                if let Ok(contents) = tokio::fs::read_to_string(&endpoint_file).await {
-                    let mut lines = contents.lines();
-                    if let (Some(port), Some(path)) = (lines.next(), lines.next())
-                        && let Ok(port) = port.parse::<u16>()
-                        && port != 0
-                        && path.starts_with("/devtools/browser/")
-                    {
-                        return format!("ws://127.0.0.1:{port}{path}");
-                    }
+                if let Some(ws_url) = probe_devtools_http(debug_port).await {
+                    return ws_url;
                 }
                 tokio::time::sleep(Duration::from_millis(ENDPOINT_POLL_MS)).await;
             }
@@ -439,16 +508,6 @@ impl ManagedBrowser {
             log_launch_stage("profile_dir_create", &error);
             BrowserError::Launch
         })?;
-        // Stale endpoint files must not connect us to an unrelated earlier process.
-        let endpoint_file = profile.join("DevToolsActivePort");
-        match tokio::fs::remove_file(&endpoint_file).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                log_launch_stage("stale_endpoint_remove", &error);
-                return Err(BrowserError::Launch);
-            }
-        }
         // Cold-start retry: the first attempt may time out while Windows
         // finishes a cold launch (Defender rescan, cold cache, profile
         // init after a force-killed predecessor). The timed-out child is
@@ -456,8 +515,7 @@ impl ManagedBrowser {
         let mut attempt = 0;
         let (child, endpoint) = loop {
             attempt += 1;
-            match Self::spawn_and_wait_endpoint(executable, profile, options, &endpoint_file).await
-            {
+            match Self::spawn_and_wait_endpoint(executable, profile, options).await {
                 Ok(launched) => break launched,
                 Err(BrowserError::Timeout) if attempt < ENDPOINT_ATTEMPTS => {
                     eprintln!(
