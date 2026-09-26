@@ -1,4 +1,29 @@
 import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import type { ContextStatus } from "../lib/ipc";
+
+/**
+ * Human wording for the session badge. Pure so the headed/off-screen/
+ * headless distinction is unit-testable: an off-screen headed session
+ * must never be labeled "headless" — it owns real windows, just none the
+ * user can see.
+ */
+export function sessionBadgeLabel(
+  live: boolean,
+  windowMode: ContextStatus["windowMode"],
+  finalFrameCaptured: boolean | null,
+): string {
+  if (!live) {
+    return finalFrameCaptured === false ? "last live frame" : "final frame";
+  }
+  switch (windowMode) {
+    case "offscreen":
+      return "live · off-screen headed session";
+    case "headed":
+      return "live · headful, direct control";
+    default:
+      return "live · headless background session";
+  }
+}
 
 /**
  * The managed browser's viewport, inline in the thread.
@@ -21,6 +46,7 @@ export default function ScreencastCard({
   frame,
   live,
   headless,
+  windowMode,
   busy,
   finalUrl,
   pageTitle,
@@ -32,6 +58,8 @@ export default function ScreencastCard({
   frame: string | null;
   live: boolean;
   headless: boolean;
+  /** Window mode behind `headless`: drives the badge wording only. */
+  windowMode: ContextStatus["windowMode"];
   busy: boolean;
   finalUrl: string | null;
   pageTitle: string | null;
@@ -66,13 +94,7 @@ export default function ScreencastCard({
       <div className="cast-head">
         <span className="eyebrow">MANAGED CHROMIUM</span>
         <span className="cast-state">
-          {live
-            ? headless
-              ? "live · headless background session"
-              : "live · headful, direct control"
-            : finalFrameCaptured === false
-              ? "last live frame"
-              : "final frame"}
+          {sessionBadgeLabel(live, windowMode, finalFrameCaptured)}
         </span>
       </div>
       {frame ? (

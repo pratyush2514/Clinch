@@ -113,39 +113,61 @@ impl ManagedBrowser {
     pub async fn clear_marks(&self) -> Result<(), BrowserError> {
         self.show_marks(&[]).await
     }
+}
 
-    /// Click the center of `mark` with a real press/release pair.
+/// Trusted-input click sequence for one press at `(x, y)`: hover first so
+/// the target sees the same `mousemove → mousedown → mouseup` ordering a
+/// human produces, then press and release the left button. Some pages only
+/// arm their handlers on hover (React synthetic events, `:hover`-gated
+/// menus), so a press without a preceding move can land on a control that
+/// never "sees" the pointer. Pure so the ordering and geometry are
+/// hermetically testable; [`ManagedBrowser::click_mark`] only executes what
+/// this builds.
+///
+/// # Errors
+/// Returns [`BrowserError::InvalidAction`] when the CDP params fail to build.
+pub fn click_event_sequence(x: f64, y: f64) -> Result<[DispatchMouseEventParams; 3], BrowserError> {
+    let hover = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseMoved)
+        .x(x)
+        .y(y)
+        .build()
+        .map_err(|_| BrowserError::InvalidAction)?;
+    let press = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MousePressed)
+        .x(x)
+        .y(y)
+        .button(MouseButton::Left)
+        .buttons(1)
+        .click_count(1)
+        .build()
+        .map_err(|_| BrowserError::InvalidAction)?;
+    let release = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseReleased)
+        .x(x)
+        .y(y)
+        .button(MouseButton::Left)
+        .buttons(0)
+        .build()
+        .map_err(|_| BrowserError::InvalidAction)?;
+    Ok([hover, press, release])
+}
+
+impl ManagedBrowser {
+    /// Click the center of `mark` with a human-like hover → press → release
+    /// through trusted CDP input events (never a synthetic DOM click).
     ///
     /// # Errors
     /// Returns [`BrowserError`] on invalid geometry, CDP failure, or timeout.
     pub async fn click_mark(&self, mark: &Mark) -> Result<(), BrowserError> {
         mark.validate()?;
         let (x, y) = mark.click_point();
-        let press = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MousePressed)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .buttons(1)
-            .click_count(1)
-            .build()
-            .map_err(|_| BrowserError::InvalidAction)?;
-        let release = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MouseReleased)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .buttons(0)
-            .build()
-            .map_err(|_| BrowserError::InvalidAction)?;
-        tokio::time::timeout(IO_TIMEOUT, self.page.execute(press))
-            .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
-        tokio::time::timeout(IO_TIMEOUT, self.page.execute(release))
-            .await
-            .map_err(|_| BrowserError::Timeout)?
-            .map_err(|_| BrowserError::Connection)?;
+        for event in click_event_sequence(x, y)? {
+            tokio::time::timeout(IO_TIMEOUT, self.page.execute(event))
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|_| BrowserError::Connection)?;
+        }
         Ok(())
     }
 

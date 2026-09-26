@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import ActionCard from "./ActionCard";
 import { activeEntry, type OutputChip, type ThreadEntry } from "../lib/thread";
+import type { ContextStatus } from "../lib/ipc";
 
 /**
  * The whole workspace: one vertical thread of turns in the order they happened.
@@ -14,6 +15,7 @@ export default function ActionThread({
   entries,
   liveFrame,
   headless,
+  windowMode,
   browserBusy,
   onDecide,
   onRename,
@@ -31,6 +33,7 @@ export default function ActionThread({
   entries: ThreadEntry[];
   liveFrame: string | null;
   headless: boolean;
+  windowMode: ContextStatus["windowMode"];
   browserBusy: boolean;
   onDecide: (entryId: string, approved: boolean) => void;
   onRename: (entryId: string, saveName: string) => void;
@@ -86,6 +89,7 @@ export default function ActionThread({
               live={live?.id === entry.id}
               liveFrame={liveFrame}
               headless={headless}
+              windowMode={windowMode}
               browserBusy={browserBusy}
               onDecide={approved => onDecide(entry.id, approved)}
               onRename={saveName => onRename(entry.id, saveName)}

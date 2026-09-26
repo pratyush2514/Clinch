@@ -13,7 +13,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { SCREENCAST_EVENT, type ContextStatus, type ScreencastFrame } from "../lib/ipc";
 import { message } from "../lib/errors";
 
-const DORMANT: ContextStatus = { attached: false, headless: true };
+const DORMANT: ContextStatus = { attached: false, headless: true, windowMode: "headless" };
 
 type Screencast = {
   status: ContextStatus;

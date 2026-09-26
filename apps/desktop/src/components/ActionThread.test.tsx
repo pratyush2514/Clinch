@@ -116,6 +116,7 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
       entries={entries}
       liveFrame={null}
       headless
+      windowMode="headless"
       browserBusy={false}
       onDecide={vi.fn()}
       onRename={vi.fn()}

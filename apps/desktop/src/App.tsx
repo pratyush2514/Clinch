@@ -130,6 +130,7 @@ export default function App() {
         entries={thread.entries}
         liveFrame={screencast.frame}
         headless={screencast.status.headless}
+        windowMode={screencast.status.windowMode}
         browserBusy={screencast.busy}
         onDecide={(id, approved) => void thread.decide(id, approved)}
         onRename={thread.rename}

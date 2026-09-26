@@ -32,7 +32,7 @@ export type SessionStatus =
 /** Portal address plus a `ReauthReason`; never a secret. */
 export type AuthPanelState = { portal: string; reason: string };
 
-export type ContextStatus = { attached: boolean; headless: boolean };
+export type ContextStatus = { attached: boolean; headless: boolean; windowMode: "headed" | "headless" | "offscreen" };
 
 /** No `rename_all` on the Rust struct, so the id stays snake_case. */
 export type ScreencastFrame = { data: string; session_id: number };

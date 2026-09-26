@@ -5,6 +5,7 @@ import ScreencastCard from "./ScreencastCard";
 import SentinelGate from "./SentinelGate";
 import ShortcutCard from "./ShortcutCard";
 import { TIER_LABELS, type OutputChip, type ThreadEntry } from "../lib/thread";
+import type { ContextStatus } from "../lib/ipc";
 import { needsSession, isPursuitMiss } from "../lib/errors";
 
 const STATUS_WORDS: Record<ThreadEntry["status"], string> = {
@@ -25,6 +26,7 @@ export default function ActionCard({
   live,
   liveFrame,
   headless,
+  windowMode,
   browserBusy,
   onDecide,
   onRename,
@@ -44,6 +46,7 @@ export default function ActionCard({
   live: boolean;
   liveFrame: string | null;
   headless: boolean;
+  windowMode: ContextStatus["windowMode"];
   browserBusy: boolean;
   onDecide: (approved: boolean) => void;
   onRename: (saveName: string) => void;
@@ -77,6 +80,7 @@ export default function ActionCard({
           frame={frame}
           live={live}
           headless={headless}
+          windowMode={windowMode}
           busy={browserBusy}
           finalUrl={entry.finalUrl}
           pageTitle={entry.pageTitle}

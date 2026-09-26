@@ -111,6 +111,11 @@ pub struct ContextStatus {
     attached: bool,
     /// The attached session runs without an OS window.
     headless: bool,
+    /// How the attached session's window runs. Distinct from `headless`
+    /// above: off-screen headed owns real windows (positioned off-monitor
+    /// and OS-hidden), so the UI badge can say "headed" honestly while
+    /// the no-visible-window gates keep using `headless`.
+    window_mode: browser_driver::WindowMode,
 }
 
 /// Tauri event carrying one base64 JPEG viewport frame to the preview card.
@@ -123,8 +128,10 @@ pub const SCREENCAST_EVENT: &str = "browser-screencast-frame";
 /// window" is checkable by reading the argument instead of tracing a boolean.
 ///
 /// * [`Self::Background`] — dispatch lanes, playbook runs, task replay, and
-///   screencast acquisition. Launches `--headless=new`, and reuses whatever
-///   is attached as-is: after an L1 escalation the session may be
+///   screencast acquisition. Launches off-screen headed (a real Chromium
+///   compositor positioned off-monitor and OS-hidden: trusted input events
+///   for the action engine, no visible window), and reuses whatever is
+///   attached as-is: after an L1 escalation the session may be
 ///   off-screen headed, which still shows no visible window.
 /// * [`Self::Interactive`] — only actions the user asked for by name:
 ///   manual login, in-app re-authentication, source-profile and bridge sync
@@ -141,8 +148,8 @@ enum BrowserIntent {
 }
 
 impl BrowserIntent {
-    /// Launch options for a fresh process. Background launches headless by
-    /// construction: no code path can launch it any other way.
+    /// Launch options for a fresh process. Background launches off-screen
+    /// headed by construction: no code path can launch it any other way.
     fn launch_options(self) -> LaunchOptions {
         match self {
             Self::Interactive => LaunchOptions::interactive(),
@@ -5408,10 +5415,12 @@ impl AppService {
             Some(browser) => ContextStatus {
                 attached: true,
                 headless: browser.is_headless(),
+                window_mode: browser.window_mode(),
             },
             None => ContextStatus {
                 attached: false,
                 headless: true,
+                window_mode: browser_driver::WindowMode::Headless,
             },
         })
     }
@@ -5720,6 +5729,7 @@ impl AppService {
         Ok(ContextStatus {
             attached: true,
             headless: browser.is_headless(),
+            window_mode: browser.window_mode(),
         })
     }
 
@@ -5774,6 +5784,7 @@ impl AppService {
         Ok(ContextStatus {
             attached: true,
             headless: browser.is_headless(),
+            window_mode: browser.window_mode(),
         })
     }
 

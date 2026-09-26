@@ -9,6 +9,7 @@ mod preview;
 mod screencast;
 mod session;
 mod som;
+pub use som::click_event_sequence;
 pub mod test_utils;
 pub use a11y::{
     AX_TARGET_RESYNC_LINE, AxElement, AxResyncCheck, interactive_elements,
@@ -98,7 +99,8 @@ pub enum BrowserError {
 }
 
 /// Window visibility for a managed Chromium launch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WindowMode {
     /// Visible headed window (interactive use).
     #[default]
