@@ -711,3 +711,123 @@ async fn main_verification_never_escalates() {
         "a verified main tail never escalates"
     );
 }
+
+// ---- phase 4: the bounded `LogOut` UI chain ----
+
+fn account_home_spec() -> &'static VerbSpec {
+    VerbSpec::for_kind(VerbKind::AccountHome)
+}
+
+/// `LogOut` gear 2 is a short pass, not the full hunt: eight proposed
+/// actions spend only three steps, then the honest miss comes back and
+/// the caller (the cookie fallback) takes over.
+#[tokio::test]
+async fn logout_model_pass_capped_at_three_steps() {
+    // Distinct names: the loop rejects re-picking an already-clicked
+    // control, so one shared name would decline instead of exhausting.
+    let tree: Vec<AxElement> = (1..=8)
+        .map(|id| button(id, &format!("logout loop action {id}")))
+        .collect();
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated);
+    let actions: Vec<Option<PageAction>> = (1..=8)
+        .map(|id| Some(PageAction::Click { target: id }))
+        .collect();
+    let navigator = Arc::new(ScriptNavigator::new(actions));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        navigator.clone(),
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    assert!(
+        diagnostic.contains("exhausted 3 steps"),
+        "diagnostic names the bounded budget: {diagnostic}"
+    );
+    assert_eq!(navigator.calls(), 3, "the logout model budget is 3 steps");
+    assert_eq!(
+        browser.clicks(),
+        vec![1, 2, 3],
+        "only the first three proposed actions executed"
+    );
+}
+
+/// Non-logout verbs are unaffected by the bound: the full eight-step
+/// budget still applies.
+#[tokio::test]
+async fn account_home_model_pass_keeps_eight_steps() {
+    // Neutral names: an "account"/"profile"-worded label would satisfy
+    // the identity verifier on its own, ending the pass early.
+    let tree: Vec<AxElement> = (1..=8)
+        .map(|id| button(id, &format!("home loop action {id}")))
+        .collect();
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated);
+    let actions: Vec<Option<PageAction>> = (1..=8)
+        .map(|id| Some(PageAction::Click { target: id }))
+        .collect();
+    let navigator = Arc::new(ScriptNavigator::new(actions));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "account home test goal",
+        navigator.clone(),
+        Some(account_home_spec()),
+        "deterministic: nothing found".to_owned(),
+        None,
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    assert!(
+        diagnostic.contains("exhausted 8 steps"),
+        "diagnostic names the full budget: {diagnostic}"
+    );
+    assert_eq!(navigator.calls(), 8, "non-logout verbs keep 8 steps");
+}
+
+/// The bounded `LogOut` chain runs exactly one model pass: even with an
+/// escalation navigator configured, no escalation pass runs — the
+/// cookie fallback is the deterministic backstop.
+#[tokio::test]
+async fn logout_model_pass_never_escalates() {
+    let tree: Vec<AxElement> = (1..=3)
+        .map(|id| button(id, &format!("logout loop action {id}")))
+        .collect();
+    let browser = LoopBrowser::new(tree, AuthState::Authenticated);
+    let main = Arc::new(ScriptNavigator::new(vec![None]));
+    let escalation_navigator = Arc::new(ScriptNavigator::new(vec![Some(PageAction::Click {
+        target: 1,
+    })]));
+    let result = pursue_with_model(
+        &browser,
+        &origin(),
+        "log out test goal",
+        main,
+        Some(logout_spec()),
+        "deterministic: nothing found".to_owned(),
+        Some(escalation_of(escalation_navigator.clone(), "big-model")),
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest miss, got {other:?}"),
+    };
+    assert!(
+        !diagnostic.contains("escalated to"),
+        "no escalation line in the logout journal: {diagnostic}"
+    );
+    assert_eq!(
+        escalation_navigator.calls(),
+        0,
+        "the bounded logout chain suppresses the escalation pass"
+    );
+}

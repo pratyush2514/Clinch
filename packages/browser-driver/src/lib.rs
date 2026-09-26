@@ -42,7 +42,7 @@ pub use preview::{DomRegion, Viewport};
 pub use screencast::{SCREENCAST_JPEG_QUALITY, ScreencastFrame};
 pub use session::{AuthSignal, AuthState, ChallengeKind, detect_auth_signal, href_from_attributes};
 use session_sync::{Cookie, CookieSameSite};
-pub use som::Mark;
+pub use som::{ClickHitTest, Mark};
 use std::{
     path::Path,
     process::Stdio,

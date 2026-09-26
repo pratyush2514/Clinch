@@ -80,6 +80,10 @@ footer .status { border-left: 0; background: transparent; padding: 14px 36px 0; 
 .preview-viewport .frame-wrap { width: 100%; }
 /* Synthetic pointer: glides between input positions, never intercepts clicks. */
 .agent-cursor { position: absolute; z-index: 5; pointer-events: none; transform: translate(-4px, -3px); transition: left 0.12s ease-out, top 0.12s ease-out; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45)); }
+/* Waypoint streams arrive ~18ms apart: a CSS transition would perpetually
+   chase the stream and read as lag, so streaming samples position raw.
+   Isolated placements keep the glide above. */
+.agent-cursor.cursor-streaming { transition: none; }
 /* One expanding ring per press: the click made visible. */
 .cursor-ripple { position: absolute; z-index: 5; width: 16px; height: 16px; margin: -8px 0 0 -8px; border: 2px solid rgba(37, 99, 235, 0.85); border-radius: 50%; pointer-events: none; animation: cursor-ping 0.6s ease-out forwards; }
 @keyframes cursor-ping { from { transform: scale(0.35); opacity: 1; } to { transform: scale(2.4); opacity: 0; } }

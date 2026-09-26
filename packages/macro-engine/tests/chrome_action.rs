@@ -18,13 +18,14 @@
 //! [`hermetic_classifier`] carry the safety argument.
 #![allow(unsafe_code)]
 
-use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight};
+use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, ClickHitTest, Highlight};
 use macro_engine::semantic::SemanticMatcher;
 use macro_engine::{
-    ChromeActionBrowser, ClickedControl, IntentError, MenuBrowser, PageGoalOutcome,
-    SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic, logout_header_candidates,
-    pursue_chrome_action, select_already_open_menu_target, select_revealed_action,
-    semantic_opener_winner, strong_openers,
+    ChromeActionBrowser, ClickedControl, IntentError, MenuBrowser, PageAction, PageGoalOutcome,
+    PageNavigator, SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic,
+    logout_header_candidates, pursue_chrome_action, pursue_verb_goal,
+    select_already_open_menu_target, select_revealed_action, semantic_opener_winner,
+    strong_openers,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -987,5 +988,121 @@ async fn gate_choice_is_clicked_even_when_ranking_prefers_another() {
         fake.clicks().await,
         vec![2],
         "the gate's chosen opener is clicked, not the ranking's favorite"
+    );
+}
+
+// ---- bounded `LogOut` UI chain (`pursue_verb_goal`) ----
+
+/// Navigator that always declines: gear 2 spends no acting steps and the
+/// chain hands straight to the fallback.
+struct DeclineNavigator;
+
+impl PageNavigator for DeclineNavigator {
+    fn next_action(&self, _goal: &str, _elements: &[AxElement]) -> Option<PageAction> {
+        None
+    }
+}
+
+/// The full bounded `LogOut` chain journals every handoff: gear-1 click →
+/// menu-open verify → the one opener retry → the short model pass → the
+/// cookie fallback. The tree is a single blank-named header button (the
+/// avatar stand-in); the menu never opens, so the chain runs to the
+/// honest fallback miss.
+#[tokio::test]
+async fn logout_bounded_chain_journals_every_handoff() {
+    hermetic_classifier();
+    let browser = FakeChromeActionBrowser::new(vec![el(1, "button", "", None)]);
+    let result = pursue_verb_goal(
+        &browser,
+        &origin(),
+        log_out_spec(),
+        Some(Arc::new(DeclineNavigator)),
+        None,
+    )
+    .await;
+    let diagnostic = match result {
+        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        other => panic!("expected the honest fallback miss, got {other:?}"),
+    };
+    for stage in [
+        "logout_ui_bounded: gear1_click -> menu_verify",
+        "logout_ui_bounded: menu_verify -> opener_retry",
+        "logout opener retry:",
+        "logout_ui_bounded: opener_retry -> model_pass",
+        "logout_ui_bounded: model_pass -> fallback",
+        "log_out: UI path missed; cleared 0 session cookies for example.com; verifier: still-unknown",
+    ] {
+        assert!(
+            diagnostic.contains(stage),
+            "missing chain stage '{stage}': {diagnostic}"
+        );
+    }
+    assert_eq!(
+        browser.clicks().await,
+        vec![1, 1],
+        "bounded: exactly the gear-1 click plus the one opener retry"
+    );
+}
+
+/// The `menu_click_reported` default (what scripted fakes get) clicks
+/// exactly like `menu_click` and journals nothing — only the production
+/// `ManagedBrowser` impl adds the hit-test line.
+#[tokio::test]
+async fn menu_click_reported_default_delegates_without_journal() {
+    let browser = FakeChromeActionBrowser::new(vec![el(1, "button", "avatar", None)]);
+    let mut tried = Vec::new();
+    let element = el(1, "button", "avatar", None);
+    if let Err(error) = browser.menu_click_reported(&element, &mut tried).await {
+        panic!("fake click succeeds, got {error:?}");
+    }
+    assert_eq!(browser.clicks().await, vec![1], "the click ran");
+    assert!(
+        tried.is_empty(),
+        "the default impl journals no hit-test line: {tried:?}"
+    );
+}
+
+/// The hit-test journal format at the call-site boundary: the
+/// browser-driver `ClickHitTest` built from a probe payload renders the
+/// spec'd `click_hit_test:` line, flagging a mismatch against the
+/// expected control.
+#[test]
+fn click_hit_test_journal_line_format() {
+    // The ad detour: the avatar click's point resolved to an ad's
+    // disclosure control instead.
+    let payload = serde_json::json!({
+        "tag": "DIV",
+        "role": "",
+        "name": "Learn More",
+    });
+    let hit = ClickHitTest::from_probe(100.0, 200.0, &payload);
+    assert!(hit.available);
+    let line = hit.journal_line("button", "Open user actions");
+    assert_eq!(
+        line,
+        "click_hit_test: (100, 200) -> DIV role=- name=\"Learn More\" \
+         MISMATCH(expected role=\"button\" name~=\"Open user actions\")",
+        "spec'd hit-test line with the mismatch flag"
+    );
+    // A genuine hit carries no mismatch flag: the role matches.
+    let genuine = serde_json::json!({
+        "tag": "BUTTON",
+        "role": "button",
+        "name": "Open user actions",
+    });
+    let genuine_hit = ClickHitTest::from_probe(1100.0, 40.0, &genuine);
+    let genuine_line = genuine_hit.journal_line("button", "avatar");
+    assert!(
+        !genuine_line.contains("MISMATCH"),
+        "a genuine hit carries no mismatch flag: {genuine_line}"
+    );
+    assert!(
+        genuine_line.starts_with("click_hit_test: (1100, 40) -> BUTTON"),
+        "spec'd hit-test prefix: {genuine_line}"
+    );
+    let unavailable = ClickHitTest::from_probe(10.0, 20.0, &serde_json::json!(null));
+    assert_eq!(
+        unavailable.journal_line("button", "Avatar"),
+        "click_hit_test: unavailable"
     );
 }

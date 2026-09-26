@@ -71,7 +71,12 @@ function FrameWithCursor({
   src,
   alt,
 }: {
-  cursor: AgentCursor | null;
+  /**
+   * May carry the screencast hook's local-only `streaming` hint: when true
+   * the sample is one waypoint of a rapid travel stream and the overlay
+   * positions it raw (no CSS transition); otherwise it keeps the glide.
+   */
+  cursor: (AgentCursor & { streaming?: boolean }) | null;
   src: string;
   alt: string;
 }) {
@@ -108,6 +113,10 @@ function FrameWithCursor({
 
   const rect = box.w > 0 ? contentRect(box.w, box.h, box.natW, box.natH) : null;
   const pos = cursor && rect ? cursorOffset(cursor, rect) : null;
+  // A waypoint stream positions the pointer directly: the CSS glide would
+  // perpetually chase the ~18ms samples and read as lag. Isolated
+  // placements keep the transition.
+  const streaming = cursor?.streaming === true;
 
   // A press lands one ripple that expands and fades. Guarded on the event
   // identity so a resize re-render never re-ripples a stale press.
@@ -126,7 +135,11 @@ function FrameWithCursor({
     <div className="frame-wrap">
       <img ref={imgRef} src={src} alt={alt} onLoad={measure} />
       {pos && (
-        <div className="agent-cursor" style={{ left: pos.left, top: pos.top }} aria-hidden="true">
+        <div
+          className={streaming ? "agent-cursor cursor-streaming" : "agent-cursor"}
+          style={{ left: pos.left, top: pos.top }}
+          aria-hidden="true"
+        >
           <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
             <path
               d="M5.5 3.2 19.2 11.4l-7.1 1.7-2.7 7.1z"
@@ -187,8 +200,12 @@ export default function ScreencastCard({
    * The agent's synthetic pointer. Rendered only while `live` — the card
    * gates on it again internally, so a settled card never shows a cursor
    * over its frozen frame even if the caller forgets to null it.
+   *
+   * May carry the screencast hook's local-only `streaming` hint (see
+   * `FrameWithCursor`): waypoint streams position raw, isolated placements
+   * glide.
    */
-  cursor: AgentCursor | null;
+  cursor: (AgentCursor & { streaming?: boolean }) | null;
   headless: boolean;
   /** Window mode behind `headless`: drives the badge wording only. */
   windowMode: ContextStatus["windowMode"];

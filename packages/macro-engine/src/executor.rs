@@ -989,6 +989,12 @@ const PAGE_GOAL_MAX_STEPS: usize = 3;
 /// hostile page still cannot burn the run.
 const MODEL_GOAL_MAX_STEPS: usize = 8;
 
+/// `LogOut`-only model budget: the `LogOut` UI attempt is a bounded chain
+/// (gear-1 click → menu-open verify → one opener retry → one short model
+/// pass → cookie fallback), so gear 2 gets a short pass instead of the
+/// full [`MODEL_GOAL_MAX_STEPS`] hunt. Other verbs keep 8.
+const LOGOUT_MODEL_MAX_STEPS: usize = 3;
+
 /// Actionable roles a follow-up can meaningfully click: links plus the
 /// controls menus are made of. Wider than [`select_search_result`]'s
 /// link-only contract on purpose — on a portal page the target often lives
@@ -1128,7 +1134,7 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
     // The UI attempt's miss journal, from gear 1 alone or both gears: it
     // rides along so the model phase — and the LogOut cookie fallback —
     // keep the full tried-click story.
-    let ui_miss = match navigator {
+    let (ui_miss, model_ran) = match navigator {
         Some(navigator) => {
             // The deterministic tried-log rides along as prompt context: without
             // it the model re-proposes (or fails to recognize) controls the
@@ -1151,16 +1157,26 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
             {
                 Ok(outcome) => return Ok(outcome),
                 Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
-                Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+                Err(IntentError::NoMatch(diagnostic)) => (diagnostic, true),
             }
         }
-        None => deterministic_miss,
+        None => (deterministic_miss, false),
     };
     // `LogOut`-only deterministic backstop: both UI gears failed to reach a
     // verified signed-out state. Clearing the managed profile's session
     // cookies ends the session without depending on the page's menu
     // cooperating; the verifier still decides COMPLETED.
     if spec.kind == VerbKind::LogOut {
+        // Final handoff of the bounded `LogOut` UI chain
+        // (gear1_click → menu_verify → opener_retry → model_pass →
+        // fallback). Journaled only when the model pass actually ran —
+        // with `navigator: None` there is no model_pass stage to hand off
+        // from.
+        let ui_miss = if model_ran {
+            format!("{ui_miss}; logout_ui_bounded: model_pass -> fallback")
+        } else {
+            ui_miss
+        };
         return logout_cookie_fallback(browser, origin, &ui_miss).await;
     }
     Err(IntentError::NoMatch(ui_miss))
@@ -1596,7 +1612,7 @@ async fn logout_opener_retry<B: ChromeActionBrowser>(
         .collect();
     let actionable_before = count_actionable(&elements);
     let raw_before = check.node_count;
-    browser.menu_click(candidate).await?;
+    browser.menu_click_reported(candidate, tried).await?;
     clicked.push(ClickedControl::of(candidate));
     *clicks_used += 1;
     let (after, check_after, _) = browser.menu_snapshot(origin).await;
@@ -1646,7 +1662,7 @@ async fn act_on_identity_target<B: ChromeActionBrowser>(
             .map(Some);
     }
     // No usable href: click the revealed control and watch the URL.
-    browser.menu_click(target).await?;
+    browser.menu_click_reported(target, tried).await?;
     clicked.push(ClickedControl::of(target));
     *clicks_used += 1;
     tried.push(tried_label(target, "clicked, watching URL"));
@@ -1685,7 +1701,7 @@ async fn act_on_path_tokens_target<B: ChromeActionBrowser>(
         )));
     };
     let label = revealed_label(target, spec);
-    browser.menu_click(target).await?;
+    browser.menu_click_reported(target, tried).await?;
     clicked.push(ClickedControl::of(target));
     *clicks_used += 1;
     tried.push(tried_label(target, "clicked, watching URL"));
@@ -1728,7 +1744,7 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
     tried: &mut Vec<String>,
     clicks_used: &mut usize,
 ) -> Result<Option<PageGoalOutcome>, IntentError> {
-    browser.menu_click(target).await?;
+    browser.menu_click_reported(target, tried).await?;
     clicked.push(ClickedControl::of(target));
     *clicks_used += 1;
     tried.push(tried_label(target, "clicked, watching URL"));
@@ -2064,6 +2080,11 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // re-grounded retry of the SAME opener per run; any other verb keeps
     // today's miss path.
     let mut logout_opener_retried = false;
+    // `LogOut`-only bounded-chain marker: the UI attempt is a fixed
+    // chain — gear-1 click → menu-open verify → one opener retry → one
+    // short model pass → cookie fallback — and each handoff is journaled
+    // once per run so the bound is visible in the tried log.
+    let mut logout_bounded_g1_journaled = false;
     // Per-run semantic matchers, created once: the verb's generic words
     // score revealed items when the closed vocabulary is inconclusive,
     // and "account menu" disambiguates the opener when several strong
@@ -2178,9 +2199,17 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
         // it. An actuation miss (click recorded, menu never opened) reads
         // identically to a wrong-opener miss, and the retry distinguishes
         // them. At most one per run; a second miss breaks exactly as
-        // before, and other verbs never enter this branch.
-        let opened = if !opened && spec.kind == VerbKind::LogOut && !logout_opener_retried {
+        // before, and other verbs never enter this branch. The bounded
+        // chain's handoffs are journaled (`logout_ui_bounded`) so the
+        // fail-fast path is visible in the tried log.
+        let logout_bounded = spec.kind == VerbKind::LogOut;
+        if logout_bounded && !logout_bounded_g1_journaled {
+            logout_bounded_g1_journaled = true;
+            tried.push("logout_ui_bounded: gear1_click -> menu_verify".to_owned());
+        }
+        let opened = if !opened && logout_bounded && !logout_opener_retried {
             logout_opener_retried = true;
+            tried.push("logout_ui_bounded: menu_verify -> opener_retry".to_owned());
             logout_opener_retry(
                 browser,
                 origin,
@@ -2194,6 +2223,9 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
             opened
         };
         if !opened {
+            if logout_bounded {
+                tried.push("logout_ui_bounded: opener_retry -> model_pass".to_owned());
+            }
             break;
         }
         menu_maybe_open = true;
@@ -2584,6 +2616,22 @@ pub trait MenuBrowser {
         &self,
         element: &AxElement,
     ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send;
+    /// Click the control like [`MenuBrowser::menu_click`], additionally
+    /// journaling the click hit-test line (expected role+name vs what the
+    /// click point resolved to) into `tried`. The default is the plain
+    /// click with no journal — scripted fakes keep their shape; only the
+    /// production [`ManagedBrowser`] impl overrides this.
+    ///
+    /// # Errors
+    /// Returns [`IntentError::Browser`] on CDP failure.
+    fn menu_click_reported(
+        &self,
+        element: &AxElement,
+        tried: &mut Vec<String>,
+    ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send {
+        let _ = tried;
+        self.menu_click(element)
+    }
     /// Dismiss any open popup layer (Escape keypress). A wrong menu left
     /// open by an earlier attempt light-dismisses on the next click —
     /// swallowing it instead of letting it reach the next candidate — so
@@ -2616,6 +2664,16 @@ impl MenuBrowser for ManagedBrowser {
 
     async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
         click_element(self, element).await.map(|_| ())
+    }
+
+    async fn menu_click_reported(
+        &self,
+        element: &AxElement,
+        tried: &mut Vec<String>,
+    ) -> Result<(), IntentError> {
+        let (_, hit_line) = click_element_reported(self, element).await?;
+        tried.push(hit_line);
+        Ok(())
     }
 
     async fn menu_dismiss(&self) {
@@ -3069,7 +3127,7 @@ pub async fn open_identity_menu<B: MenuBrowser>(
         };
 
         let tried_key = ClickedControl::of(&candidate);
-        browser.menu_click(&candidate).await?;
+        browser.menu_click_reported(&candidate, &mut tried).await?;
         clicked.push(tried_key.clone());
 
         let poll = poll_for_menu_open(
@@ -3429,7 +3487,8 @@ struct ModelLoopState {
 ///    snapshot and clicks it. Unknown ids decline, never guess; an
 ///    already-clicked re-pick declines instead of toggling a menu shut.
 ///
-/// Bounded budget: [`MODEL_GOAL_MAX_STEPS`] steps, then the loop stops.
+/// Bounded budget: `max_steps` steps (see [`model_loop_pass`]), then the
+/// loop stops.
 /// The model NEVER declares completion: [`PageAction::Done`] is a decline —
 /// the loop stops acting and falls through to verification. Completion is
 /// decided ONLY by the verifier: with `spec` present [`verify_verb`] runs
@@ -3462,12 +3521,23 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
     escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
     let mut state = ModelLoopState::default();
+    // `LogOut` runs a bounded chain: one short model pass, no escalation —
+    // the cookie fallback is the deterministic backstop, so the extra
+    // escalation pass would only burn model calls on the way to it.
+    let logout_bounded = spec.is_some_and(|spec| spec.kind == VerbKind::LogOut);
+    let max_steps = if logout_bounded {
+        LOGOUT_MODEL_MAX_STEPS
+    } else {
+        MODEL_GOAL_MAX_STEPS
+    };
+    let escalation = if logout_bounded { None } else { escalation };
     let main_miss = match model_loop_pass(
         browser,
         origin,
         goal,
         navigator,
         spec,
+        max_steps,
         &deterministic_miss,
         &mut state,
     )
@@ -3494,6 +3564,7 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
         goal,
         escalation.navigator,
         spec,
+        max_steps,
         &deterministic_miss,
         &mut state,
     )
@@ -3573,17 +3644,24 @@ async fn model_loop_exit<B: ChromeActionBrowser>(
 /// is not duplicated. `state` accumulates across passes; the pass ends in
 /// [`model_loop_tail`], whose [`IntentError::NoMatch`] carries the
 /// journal. Exactly one pass escalates — this helper never escalates
-/// itself.
+/// itself. `max_steps` is the acting budget: [`MODEL_GOAL_MAX_STEPS`]
+/// for most verbs, [`LOGOUT_MODEL_MAX_STEPS`] for the bounded `LogOut`
+/// chain.
 ///
 /// # Errors
 /// Returns [`IntentError::NoMatch`] when the goal is not reached or not
 /// verified, and [`IntentError::Browser`] on CDP failure.
+// Eight parameters: the pass's own inputs plus the step budget; the
+// `too_many_arguments` shape this crate already uses for its loop
+// helpers.
+#[allow(clippy::too_many_arguments)]
 async fn model_loop_pass<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
     goal: &str,
     navigator: std::sync::Arc<dyn crate::navigator::PageNavigator>,
     spec: Option<&VerbSpec>,
+    max_steps: usize,
     deterministic_miss: &str,
     state: &mut ModelLoopState,
 ) -> Result<PageGoalOutcome, IntentError> {
@@ -3595,7 +3673,7 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
     // The LogOut filter's fail-safe line is journaled once per pass.
     let mut logout_filter_fallback_journaled = false;
 
-    for _ in 0..MODEL_GOAL_MAX_STEPS {
+    for _ in 0..max_steps {
         // Untruncated: the pick is validated against the same full list
         // the loop observed — a control past the head truncation is
         // clickable when the model names it.
@@ -3688,7 +3766,7 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
         goal,
         deterministic_miss,
         state,
-        &format!("navigator exhausted {MODEL_GOAL_MAX_STEPS} steps"),
+        &format!("navigator exhausted {max_steps} steps"),
     )
     .await
 }
@@ -3765,7 +3843,7 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     {
         *revealed_username = username_from_menu_text(&label);
     }
-    browser.menu_click(element).await?;
+    browser.menu_click_reported(element, tried).await?;
     clicked.push(ClickedControl::of(element));
     *last_label = Some(label.clone());
     let navigated = wait_for_url_change(browser).await;
@@ -4500,17 +4578,18 @@ async fn click_batch(
     Ok(ExecuteOutcome::Completed(outcomes))
 }
 
-/// Badge one resolved element and click it: rect resolution, visible mark,
-/// press. Shared by single and batch paths so both act identically; the
-/// badge stays visible on success as evidence, failures clear it so no
-/// stale overlay survives.
+/// Badge one resolved element and click it through the reported click:
+/// rect resolution, visible mark, press, plus the click hit-test journal
+/// line (the expected role+name vs what the click point resolved to —
+/// role+name, never backend node ids). The badge stays visible on
+/// success as evidence, failures clear it so no stale overlay survives.
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
-async fn click_element(
+async fn click_element_reported(
     browser: &ManagedBrowser,
     element: &AxElement,
-) -> Result<IntentOutcome, IntentError> {
+) -> Result<(IntentOutcome, String), IntentError> {
     let highlight = browser.node_rect(element.backend_node_id).await?;
     let mark = Mark {
         index: 0,
@@ -4520,11 +4599,37 @@ async fn click_element(
         height: highlight.height,
     };
     browser.show_marks(std::slice::from_ref(&mark)).await?;
-    if let Err(error) = browser.click_mark(&mark).await {
-        let _ = browser.clear_marks().await;
-        return Err(error.into());
-    }
-    Ok(IntentOutcome { mark, highlight })
+    // The reported click: the same hover → press → release as
+    // `click_mark`, plus what the click point actually resolved to
+    // (page-side `elementFromPoint`) for the journal. The probe is pure
+    // diagnostic — it never fails the click.
+    let hit = match browser.click_mark_reported(&mark).await {
+        Ok(hit) => hit,
+        Err(error) => {
+            let _ = browser.clear_marks().await;
+            return Err(error.into());
+        }
+    };
+    let line = hit.journal_line(&element.role, &element.name);
+    Ok((IntentOutcome { mark, highlight }, line))
+}
+
+/// Badge one resolved element and click it: rect resolution, visible mark,
+/// press. Shared by single and batch paths so both act identically; the
+/// badge stays visible on success as evidence, failures clear it so no
+/// stale overlay survives. The unjournaled twin of
+/// [`click_element_reported`] for paths without a tried log; both act
+/// identically.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn click_element(
+    browser: &ManagedBrowser,
+    element: &AxElement,
+) -> Result<IntentOutcome, IntentError> {
+    click_element_reported(browser, element)
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
 #[cfg(test)]

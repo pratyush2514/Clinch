@@ -152,4 +152,44 @@ describe("agent cursor overlay", () => {
       restoreImgBox();
     }
   });
+
+  it("positions streaming waypoints raw, without the CSS glide", () => {
+    mockImgBox(640, 360);
+    try {
+      const { container } = render(
+        <ScreencastCard {...baseProps} cursor={{ ...cursor, streaming: true }} />,
+      );
+      const pointer = container.querySelector(".agent-cursor") as HTMLElement | null;
+      expect(pointer).not.toBeNull();
+      expect(pointer?.classList.contains("cursor-streaming")).toBe(true);
+    } finally {
+      restoreImgBox();
+    }
+  });
+
+  it("keeps the glide for isolated placements", () => {
+    mockImgBox(640, 360);
+    try {
+      const { container } = render(
+        <ScreencastCard {...baseProps} cursor={{ ...cursor, streaming: false }} />,
+      );
+      const pointer = container.querySelector(".agent-cursor") as HTMLElement | null;
+      expect(pointer).not.toBeNull();
+      expect(pointer?.classList.contains("cursor-streaming")).toBe(false);
+    } finally {
+      restoreImgBox();
+    }
+  });
+
+  it("glides when the cursor carries no streaming hint", () => {
+    mockImgBox(640, 360);
+    try {
+      const { container } = render(<ScreencastCard {...baseProps} cursor={cursor} />);
+      const pointer = container.querySelector(".agent-cursor") as HTMLElement | null;
+      expect(pointer).not.toBeNull();
+      expect(pointer?.classList.contains("cursor-streaming")).toBe(false);
+    } finally {
+      restoreImgBox();
+    }
+  });
 });
