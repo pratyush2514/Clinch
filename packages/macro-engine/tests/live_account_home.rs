@@ -136,9 +136,13 @@ fn chromium_path() -> PathBuf {
 }
 
 async fn launch(profile_dir: &std::path::Path) -> ManagedBrowser {
-    ManagedBrowser::launch_with_options(&chromium_path(), profile_dir, LaunchOptions::offscreen_headed())
-        .await
-        .expect("launch off-screen Chromium")
+    ManagedBrowser::launch_with_options(
+        &chromium_path(),
+        profile_dir,
+        LaunchOptions::offscreen_headed(),
+    )
+    .await
+    .expect("launch off-screen Chromium")
 }
 
 async fn goto(browser: &ManagedBrowser, origin: &Url, path: &str) -> Url {

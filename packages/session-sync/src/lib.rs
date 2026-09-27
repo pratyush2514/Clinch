@@ -1,12 +1,12 @@
 #![deny(unsafe_code)]
 //! Consent-gated browser cookie extraction. Secrets never cross desktop IPC.
-mod crypto;
-mod local_storage;
-mod paths;
-mod profile;
-mod reader;
-mod service;
-mod user_agent;
+pub mod crypto;
+pub mod local_storage;
+pub mod paths;
+pub mod profile;
+pub mod reader;
+pub mod service;
+pub mod user_agent;
 
 pub use local_storage::{StorageItem, build_hydration_script, read_local_storage};
 pub use paths::{cookie_db_candidates, local_base, resolve_profile_dir, user_data_dir};

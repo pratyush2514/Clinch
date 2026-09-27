@@ -2,7 +2,12 @@
 use crate::{EngineError, Task, TaskId};
 use sqlx::SqlitePool;
 
-pub(crate) async fn initialize(pool: &SqlitePool) -> Result<(), EngineError> {
+/// Initialize the task store schema.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] if the database cannot be initialized.
+pub async fn initialize(pool: &SqlitePool) -> Result<(), EngineError> {
     let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(pool)
         .await?;
@@ -14,7 +19,12 @@ pub(crate) async fn initialize(pool: &SqlitePool) -> Result<(), EngineError> {
     Ok(())
 }
 
-pub(crate) async fn create(pool: &SqlitePool, task: &mut Task) -> Result<(), EngineError> {
+/// Persist a new task.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] if the task cannot be written.
+pub async fn create(pool: &SqlitePool, task: &mut Task) -> Result<(), EngineError> {
     let mut transaction = pool.begin().await?;
     let id = sqlx::query("INSERT INTO tasks(revision,snapshot) VALUES(0,'{}')")
         .execute(&mut *transaction)
@@ -38,7 +48,12 @@ pub(crate) async fn create(pool: &SqlitePool, task: &mut Task) -> Result<(), Eng
     Ok(())
 }
 
-pub(crate) async fn checkpoint(pool: &SqlitePool, task: &mut Task) -> Result<(), EngineError> {
+/// Write a task checkpoint.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] on conflict or database failure.
+pub async fn checkpoint(pool: &SqlitePool, task: &mut Task) -> Result<(), EngineError> {
     let mut next = task.clone();
     next.revision = task.revision.checked_add(1).ok_or(EngineError::Invalid)?;
     let json = serde_json::to_string(&next)?;
@@ -78,46 +93,4 @@ pub(crate) async fn unfinished(pool: &SqlitePool) -> Result<Vec<Task>, EngineErr
     rows.iter()
         .map(|json| serde_json::from_str(json).map_err(EngineError::from))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Engine, RunMode, StepState, TaskRequest, TaskState};
-    #[tokio::test]
-    async fn checkpoints_survive_reopen_and_recover_without_reexecution()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("test.db");
-        let pool = playbook_store::initialize(&path).await?;
-        initialize(&pool).await?;
-        let request: TaskRequest = serde_json::from_str(
-            r#"{"workflow":"reports","portalUrl":"https://example.com","linkSelector":null,"downloadSelector":"a.report"}"#,
-        )?;
-        let mut task = Task::new("reports".into(), request.plan()?, RunMode::Record);
-        create(&pool, &mut task).await?;
-        let mut stale = task.clone();
-        task.start_step(0)?;
-        checkpoint(&pool, &mut task).await?;
-        assert!(matches!(
-            checkpoint(&pool, &mut stale).await,
-            Err(EngineError::Conflict)
-        ));
-        pool.close().await;
-        let pool = playbook_store::initialize(&path).await?;
-        let engine = Engine::new(pool.clone()).await?;
-        engine.recover().await?;
-        let recovered = engine.load(task.id).await?;
-        assert_eq!(recovered.state, TaskState::Interrupted);
-        assert_eq!(recovered.plan.steps[0].state, StepState::Interrupted);
-        assert_eq!(recovered.plan.steps[1].state, StepState::Pending);
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM task_checkpoints")
-            .fetch_one(&pool)
-            .await?;
-        assert_eq!(count, 3);
-        engine.recover().await?;
-        assert_eq!(engine.load(task.id).await?.revision, 2);
-        pool.close().await;
-        Ok(())
-    }
 }

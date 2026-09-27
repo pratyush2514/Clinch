@@ -111,7 +111,8 @@ pub struct Task {
 }
 
 impl Task {
-    pub(crate) fn new(workflow: String, plan: Plan, mode: RunMode) -> Self {
+    #[must_use]
+    pub fn new(workflow: String, plan: Plan, mode: RunMode) -> Self {
         Self {
             id: TaskId::default(),
             revision: 0,
@@ -125,7 +126,12 @@ impl Task {
         }
     }
 
-    pub(crate) fn start_step(&mut self, index: usize) -> Result<(), EngineError> {
+    /// Start a step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if the task is not plannable/runnable or the index does not match the expected step.
+    pub fn start_step(&mut self, index: usize) -> Result<(), EngineError> {
         if !matches!(self.state, TaskState::Planned | TaskState::Running)
             || self
                 .plan
@@ -154,7 +160,12 @@ impl Task {
             .ok_or(EngineError::Transition)
     }
 
-    pub(crate) fn complete_step(
+    /// Complete a step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if the step is not running or the index does not match.
+    pub fn complete_step(
         &mut self,
         index: usize,
         output: ActionOutput,
@@ -181,7 +192,12 @@ impl Task {
         Ok(())
     }
 
-    pub(crate) fn fail_step(
+    /// Fail a step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if the step is not running or the index does not match.
+    pub fn fail_step(
         &mut self,
         index: usize,
         elapsed_ms: u64,
@@ -195,7 +211,12 @@ impl Task {
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self) -> Result<(), EngineError> {
+    /// Finish the task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if not all steps are complete.
+    pub fn finish(&mut self) -> Result<(), EngineError> {
         if self.state != TaskState::Running
             || self
                 .plan
@@ -226,32 +247,6 @@ impl Task {
             }
         }
         self.state = TaskState::Interrupted;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::TaskRequest;
-    #[test]
-    fn transitions_reject_skipping_repeating_and_false_completion() -> Result<(), EngineError> {
-        let request: TaskRequest = serde_json::from_str(
-            r#"{"workflow":"reports","portalUrl":"https://example.com","linkSelector":null,"downloadSelector":"a.report"}"#,
-        )?;
-        let mut task = Task::new("reports".into(), request.plan()?, RunMode::Record);
-        assert!(task.start_step(1).is_err());
-        assert!(task.finish().is_err());
-        assert!(task.start_step(99).is_err());
-        task.start_step(0)?;
-        assert!(task.start_step(0).is_err());
-        task.complete_step(0, ActionOutput::default(), 1)?;
-        assert!(task.complete_step(0, ActionOutput::default(), 1).is_err());
-        assert!(task.finish().is_err());
-        task.start_step(1)?;
-        task.fail_step(1, 2, FailureReason::Browser)?;
-        assert!(task.start_step(1).is_err());
-        assert!(task.finish().is_err());
         Ok(())
     }
 }

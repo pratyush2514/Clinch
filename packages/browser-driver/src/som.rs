@@ -24,7 +24,7 @@ use std::time::Duration;
 
 /// Upper bound on badges per overlay; matches the AX snapshot cap so one
 /// snapshot always fits one overlay.
-const MAX_MARKS: usize = 300;
+pub const MAX_MARKS: usize = 300;
 
 /// One badged rectangle in CSS viewport pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,7 +38,7 @@ pub struct Mark {
 }
 
 impl Mark {
-    fn validate(&self) -> Result<(), BrowserError> {
+    pub fn validate(&self) -> Result<(), BrowserError> {
         for value in [self.x, self.y, self.width, self.height] {
             if !value.is_finite() {
                 return Err(BrowserError::InvalidAction);
@@ -71,7 +71,7 @@ fn validate_marks(marks: &[Mark]) -> Result<(), BrowserError> {
 /// pointer-transparent layer with one red-circle index badge plus one outline
 /// box per rectangle. Re-running replaces the previous layer, so overlays are
 /// idempotent without ever selecting page content.
-fn overlay_script(marks: &[Mark]) -> Result<String, BrowserError> {
+pub fn overlay_script(marks: &[Mark]) -> Result<String, BrowserError> {
     validate_marks(marks)?;
     let payload = serde_json::to_string(marks).map_err(|_| BrowserError::InvalidAction)?;
     Ok(format!(
@@ -94,7 +94,7 @@ fn overlay_script(marks: &[Mark]) -> Result<String, BrowserError> {
     ))
 }
 
-const TEARDOWN_EXPRESSION: &str = "if(window.__clinchClearMarks){window.__clinchClearMarks();}";
+pub const TEARDOWN_EXPRESSION: &str = "if(window.__clinchClearMarks){window.__clinchClearMarks();}";
 
 impl ManagedBrowser {
     /// Render index badges for `marks` on the live target. An empty list
@@ -177,7 +177,7 @@ const HIT_TEST_EXPRESSION: &str = "(() => {
 /// Substitute the click point into the probe const's `{x}`/`{y}`
 /// placeholders. Pure so the substitution stays unit-testable; `format!`
 /// needs a literal format string, hence plain `replace`.
-fn hit_test_expression(x: f64, y: f64) -> String {
+pub fn hit_test_expression(x: f64, y: f64) -> String {
     HIT_TEST_EXPRESSION
         .replace("{x}", &x.to_string())
         .replace("{y}", &y.to_string())
@@ -463,77 +463,5 @@ impl ManagedBrowser {
     pub async fn marked_viewport(&self, marks: &[Mark]) -> Result<crate::Viewport, BrowserError> {
         self.show_marks(marks).await?;
         self.viewport().await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mark(index: usize) -> Mark {
-        Mark {
-            index,
-            x: 10.0,
-            y: 20.0,
-            width: 100.0,
-            height: 40.0,
-        }
-    }
-
-    #[test]
-    fn hit_test_expression_substitutes_coordinates() {
-        let expr = hit_test_expression(120.5, 80.25);
-        assert!(expr.contains("document.elementFromPoint(120.5, 80.25)"));
-        // The const uses single braces (it is substituted with `replace`,
-        // not `format!`); doubled braces would be a JS syntax error.
-        assert!(!expr.contains("{{"));
-        assert!(!expr.contains("}}"));
-        assert!(expr.contains("return {tag:"));
-        assert!(expr.contains("if (!el) return null;"));
-    }
-
-    #[test]
-    fn click_point_is_the_rectangle_center() {
-        assert_eq!(mark(3).click_point(), (60.0, 40.0));
-    }
-
-    #[test]
-    fn validation_rejects_degenerate_geometry() {
-        assert!(mark(0).validate().is_ok());
-        for broken in [
-            Mark {
-                x: f64::NAN,
-                ..mark(0)
-            },
-            Mark {
-                width: 0.0,
-                ..mark(0)
-            },
-            Mark {
-                height: -5.0,
-                ..mark(0)
-            },
-        ] {
-            assert!(broken.validate().is_err());
-        }
-        assert!(overlay_script(&[]).is_err());
-        assert!(overlay_script(&vec![mark(0); MAX_MARKS + 1]).is_err());
-    }
-
-    #[test]
-    fn overlay_embeds_badges_and_teardown() -> Result<(), Box<dyn std::error::Error>> {
-        let script = overlay_script(&[mark(0), mark(7)])?;
-        assert!(script.contains("\"index\":0"));
-        assert!(script.contains("\"index\":7"));
-        assert!(script.contains("#dc2626"));
-        assert!(script.contains("__clinchClearMarks"));
-        assert!(script.contains("__clinchMarkLayer"));
-        // No page-content selection: the script only creates its own layer.
-        assert!(!script.contains("querySelector"));
-        assert_eq!(
-            TEARDOWN_EXPRESSION,
-            "if(window.__clinchClearMarks){window.__clinchClearMarks();}"
-        );
-        Ok(())
     }
 }

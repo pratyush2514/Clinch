@@ -115,8 +115,7 @@ async fn funnel_declines_non_open_and_plural_prompts() {
 }
 
 /// Read the Session Activity backing store to assert on journal order.
-/// `test_session_events` is `#[cfg(test)]` (unit tests only), so
-/// integration tests open the database file directly.
+/// Integration tests open the database file directly.
 async fn journal_lines(data_dir: &std::path::Path) -> Vec<String> {
     let url = format!("sqlite:{}", data_dir.join("clinch.db").display());
     let pool = sqlx::SqlitePool::connect(&url).await.unwrap();

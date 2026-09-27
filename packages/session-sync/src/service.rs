@@ -105,39 +105,3 @@ pub async fn prepare(request: &ValidatedRequest, home: &Path) -> PreparedSync {
         Err(_) => PreparedSync::ManualLogin(FallbackReason::TimedOut),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn errors_select_explicit_fallbacks() {
-        assert_eq!(
-            FallbackReason::from(&SyncError::MissingCookies),
-            FallbackReason::NoCookies
-        );
-        assert_eq!(
-            FallbackReason::from(&SyncError::Decryption),
-            FallbackReason::DecryptionFailed
-        );
-        assert_eq!(
-            FallbackReason::from(&SyncError::UnsupportedFormat),
-            FallbackReason::UnsupportedFormat
-        );
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    #[tokio::test]
-    async fn unsupported_host_offers_manual_login() -> Result<(), SyncError> {
-        let request = crate::SyncRequest {
-            browser: BrowserSource::Chrome,
-            profile: "Default".into(),
-            portal_url: "https://example.com".into(),
-            consent: true,
-        }
-        .validate()?;
-        assert!(matches!(
-            prepare(&request, Path::new("/nonexistent")).await,
-            PreparedSync::ManualLogin(FallbackReason::UnsupportedPlatform)
-        ));
-        Ok(())
-    }
-}

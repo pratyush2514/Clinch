@@ -137,7 +137,7 @@ impl Action {
 }
 
 // Blob URLs retain their creator's origin. Opaque and cross-origin blobs are rejected.
-fn validate_download_url(url: &Url, origin: &Url) -> Result<(), BrowserError> {
+pub fn validate_download_url(url: &Url, origin: &Url) -> Result<(), BrowserError> {
     if url.scheme() == "blob" {
         let inner = Url::parse(url.path()).map_err(|_| BrowserError::InvalidAction)?;
         Action::Navigate { url: inner }.validate(origin)
@@ -146,7 +146,7 @@ fn validate_download_url(url: &Url, origin: &Url) -> Result<(), BrowserError> {
     }
 }
 
-fn matches_download_url(actual: &str, expected: &Url, origin: &Url) -> bool {
+pub fn matches_download_url(actual: &str, expected: &Url, origin: &Url) -> bool {
     let Ok(actual) = Url::parse(actual) else {
         return false;
     };
@@ -423,33 +423,5 @@ impl ManagedBrowser {
             });
         }
         Ok(ActionOutput { files })
-    }
-}
-
-#[cfg(test)]
-mod download_tests {
-    use super::*;
-    #[test]
-    fn blob_downloads_are_scoped_to_the_portal_without_allowing_blob_navigation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let origin = Url::parse("https://github.com/settings/files")?;
-        let expected = Url::parse("https://github.com/report")?;
-        let blob = Url::parse("blob:https://github.com/fixture-guid")?;
-        assert!(validate_download_url(&blob, &origin).is_ok());
-        assert!(matches_download_url(blob.as_str(), &expected, &origin));
-        assert!(matches_download_url(expected.as_str(), &expected, &origin));
-        assert!(Action::Navigate { url: blob }.validate(&origin).is_err());
-        for invalid in [
-            "blob:https://evil.example/guid",
-            "blob:null/guid",
-            "blob:https://user:secret@github.com/guid",
-            "javascript:alert(1)",
-            "data:application/pdf,abc",
-            "https://github.com/unexpected",
-            "blob:http://github.com/guid",
-        ] {
-            assert!(!matches_download_url(invalid, &expected, &origin));
-        }
-        Ok(())
     }
 }
