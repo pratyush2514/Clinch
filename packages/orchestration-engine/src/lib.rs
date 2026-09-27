@@ -2,7 +2,6 @@
 //! Task → Plan → Step execution with durable boundaries and typed progress.
 mod compound;
 mod domain_grounder;
-mod entity_resolver;
 mod funnel_slots;
 mod intent_parser;
 mod intent_resolver;
@@ -17,7 +16,6 @@ mod verb_spec;
 use browser_driver::{Action, Highlight, ManagedBrowser, WaitCondition};
 pub use compound::split_compound;
 pub use domain_grounder::{GrounderEnv, GrounderProvider, LlmDomainGrounder};
-pub use entity_resolver::{AccountDirectory, DirectoryError, RepoRef, resolve_repo_entity};
 pub use funnel_slots::{
     AsideInfo, FunnelDecision, FunnelPlan, FunnelSlots, ObjectClass, funnel_claims, funnel_plan,
     object_noun, split_slots, strip_asides,
@@ -63,8 +61,8 @@ pub use verb_spec::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("Macro replay requires a headless browser")]
-    HeadlessRequired,
+    #[error("Macro replay requires a browser with no visible window")]
+    NoVisibleWindowRequired,
     #[error("Task transition is not valid")]
     Transition,
     #[error("Task or workflow input is invalid")]
@@ -346,7 +344,7 @@ impl Engine {
     ) -> Result<Task, EngineError> {
         let (plan, mode, path) = Self::prepare(request, root).await?;
         if mode == RunMode::Replay && !browser.is_headless() {
-            return Err(EngineError::HeadlessRequired);
+            return Err(EngineError::NoVisibleWindowRequired);
         }
         let mut task = Task::new(request.workflow.clone(), plan, mode);
         store::create(&self.pool, &mut task).await?;

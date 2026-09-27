@@ -13,7 +13,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { SCREENCAST_EVENT, CURSOR_EVENT, type AgentCursor, type ContextStatus, type ScreencastFrame } from "../lib/ipc";
 import { message } from "../lib/errors";
 
-const DORMANT: ContextStatus = { attached: false, headless: true, windowMode: "headless" };
+const DORMANT: ContextStatus = { attached: false, headless: true, windowMode: "offscreen" };
 
 /**
  * Frame-integrity gate for the live stream.

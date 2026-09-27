@@ -1,6 +1,6 @@
 # Clinch — Product Requirements
 
-Owner: Pratyush · Rewritten for readability 2026-09-27.
+Owner: (unassigned) · Rewritten for readability 2026-09-27.
 Product authority: [CONSTITUTION.md](CONSTITUTION.md). Code is the authority on what is actually built.
 
 ## What Clinch is

@@ -187,11 +187,11 @@ async fn records_replays_downloads_and_flags_only_the_broken_step()
         engine
             .run_task(&replay_request, &browser, directory.path(), |_| {})
             .await,
-        Err(orchestration_engine::EngineError::HeadlessRequired)
+        Err(orchestration_engine::EngineError::NoVisibleWindowRequired)
     ));
-    let browser = headless_replay(&browser, &executable, directory.path())
+    let browser = background_replay(&browser, &executable, directory.path())
         .await
-        .map_err(|error| format!("Headless restart: {error}"))?;
+        .map_err(|error| format!("Background restart: {error}"))?;
     let start = Instant::now();
     let second = engine
         .run_task(&replay_request, &browser, directory.path(), |event| {
@@ -275,7 +275,7 @@ async fn verify_blob_downloads(
     Ok(())
 }
 
-async fn headless_replay(
+async fn background_replay(
     browser: &ManagedBrowser,
     executable: &str,
     root: &Path,
@@ -284,7 +284,7 @@ async fn headless_replay(
         .restart(
             Path::new(executable),
             &root.join("profile"),
-            browser_driver::LaunchOptions::replay(),
+            browser_driver::LaunchOptions::offscreen_headed(),
         )
         .await?;
     assert!(browser.is_headless());

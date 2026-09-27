@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 //! Opt-in live-Chromium proof for Playbook step dispatch (legacy replay plus
 //! semantic intents). Requires `CLINCH_CHROMIUM_PATH`; launches an isolated
-//! headless profile and a loopback fixture portal. No personal profile or
+//! off-screen profile and a loopback fixture portal. No personal profile or
 //! real portal is touched.
 use browser_driver::{Action, LaunchOptions, ManagedBrowser, WaitCondition};
 use macro_engine::SemanticIntent;
@@ -47,13 +47,13 @@ async fn fixture_portal() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn 
     Ok((url, task))
 }
 
-async fn headless_browser(
+async fn background_browser(
     dir: &tempfile::TempDir,
 ) -> Result<ManagedBrowser, Box<dyn std::error::Error>> {
     Ok(ManagedBrowser::launch_with_options(
         Path::new(&std::env::var("CLINCH_CHROMIUM_PATH")?),
         &dir.path().join("profile"),
-        LaunchOptions::replay(),
+        LaunchOptions::offscreen_headed(),
     )
     .await?)
 }
@@ -71,7 +71,7 @@ async fn harness() -> Result<Harness, Box<dyn std::error::Error>> {
     let (portal, server) = fixture_portal().await?;
     let profile_dir = tempfile::tempdir()?;
     let output = profile_dir.path().join("downloads");
-    let browser = headless_browser(&profile_dir).await?;
+    let browser = background_browser(&profile_dir).await?;
     browser.navigate(&portal).await?;
     Ok(Harness {
         portal,
@@ -116,7 +116,7 @@ fn pay_intent() -> Step {
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn dispatch_replays_legacy_steps() -> Result<(), Box<dyn std::error::Error>> {
     // Recorded clicks replay through the saved selector and honor the
     // postcondition wait (proving navigation happened).
@@ -150,7 +150,7 @@ async fn dispatch_replays_legacy_steps() -> Result<(), Box<dyn std::error::Error
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn dispatch_executes_semantic_intents() -> Result<(), Box<dyn std::error::Error>> {
     let harness = harness().await?;
     let outcome = execute_step(
@@ -180,7 +180,7 @@ async fn dispatch_executes_semantic_intents() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
     let harness = harness().await?;
     // Denied approvals fail closed on both paths without touching the page.
@@ -262,7 +262,7 @@ async fn dispatch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn sequence_runs_in_order_and_stops_at_repair() -> Result<(), Box<dyn std::error::Error>> {
     let harness = harness().await?;
     let phases: Arc<Mutex<Vec<(usize, SequencePhase)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -361,7 +361,7 @@ fn plural_invoice_step() -> Step {
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn saved_plural_step_batches_every_candidate_behind_one_gate()
 -> Result<(), Box<dyn std::error::Error>> {
     // The live half of `test_saved_playbook_plural_batch_execution`: a saved
@@ -372,7 +372,7 @@ async fn saved_plural_step_batches_every_candidate_behind_one_gate()
     let (portal, server) = invoices_portal().await?;
     let profile_dir = tempfile::tempdir()?;
     let output = profile_dir.path().join("downloads");
-    let browser = headless_browser(&profile_dir).await?;
+    let browser = background_browser(&profile_dir).await?;
     browser.navigate(&portal).await?;
 
     let previewed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -432,7 +432,7 @@ async fn saved_plural_step_batches_every_candidate_behind_one_gate()
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn rejected_plural_step_denies_the_sequence_without_clicking()
 -> Result<(), Box<dyn std::error::Error>> {
     // Fail-closed, and closed means untouched: a denied batch leaves the
@@ -440,7 +440,7 @@ async fn rejected_plural_step_denies_the_sequence_without_clicking()
     let (portal, server) = invoices_portal().await?;
     let profile_dir = tempfile::tempdir()?;
     let output = profile_dir.path().join("downloads");
-    let browser = headless_browser(&profile_dir).await?;
+    let browser = background_browser(&profile_dir).await?;
     browser.navigate(&portal).await?;
     let steps = vec![plural_invoice_step()];
     let outcome = run_playbook_sequence(

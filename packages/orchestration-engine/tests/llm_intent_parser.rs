@@ -432,7 +432,6 @@ fn parser_tier_fires_for_the_failing_prompts() {
         }));
         let parser: Arc<dyn IntentParser> = double.clone();
         let ctx = ResolutionContext {
-            account_dir: None,
             llm: None,
             parser: Some(&parser),
             shortcuts: None,

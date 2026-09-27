@@ -16,8 +16,12 @@ describe("sessionBadgeLabel", () => {
     expect(sessionBadgeLabel(true, "offscreen", null)).toBe("live · off-screen headed session");
   });
 
-  it("keeps the headless wording for a true headless session", () => {
-    expect(sessionBadgeLabel(true, "headless", null)).toBe("live · headless background session");
+  it("falls back to the off-screen label for an unknown mode, never headless", () => {
+    // "headless" can no longer arrive from the engine; the cast simulates
+    // a stale or foreign backend.
+    expect(sessionBadgeLabel(true, "headless" as "offscreen", null)).toBe(
+      "live · off-screen headed session"
+    );
   });
 
   it("labels a visible headed session as direct control", () => {

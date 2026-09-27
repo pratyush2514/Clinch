@@ -2,10 +2,9 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import type { AgentCursor, ContextStatus } from "../lib/ipc";
 
 /**
- * Human wording for the session badge. Pure so the headed/off-screen/
- * headless distinction is unit-testable: an off-screen headed session
- * must never be labeled "headless" — it owns real windows, just none the
- * user can see.
+ * Human wording for the session badge. Pure so the headed/off-screen
+ * distinction is unit-testable: an off-screen headed session owns real
+ * windows, just none the user can see.
  */
 export function sessionBadgeLabel(
   live: boolean,
@@ -21,7 +20,9 @@ export function sessionBadgeLabel(
     case "headed":
       return "live · headful, direct control";
     default:
-      return "live · headless background session";
+      // Unreachable: the engine only emits "offscreen" | "headed".
+      // Defensive fallback — never a "headless" label.
+      return "live · off-screen headed session";
   }
 }
 

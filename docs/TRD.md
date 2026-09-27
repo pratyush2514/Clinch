@@ -97,6 +97,6 @@ Task approvals write sentinel_decisions before execution. Playbook decisions use
 
 Database tables include session_events, playbooks, runs, signature_history, entry_urls, identity_memory, tasks, task_checkpoints, and sentinel_decisions. Tasks have durable step checkpoints; playbook runs have summary journaling, not equivalent restart/resume semantics. Some journal writes are best effort.
 
-Completed command-bar save keys are held in memory (32-entry cap) and consumed by save_run_as_workflow. Playbook persistence is durable; the key registry is not. TaskWorkspace saves legacy steps through save_playbook instead.
+Completed command-bar save keys are held in memory (32-entry cap) and consumed by save_run_as_workflow. Playbook persistence is durable; the key registry is not.
 
 See [STATUS.md](STATUS.md) for validation and [POC.md](POC.md) for outstanding acceptance work.

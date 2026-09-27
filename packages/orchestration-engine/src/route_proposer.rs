@@ -13,10 +13,9 @@
 //!    typed destination is ground truth, so it precedes every adapter —
 //!    and fails closed when malformed, since a typo is not fixed by a
 //!    model guess.
-//! 3. Connected-account entity (`entity_resolver`), only with a directory.
-//! 4. LLM fallback, only with a configured adapter — and its output is
+//! 3. LLM fallback, only with a configured adapter — and its output is
 //!    untrusted input, validated like every other tier.
-//! 5. Direct-open grounding ladder, only for high-confidence single-target
+//! 4. Direct-open grounding ladder, only for high-confidence single-target
 //!    opens (`open amazon`): a user-saved site shortcut, then a structured
 //!    site directory (Brave Search API when keyed, keyless `DuckDuckGo`
 //!    otherwise), then a fenced domain grounder (site slot + region hint →
@@ -24,8 +23,8 @@
 //!    the UI can act on — it never falls through to a search page, because
 //!    a guessed SERP click is worse than asking. In-page goals (site +
 //!    artifact noun) ground only the site through the same ladder and may
-//!    fall through to tier 6 when no rung knows it.
-//! 6. Site-ladder retry — the grammar's site slots (`site_context`, then
+//!    fall through to tier 5 when no rung knows it.
+//! 5. Site-ladder retry — the grammar's site slots (`site_context`, then
 //!    `target_noun`) through the same site-only ladder, for prompts no
 //!    earlier tier grounded. First hit wins; a total miss is an honest
 //!    miss. The engine never navigates to a visible search page: no search
@@ -69,7 +68,6 @@
 //!   failure — offline is a normal outcome.
 
 use crate::{
-    entity_resolver::{AccountDirectory, resolve_repo_entity},
     intent_parser::{IntentParser, parse_prompt_bounded},
     intent_resolver::{ParsedGrammar, is_direct_open, parse_grammar},
     url_policy::{validate_proposed_url, validate_user_directed_url},
@@ -81,7 +79,6 @@ use zeroize::Zeroizing;
 /// with the navigation proposal so wrong sources are debuggable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteSource {
-    AccountEntity,
     LlmFallback,
     /// The prompt named a domain or URL outright (`open amazon.in`).
     ExplicitDomain,
@@ -115,12 +112,10 @@ pub struct ResolvedRoute {
 }
 
 /// Optional resolution inputs. Every one is inert when unset, which is the
-/// production default: no account directory is wired (no stored GitHub
-/// credential exists to back one), no URL adapter is configured, and the
-/// shipped intent parser declines. Unset inputs degrade the cascade to the
-/// honest miss rather than failing it.
+/// production default: no URL adapter is configured and the shipped intent
+/// parser declines. Unset inputs degrade the cascade to the honest miss
+/// rather than failing it.
 pub struct ResolutionContext<'a> {
-    pub account_dir: Option<&'a dyn AccountDirectory>,
     pub llm: Option<&'a dyn LlmUrlProposer>,
     /// Fenced slot parser consulted only for low-confidence prompts, and
     /// only for slots — it never proposes a URL. See
@@ -584,7 +579,7 @@ fn directory_veto_note(site_name: &str, hit: &SiteHit) -> Option<String> {
     }
 }
 
-/// One Tier 3b directory step: query the client, veto host-mismatched hits,
+/// One Tier 2b directory step: query the client, veto host-mismatched hits,
 /// accept plausible ones. Returns the accepted route plus, when the hit
 /// was vetoed, the journal note — the caller falls through to the grounder
 /// rung and carries the note on whatever route grounds next, so the veto
@@ -602,7 +597,7 @@ fn directory_step(
     (accept_site_search(&hit), None)
 }
 
-/// The site-only grounding ladder, shared by Tier 3 (direct opens), Tier 3b
+/// The site-only grounding ladder, shared by Tier 2 (direct opens), Tier 2b
 /// (in-page goals), and the funnel: a user-saved site shortcut, then the
 /// structured site directory with the plausibility veto, then the fenced
 /// domain grounder. One ladder, three callers — never forked, so a rung
@@ -993,8 +988,8 @@ pub fn resolve_slots(
 ///    Prompts naming a site plus an artifact noun ("open my profile on the
 ///    reddit") ground the site alone through the same ladder; the artifact
 ///    is pursued on the live page, never searched. A site no rung knows
-///    falls through to Tier 4 below.
-/// 4. Site-ladder retry: the grammar's site slots (`site_context`, then
+///    falls through to Tier 3 below.
+/// 3. Site-ladder retry: the grammar's site slots (`site_context`, then
 ///    `target_noun`, deduped, non-empty) through the normal site-only
 ///    ladder ([`resolve_site_entry_url`]); first hit wins. On total miss
 ///    returns `None` — the honest miss. The engine never navigates to a
@@ -1007,24 +1002,18 @@ pub fn resolve_entry_url(
     ctx: &ResolutionContext<'_>,
 ) -> Option<ResolvedRoute> {
     // Tier 0: the prompt's own explicit domain or URL. Typed by the user,
-    // so it outranks the account directory and the model — neither gets
-    // to reinterpret a destination the user spelled out.
+    // so it outranks the model — nothing gets to reinterpret a destination
+    // the user spelled out.
     if let Some(url) = explicit_url_in_prompt(prompt) {
         return accept_user_directed(&url, RouteSource::ExplicitDomain);
     }
-    // Tier 1: connected-account entity, only with a directory wired.
-    if let Some(dir) = ctx.account_dir
-        && let Some(url) = resolve_repo_entity(prompt, dir)
-    {
-        return accept(&url, RouteSource::AccountEntity);
-    }
-    // Tier 2: configured LLM adapter, output untrusted until validated.
+    // Tier 1: configured LLM adapter, output untrusted until validated.
     if let Some(llm) = ctx.llm
         && let Some(url) = llm.propose_url(prompt)
     {
         return accept(&url, RouteSource::LlmFallback);
     }
-    // Tier 3: direct-open grounding ladder — the shared site-only ladder
+    // Tier 2: direct-open grounding ladder — the shared site-only ladder
     // ([`resolve_site_entry_url`]) over the target noun. High-confidence
     // single-target opens never touch a search page: the destination
     // comes from the user's own data, a structured directory, a fenced
@@ -1042,13 +1031,13 @@ pub fn resolve_entry_url(
         // be a challenge page or an ad.
         return None;
     }
-    // Tier 3b: in-page goal — the prompt names a site and carries an
+    // Tier 2b: in-page goal — the prompt names a site and carries an
     // artifact noun ("open my profile on the reddit"), so it is not a
     // direct open and must never become a search query when the site
     // grounds. Ground ONLY the site through the shared site-only ladder
     // ([`resolve_site_entry_url`]); the artifact is pursued on the live
     // page by the dispatcher, never searched. When no rung knows the site,
-    // fall through to Tier 4: with nothing to navigate to, the grammar's
+    // fall through to Tier 3: with nothing to navigate to, the grammar's
     // site slots get one more pass through the site-only ladder (and in
     // production the directory rung below is always live, so this corner
     // is theoretical).
@@ -1068,9 +1057,9 @@ pub fn resolve_entry_url(
     {
         return Some(route);
     }
-    // 3d. Site ungrounded (or coordinator, or no artifact): fall through
-    // to the Tier 4 site-ladder retry below.
-    // Tier 4: site-ladder retry over the already-parsed grammar — no
+    // 2d. Site ungrounded (or coordinator, or no artifact): fall through
+    // to the Tier 3 site-ladder retry below.
+    // Tier 3: site-ladder retry over the already-parsed grammar — no
     // visible search page, no guessed TLDs. The grammar's site slots
     // (`site_context`, then `target_noun`, deduped, non-empty) each run
     // the normal site-only ladder; the first hit wins. On total miss
@@ -1079,7 +1068,7 @@ pub fn resolve_entry_url(
     // when no stronger tier proposed anything; invalid stronger proposals
     // already returned `None` above without falling through.
     //
-    // Multi-target veto, mirroring tier 3b: a prompt naming two sites
+    // Multi-target veto, mirroring tier 2b: a prompt naming two sites
     // ("open my profile on reddit and twitter") must not silently pursue
     // one of its targets — honest miss instead of one site's home page.
     if coordinator {
@@ -1108,17 +1097,6 @@ pub fn resolve_entry_url(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_resolver::{DirectoryError, RepoRef};
-
-    struct FixtureDirectory {
-        repos: Vec<RepoRef>,
-    }
-
-    impl AccountDirectory for FixtureDirectory {
-        fn github_repos(&self) -> Result<Vec<RepoRef>, DirectoryError> {
-            Ok(self.repos.clone())
-        }
-    }
 
     struct MockLlm {
         answer: Option<String>,
@@ -1130,17 +1108,8 @@ mod tests {
         }
     }
 
-    fn repo(owner: &str, name: &str) -> RepoRef {
-        RepoRef {
-            owner: owner.into(),
-            name: name.into(),
-            html_url: format!("https://github.com/{owner}/{name}"),
-        }
-    }
-
     fn empty_ctx() -> ResolutionContext<'static> {
         ResolutionContext {
-            account_dir: None,
             llm: None,
             parser: None,
             shortcuts: None,
@@ -1148,48 +1117,6 @@ mod tests {
             domain_grounder: None,
             region_hint: "",
         }
-    }
-
-    #[test]
-    fn tier_order_prefers_account_entity_over_later_tiers() {
-        // A connected repo named like the prompt's artifact must win over
-        // the tiers below it.
-        let dir = FixtureDirectory {
-            repos: vec![
-                repo("fixture-owner", "invoices"),
-                repo("fixture-owner", "website"),
-            ],
-        };
-        let ctx = ResolutionContext {
-            account_dir: Some(&dir),
-            llm: None,
-            parser: None,
-            shortcuts: None,
-            site_search: None,
-            domain_grounder: None,
-            region_hint: "",
-        };
-        let Some(resolved) = resolve_entry_url("download all my invoices from github", None, &ctx)
-        else {
-            panic!("entity tier resolves");
-        };
-        assert_eq!(resolved.source, RouteSource::AccountEntity);
-        assert_eq!(
-            resolved.url.as_str(),
-            "https://github.com/fixture-owner/invoices"
-        );
-    }
-
-    #[test]
-    fn entity_resolver_falls_through_to_honest_miss_without_connected_account() {
-        // No directory wired, and no ladder rung grounds the site slot
-        // either: an entity-dependent prompt is an honest miss, not a
-        // search page. The caller turns the miss into "try the full domain
-        // or save a site shortcut".
-        assert_eq!(
-            resolve_entry_url("check out my portopsy on github", None, &empty_ctx()),
-            None
-        );
     }
 
     #[test]
@@ -1230,7 +1157,6 @@ mod tests {
 
     fn in_page_ctx(search: &StubSiteSearch) -> ResolutionContext<'_> {
         ResolutionContext {
-            account_dir: None,
             llm: None,
             parser: None,
             shortcuts: None,
@@ -1293,32 +1219,6 @@ mod tests {
 
     #[test]
     fn validation_rejects_credentials_and_non_https_across_all_tiers() {
-        // Entity tier with a hostile directory URL fails closed without
-        // falling through to search.
-        struct EvilDirectory;
-        impl AccountDirectory for EvilDirectory {
-            fn github_repos(&self) -> Result<Vec<RepoRef>, DirectoryError> {
-                Ok(vec![RepoRef {
-                    owner: "evil".into(),
-                    name: "portopsy".into(),
-                    html_url: "https://user:secret@github.com/evil/portopsy".into(),
-                }])
-            }
-        }
-        let evil_dir = EvilDirectory;
-        let ctx = ResolutionContext {
-            account_dir: Some(&evil_dir),
-            llm: None,
-            parser: None,
-            shortcuts: None,
-            site_search: None,
-            domain_grounder: None,
-            region_hint: "",
-        };
-        assert_eq!(
-            resolve_entry_url("check out my portopsy on github", None, &ctx),
-            None
-        );
         // LLM tier: credentials and non-https both fail closed.
         for answer in [
             "https://user:pass@github.com/settings/billing",
@@ -1330,7 +1230,6 @@ mod tests {
                 answer: Some(answer.into()),
             };
             let ctx = ResolutionContext {
-                account_dir: None,
                 llm: Some(&evil),
                 parser: None,
                 shortcuts: None,
@@ -1370,7 +1269,6 @@ mod tests {
             answer: Some("https://github.com.evil.com/x".into()),
         };
         let ctx = ResolutionContext {
-            account_dir: None,
             llm: Some(&evil),
             parser: None,
             shortcuts: None,
@@ -1387,7 +1285,6 @@ mod tests {
             answer: Some("https://github.com/settings/billing".into()),
         };
         let ctx = ResolutionContext {
-            account_dir: None,
             llm: Some(&kind),
             parser: None,
             shortcuts: None,
@@ -1417,7 +1314,6 @@ mod tests {
             answer: Some("https://github.com/settings/billing".into()),
         };
         let ctx = ResolutionContext {
-            account_dir: None,
             llm: Some(&llm),
             parser: None,
             shortcuts: Some(&store),
@@ -1434,7 +1330,7 @@ mod tests {
 
     #[test]
     fn resolution_is_prompt_only_with_no_static_route_table() {
-        // Nothing between the entity tier and the honest miss: a
+        // No rung between the ladder and the honest miss: a
         // portal-shaped prompt that the deleted table used to answer now
         // misses instead of inventing a deep link — no static route table,
         // no search page standing in for a destination.
@@ -1471,7 +1367,6 @@ mod tests {
         region_hint: &'a str,
     ) -> ResolutionContext<'a> {
         ResolutionContext {
-            account_dir: None,
             llm: None,
             parser: None,
             shortcuts,

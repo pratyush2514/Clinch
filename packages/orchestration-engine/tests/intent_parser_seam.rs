@@ -47,7 +47,6 @@ fn link(backend_node_id: i64, name: &str) -> AxElement {
 
 fn ctx_with(parser: Option<&Arc<dyn IntentParser>>) -> ResolutionContext<'_> {
     ResolutionContext {
-        account_dir: None,
         llm: None,
         parser,
         shortcuts: None,

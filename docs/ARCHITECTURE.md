@@ -34,21 +34,21 @@ Dependency direction is desktop → orchestration → macro → browser driver; 
 
 ### Task macros
 
-`TaskWorkspace → run_task → Engine::run_task → HealingReplay`.
+`CommandPalette → run_task → Engine::run_task → HealingReplay`.
 
 The current form replays an existing macro by workflow name. The backend's `TaskRequest::plan` can construct navigate, optional link click, and download-links steps for a first run when selectors are supplied by an API caller. Both paths checkpoint before and after each step. Completed first runs publish a versioned macro atomically.
 
-Task replay requires a headless browser. Startup recovery marks unfinished task state interrupted; it does not repeat uncertain actions or provide a resume API. Selector repair is confined to a failed target or wait stage, with no repetition of an action whose wait failed.
+Task replay requires a browser with no visible window (off-screen headed — true `--headless` was removed). Startup recovery marks unfinished task state interrupted; it does not repeat uncertain actions or provide a resume API. Selector repair is confined to a failed target or wait stage, with no repetition of an action whose wait failed.
 
 ### Playbooks and natural-language commands
 
-`WorkflowForm → save_playbook/list_playbooks/execute_playbook → run_steps`.
+`CommandPalette / playbook UI → save_playbook/list_playbooks/execute_playbook → run_steps`.
 
 Playbooks contain legacy selector steps or semantic intents. Legacy playbook steps use `replay_step`, not the task lane's `HealingReplay`; selector failures stop for repair. Semantic intents ground role, label, and optional contextual fields against live accessibility data, then use node geometry for clicks.
 
 `CommandBar → dispatch_natural_command → resolve_command` chooses a saved playbook, one ephemeral semantic intent, or a plural batch. Saved-name/host matching is deterministic. Ephemeral parsing can invoke a configured intent provider, with a deterministic fallback for returned failures or invalid output.
 
-Cold-path entry routing uses a tiered resolver, not a curated route table (deleted): explicit domain → account directory (unwired) → LLM intent adapter (unwired) → direct-open grounding ladder (saved site shortcut → structured site directory → fenced domain grounder) → honest miss or grounded search fallback. The directory rung is composite: Brave Search API when `CLINCH_BRAVE_API_KEY` is set, keyless DuckDuckGo HTML as the zero-config fallback — backend HTTP in memory, so the browser never sees a search page. The production grounder is `LlmDomainGrounder::from_env()` — Groq cloud via `GROQ_API_KEY`, or local Ollama via `CLINCH_GROUNDER_PROVIDER` — declining to a stub when unconfigured or offline. It returns only a bare domain from the site slot plus a region hint; the domain is validated in Rust (https, valid TLD, no credentials, no raw IP) before anything navigates, and a malformed response degrades to the next rung, never to a guessed `www.{noun}.com`. An entry URL on the first semantic step supports pre-navigation and re-anchoring; the separate `entry_urls` table is not read on this dispatch path. After a grounded navigation succeeds, the service journals a consent-gated shortcut offer; an accepted save persists a site shortcut that later runs resolve through the shortcut rung with no model call.
+Cold-path entry routing uses a tiered resolver, not a curated route table (deleted): explicit domain → configured LLM adapter (unwired seam — production passes `None`) → direct-open grounding ladder (saved site shortcut → structured site directory → fenced domain grounder) → honest miss or grounded search fallback. (The old connected-account entity tier was removed 2026-09-27: no adapter was ever wired.) The directory rung is composite: Brave Search API when `CLINCH_BRAVE_API_KEY` is set, keyless DuckDuckGo HTML as the zero-config fallback — backend HTTP in memory, so the browser never sees a search page. The production grounder is `LlmDomainGrounder::from_env()` — Groq cloud via `GROQ_API_KEY`, or local Ollama via `CLINCH_GROUNDER_PROVIDER` — declining to a stub when unconfigured or offline. It returns only a bare domain from the site slot plus a region hint; the domain is validated in Rust (https, valid TLD, no credentials, no raw IP) before anything navigates, and a malformed response degrades to the next rung, never to a guessed `www.{noun}.com`. An entry URL on the first semantic step supports pre-navigation and re-anchoring; the separate `entry_urls` table is not read on this dispatch path. After a grounded navigation succeeds, the service journals a consent-gated shortcut offer; an accepted save persists a site shortcut that later runs resolve through the shortcut rung with no model call.
 
 Plural dispatch snapshots candidates, asks for batch approval, and checks approval before each click. It caps execution at 30 candidates and stops on drift/failure. Candidate ordering follows snapshot document order, not a geometric visual sort.
 

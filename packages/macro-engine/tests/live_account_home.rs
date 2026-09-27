@@ -1,6 +1,6 @@
 //! Live-browser proof for the account-home worker (`pursue_account_home`).
 //!
-//! A real headless Chromium against real DOM: no mocks, no fixtures — the
+//! A real off-screen Chromium against real DOM: no mocks, no fixtures — the
 //! worker clicks a blind avatar, a menu opens, a profile link is clicked, the
 //! URL changes, and the verifier decides. A tiny `std`-only HTTP server plays
 //! the portal.
@@ -136,9 +136,9 @@ fn chromium_path() -> PathBuf {
 }
 
 async fn launch(profile_dir: &std::path::Path) -> ManagedBrowser {
-    ManagedBrowser::launch_with_options(&chromium_path(), profile_dir, LaunchOptions::replay())
+    ManagedBrowser::launch_with_options(&chromium_path(), profile_dir, LaunchOptions::offscreen_headed())
         .await
-        .expect("launch headless Chromium")
+        .expect("launch off-screen Chromium")
 }
 
 async fn goto(browser: &ManagedBrowser, origin: &Url, path: &str) -> Url {
@@ -170,7 +170,7 @@ fn href_gate_assertions() {
 }
 
 #[tokio::test]
-#[ignore = "needs CLINCH_CHROMIUM_PATH and launches a real headless browser"]
+#[ignore = "needs CLINCH_CHROMIUM_PATH and launches a real off-screen browser"]
 async fn live_account_home_proof() {
     href_gate_assertions();
 

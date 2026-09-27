@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 //! Embedded CDP screencast streaming for the UI preview card.
 //!
-//! The app-owned background browser renders headless, so the workspace
+//! The app-owned background browser renders off-screen headed, so the workspace
 //! shows its viewport through `Page.startScreencast` instead of OS window
 //! capture. Frames flow as base64 JPEG over the existing Tauri IPC channel
 //! pattern; every frame is acknowledged back to the renderer, otherwise
@@ -117,9 +117,12 @@ mod tests {
     /// Chromium-gated fixtures.
     #[tokio::test]
     async fn test_lazy_context_acquisition_and_release() -> Result<(), Box<dyn std::error::Error>> {
-        // Dormant by default: background acquisition is headless by
-        // construction, so no OS window can ever spawn on this path.
-        assert_eq!(LaunchOptions::replay().mode, WindowMode::Headless);
+        // Dormant by default: background acquisition is off-screen headed
+        // by construction, so no visible window can ever spawn on this path.
+        assert_eq!(
+            LaunchOptions::offscreen_headed().mode,
+            WindowMode::Offscreen
+        );
         assert_eq!(LaunchOptions::interactive().mode, WindowMode::Headed);
         // Failed acquisition leaves nothing behind: a missing executable
         // fails fast at spawn with no child process and no retained state
@@ -129,7 +132,7 @@ mod tests {
         let profile = dir.path().join("profile");
         for _ in 0..2 {
             assert!(matches!(
-                ManagedBrowser::launch_with_options(&missing, &profile, LaunchOptions::replay())
+                ManagedBrowser::launch_with_options(&missing, &profile, LaunchOptions::offscreen_headed())
                     .await,
                 Err(BrowserError::Launch)
             ));

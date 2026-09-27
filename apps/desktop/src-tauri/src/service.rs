@@ -34,7 +34,7 @@ pub enum AppError {
     /// Extension bridge reports a logged-out session for the target portal.
     /// Carries the full human-readable message so the UI can surface it.
     AuthenticationRequired(String),
-    /// Picking needs the visible managed window: replays run headless, so an
+    /// Picking needs the visible managed window: replays run off-screen, so an
     /// overlay armed there can never receive a click.
     PickerUnavailable,
 }
@@ -97,7 +97,7 @@ pub struct BridgeStatus {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PickerStatus {
-    /// True only with a headed (visible-window) browser connected. Headless
+    /// True only with a headed (visible-window) browser connected. Off-screen
     /// replay targets and absent browsers both report false.
     ready: bool,
 }
@@ -188,9 +188,9 @@ enum AcquireAction {
 /// Background never restarts: it reuses whatever is attached, so a run can
 /// neither open a visible window nor close one the user opened. Interactive restarts
 /// only when the live session shows no visible window. [`BrowserIntent::ChallengeEscalation`]
-/// restarts a headless session into off-screen headed (cookies carried in
-/// memory by the restart path) and reuses a session that is already headed
-/// or off-screen.
+/// reuses any attached session (off-screen headed or visible-headed),
+/// launching off-screen headed only when dormant (cookies carried in
+/// memory by the restart path).
 fn acquire_action(intent: BrowserIntent, attached: Option<WindowMode>) -> AcquireAction {
     match (intent, attached) {
         (_, None) => AcquireAction::Launch,
@@ -199,10 +199,7 @@ fn acquire_action(intent: BrowserIntent, attached: Option<WindowMode>) -> Acquir
         | (BrowserIntent::ChallengeEscalation, Some(WindowMode::Headed | WindowMode::Offscreen)) => {
             AcquireAction::Reuse
         }
-        (BrowserIntent::Interactive, Some(_))
-        | (BrowserIntent::ChallengeEscalation, Some(WindowMode::Headless)) => {
-            AcquireAction::Restart
-        }
+        (BrowserIntent::Interactive, Some(_)) => AcquireAction::Restart,
     }
 }
 
@@ -755,7 +752,8 @@ impl AppService {
             return Err(AppError::SessionRequired);
         }
         // Task runs are background work in both modes: replay additionally
-        // *requires* headless (`EngineError::HeadlessRequired`), and a
+        // requires a browser with no visible window
+        // (`EngineError::NoVisibleWindowRequired`), and a
         // first-run recording has no reason to put a window on screen either.
         let browser = self.browser(BrowserIntent::Background).await?;
         self.engine()
@@ -988,9 +986,9 @@ impl AppService {
         if let Some(user_agent) = session_sync::source_user_agent(request.browser()) {
             let _ = browser.mirror_user_agent(&user_agent).await;
         }
-        // Headless-first note: session establishment itself stays interactive
+        // Off-screen-first note: session establishment itself stays interactive
         // (the user may need to see login/2FA), but every macro replay runs
-        // headless via `run_task()` → `browser(mode == Replay)`.
+        // off-screen headed via `run_task()` on a `BrowserIntent::Background` browser.
         let injected = match prepared {
             PreparedSync::Cookies(cookies) => {
                 if browser.inject(&cookies).await.is_ok() {
@@ -1545,7 +1543,7 @@ impl AppService {
     }
 
     /// Arm the visual element picker overlay on the live target. Refuses
-    /// headless targets outright: an invisible overlay can never be clicked,
+    /// off-screen targets outright: an invisible overlay can never be clicked,
     /// and silently arming one is exactly the stuck-`Picking…` trap.
     pub async fn picker_enable(&self) -> Result<(), AppError> {
         let browser = {
@@ -2374,7 +2372,6 @@ impl AppService {
                 None => &stub_grounder,
             };
             let ctx = orchestration_engine::ResolutionContext {
-                account_dir: None,
                 llm: None,
                 parser: None,
                 shortcuts: Some(&shortcut_store),
@@ -3128,7 +3125,7 @@ impl AppService {
                     // The headed session's job is done: shut it down
                     // gracefully so no phantom window lingers. Clearance
                     // persists in the app profile on disk, so the next
-                    // acquisition lazily launches headless again.
+                    // acquisition lazily launches off-screen headed again.
                     self.stand_down_escalated_browser().await;
                 }
                 Ok(false) => {
@@ -3433,7 +3430,6 @@ impl AppService {
                 None => &stub_grounder,
             };
             let ctx = orchestration_engine::ResolutionContext {
-                account_dir: None,
                 llm: None,
                 parser: None,
                 shortcuts: Some(&shortcut_store),
@@ -5425,7 +5421,7 @@ impl AppService {
             None => ContextStatus {
                 attached: false,
                 headless: true,
-                window_mode: browser_driver::WindowMode::Headless,
+                window_mode: browser_driver::WindowMode::Offscreen,
             },
         })
     }
@@ -5616,7 +5612,7 @@ impl AppService {
     }
 
     /// Gracefully shut down the attached (headed, post-escalation) browser
-    /// and detach it, so the next acquisition lazily launches headless. The
+    /// and detach it, so the next acquisition lazily launches off-screen headed. The
     /// app profile on disk keeps any clearance cookies; a fresh challenge
     /// simply escalates again. Only used after a *cleared* escalation — a
     /// persistent challenge keeps the headed session alive for L2 Take
@@ -5656,7 +5652,7 @@ impl AppService {
         }
         // The restart carries cookies in memory and swaps the attached
         // session: the run continues in the headed browser afterwards —
-        // no cookie handoff back to a headless instance mid-run.
+        // no cookie handoff back to an off-screen instance mid-run.
         let browser = self.browser(BrowserIntent::ChallengeEscalation).await?;
         browser
             .navigate(&parsed)
@@ -5693,8 +5689,8 @@ impl AppService {
         }
     }
 
-    /// Lazily attach the app-owned background Chromium (headless: no OS
-    /// window, dedicated Clinch profile) and stream its viewport into
+    /// Lazily attach the app-owned background Chromium (off-screen headed:
+    /// no visible window, dedicated Clinch profile) and stream its viewport into
     /// `emit` until released, retaken, or re-acquired. Reuses the live
     /// session when one is already attached. Nothing launches on startup
     /// or on status reads — only dispatch, sync flows, and this call
@@ -5778,7 +5774,7 @@ impl AppService {
     /// without credentials; the headed window opens directly on it. This is
     /// the challenge-takeover path: the user solves a human-verification
     /// gate once in a real window, and the shared profile keeps the
-    /// clearance for later headless runs.
+    /// clearance for later background runs.
     pub async fn take_control(&self, url: Option<String>) -> Result<ContextStatus, AppError> {
         // The one and only path that may put a window on screen.
         let browser = self.browser(BrowserIntent::Interactive).await?;
@@ -6325,13 +6321,9 @@ pub(crate) mod tests {
             );
         }
         // 3. Background NEVER restarts, in either direction: it cannot
-        //    promote a headless context into a window, and it cannot demote
+        //    promote an off-screen context into a window, and it cannot demote
         //    a window the user opened with Take Control.
-        for attached in [
-            WindowMode::Headless,
-            WindowMode::Headed,
-            WindowMode::Offscreen,
-        ] {
+        for attached in [WindowMode::Headed, WindowMode::Offscreen] {
             assert_eq!(
                 acquire_action(BrowserIntent::Background, Some(attached)),
                 AcquireAction::Reuse,
@@ -6341,10 +6333,6 @@ pub(crate) mod tests {
         // 4. Interactive restarts only when the live session shows no
         //    visible window, and reuses an already-visible one.
         assert_eq!(
-            acquire_action(BrowserIntent::Interactive, Some(WindowMode::Headless)),
-            AcquireAction::Restart
-        );
-        assert_eq!(
             acquire_action(BrowserIntent::Interactive, Some(WindowMode::Offscreen)),
             AcquireAction::Restart
         );
@@ -6352,16 +6340,8 @@ pub(crate) mod tests {
             acquire_action(BrowserIntent::Interactive, Some(WindowMode::Headed)),
             AcquireAction::Reuse
         );
-        // 5. Escalation restarts a headless session into off-screen headed,
-        //    and reuses a session that already has (hidden or visible)
-        //    windows instead of relaunching it.
-        assert_eq!(
-            acquire_action(
-                BrowserIntent::ChallengeEscalation,
-                Some(WindowMode::Headless)
-            ),
-            AcquireAction::Restart
-        );
+        // 5. Escalation reuses any attached session — headed-visible or
+        //    off-screen — instead of relaunching it.
         assert_eq!(
             acquire_action(
                 BrowserIntent::ChallengeEscalation,
@@ -8092,7 +8072,6 @@ pub(crate) mod tests {
         let map = service.load_shortcut_map().await.ok_or("shortcut map")?;
         let shortcuts = orchestration_engine::InMemoryShortcuts::new(map);
         let ctx = orchestration_engine::ResolutionContext {
-            account_dir: None,
             llm: None,
             parser: None,
             shortcuts: Some(&shortcuts),

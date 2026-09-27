@@ -117,7 +117,7 @@ function view(entries: ThreadEntry[], overrides: Partial<Parameters<typeof Actio
       liveFrame={null}
       agentCursor={null}
       headless
-      windowMode="headless"
+      windowMode="offscreen"
       browserBusy={false}
       onDecide={vi.fn()}
       onRename={vi.fn()}
@@ -210,7 +210,7 @@ describe("ActionThread", () => {
     // Enlarging a frame acts on nothing, so every turn that has one offers it.
     expect(screen.getAllByRole("button", { name: "Open Preview" })).toHaveLength(2);
     expect(screen.getByText("final frame")).toBeDefined();
-    expect(screen.getByText("live · headless background session")).toBeDefined();
+    expect(screen.getByText("live · off-screen headed session")).toBeDefined();
   });
 
   it("offers the one fix a session failure has, instead of only naming it", () => {

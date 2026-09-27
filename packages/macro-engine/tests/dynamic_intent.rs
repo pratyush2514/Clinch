@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 //! Opt-in live-Chromium proof for semantic intent execution.
-//! Requires `CLINCH_CHROMIUM_PATH`; launches an isolated headless profile and
+//! Requires `CLINCH_CHROMIUM_PATH`; launches an isolated off-screen profile and
 //! a loopback fixture page. No personal profile or real portal is touched.
 use browser_driver::{LaunchOptions, ManagedBrowser};
 use macro_engine::SemanticIntent;
@@ -10,7 +10,7 @@ use url::Url;
 const FIXTURE_HTML: &str = "<!doctype html><html><body><button data-testid=\"pay-btn\">Pay now</button><a href=\"/docs\">Docs</a><input type=\"text\" aria-label=\"Email address\"><section aria-label=\"Statements\"><h2>Statement #42</h2><button>Download</button></section><section aria-label=\"Settings\"><button>Download</button></section><script>document.querySelector('button').addEventListener('click', function(){document.body.setAttribute('data-clicked','yes');});document.querySelectorAll('section button')[0].addEventListener('click', function(){document.body.setAttribute('data-statement-clicked','yes');});document.querySelectorAll('section button')[1].addEventListener('click', function(){document.body.setAttribute('data-settings-clicked','yes');});</script></body></html>";
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn intent_executes_without_selectors() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = Url::parse(&format!("http://{}/", listener.local_addr()?))?;
@@ -35,7 +35,7 @@ async fn intent_executes_without_selectors() -> Result<(), Box<dyn std::error::E
     let browser = ManagedBrowser::launch_with_options(
         Path::new(&std::env::var("CLINCH_CHROMIUM_PATH")?),
         &dir.path().join("profile"),
-        LaunchOptions::replay(),
+        LaunchOptions::offscreen_headed(),
     )
     .await?;
     browser.navigate(&url).await?;
@@ -68,7 +68,7 @@ async fn intent_executes_without_selectors() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn container_context_disambiguates_duplicate_buttons()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -94,7 +94,7 @@ async fn container_context_disambiguates_duplicate_buttons()
     let browser = ManagedBrowser::launch_with_options(
         Path::new(&std::env::var("CLINCH_CHROMIUM_PATH")?),
         &dir.path().join("profile"),
-        LaunchOptions::replay(),
+        LaunchOptions::offscreen_headed(),
     )
     .await?;
     browser.navigate(&url).await?;
@@ -131,7 +131,7 @@ async fn container_context_disambiguates_duplicate_buttons()
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn container_query_vetoes_out_of_scope_controls_live()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -157,7 +157,7 @@ async fn container_query_vetoes_out_of_scope_controls_live()
     let browser = ManagedBrowser::launch_with_options(
         Path::new(&std::env::var("CLINCH_CHROMIUM_PATH")?),
         &dir.path().join("profile"),
-        LaunchOptions::replay(),
+        LaunchOptions::offscreen_headed(),
     )
     .await?;
     browser.navigate(&url).await?;

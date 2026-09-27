@@ -34,15 +34,10 @@ fn click_sequence_presses_and_releases_the_left_button() {
 
 #[test]
 fn window_mode_serializes_for_the_ui_badge() {
-    // The frontend badge keys off this string: off-screen headed must not
-    // serialize as "headless".
+    // The frontend badge keys off this string.
     assert_eq!(
         serde_json::to_string(&WindowMode::Offscreen).expect("serializes"),
         "\"offscreen\""
-    );
-    assert_eq!(
-        serde_json::to_string(&WindowMode::Headless).expect("serializes"),
-        "\"headless\""
     );
     assert_eq!(
         serde_json::to_string(&WindowMode::Headed).expect("serializes"),

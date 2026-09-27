@@ -244,8 +244,6 @@ pub enum WindowMode {
     /// Visible headed window (interactive use).
     #[default]
     Headed,
-    /// `--headless=new`: no OS window at all.
-    Headless,
     /// Headed Chromium positioned off-screen and hidden via OS APIs: a
     /// real compositor/GPU for bot-mitigation probes, no visible window.
     /// The OS hide is Windows-only; elsewhere the window sits off-monitor
@@ -268,19 +266,10 @@ impl LaunchOptions {
         }
     }
 
-    /// Background macro replay. No OS window may spawn on this path —
-    /// enforced by `Engine::run_task` (`HeadlessRequired`) and asserted by
-    /// the `headless_replay_*` integration tests.
-    #[must_use]
-    pub fn replay() -> Self {
-        Self {
-            mode: WindowMode::Headless,
-        }
-    }
-
-    /// Automatic bot-challenge escalation: headed for Cloudflare's probes,
-    /// off-screen and OS-hidden so no window appears. Never interactive —
-    /// the window is hidden, not handed to the user.
+    /// Background runs (macro replay included) launch off-screen headed:
+    /// a real headed Chromium (compositor, plugins, screen metrics) with
+    /// no visible window. True `--headless=new` is gone — it is the most
+    /// fingerprinted mode and nothing about a background run needs it.
     #[must_use]
     pub fn offscreen_headed() -> Self {
         Self {
@@ -294,7 +283,6 @@ impl LaunchOptions {
 /// `--headless`) is hermetically testable.
 fn window_mode_args(mode: WindowMode) -> &'static [&'static str] {
     match mode {
-        WindowMode::Headless => &["--headless=new"],
         WindowMode::Headed => &[],
         WindowMode::Offscreen => &[
             // Far-positive: off every monitor, including negative-offset
@@ -701,7 +689,7 @@ impl ManagedBrowser {
     /// Whether the session shows no *visible* window. Off-screen headed
     /// counts: it owns real windows, but they are positioned off-monitor
     /// and OS-hidden, so every no-visible-window contract holds for it —
-    /// replay gating (`HeadlessRequired`), the picker refusal (an
+    /// replay gating (`NoVisibleWindowRequired`), the picker refusal (an
     /// invisible overlay can never be clicked), and status reporting.
     pub fn is_headless(&self) -> bool {
         !matches!(self.mode, WindowMode::Headed)
@@ -1064,24 +1052,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_options_separate_replay_from_interactive() {
-        // Phase B headless-first contract: replays never spawn an OS window.
-        assert_eq!(LaunchOptions::replay().mode, WindowMode::Headless);
-        assert_eq!(LaunchOptions::interactive().mode, WindowMode::Headed);
-        assert_eq!(LaunchOptions::default().mode, WindowMode::Headed);
-        // The escalation rung is headed under the hood but shows no window.
+    fn launch_options_separate_background_from_interactive() {
+        // Background runs never show a window: off-screen headed, never
+        // visible. Interactive is the only visible mode.
         assert_eq!(
             LaunchOptions::offscreen_headed().mode,
             WindowMode::Offscreen
         );
-        assert_ne!(LaunchOptions::offscreen_headed().mode, WindowMode::Headless);
+        assert_eq!(LaunchOptions::interactive().mode, WindowMode::Headed);
+        assert_eq!(LaunchOptions::default().mode, WindowMode::Headed);
     }
 
     #[test]
-    fn window_mode_args_keep_offscreen_headed_not_headless() {
-        // Headless carries exactly the headless flag and nothing else.
-        assert_eq!(window_mode_args(WindowMode::Headless), &["--headless=new"]);
-        // Visible headed adds nothing: it must not inherit off-screen flags.
+    fn window_mode_args_keep_offscreen_headed() {
         assert!(window_mode_args(WindowMode::Headed).is_empty());
         // Off-screen headed: real window geometry, occlusion protection,
         // and crucially no `--headless` — Cloudflare probes a headed
@@ -1276,12 +1259,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Requires CLINCH_CHROMIUM_PATH and launches a real headless browser using a temporary profile"]
-    async fn headless_launch_confirms_no_window() -> Result<(), Box<dyn std::error::Error>> {
+    #[ignore = "Requires CLINCH_CHROMIUM_PATH and launches a real off-screen browser using a temporary profile"]
+    async fn offscreen_launch_confirms_no_window() -> Result<(), Box<dyn std::error::Error>> {
         let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
         let profile = tempfile::tempdir()?;
-        let options = LaunchOptions::replay();
-        assert_eq!(options.mode, WindowMode::Headless);
+        let options = LaunchOptions::offscreen_headed();
+        assert_eq!(options.mode, WindowMode::Offscreen);
         let browser =
             ManagedBrowser::launch_with_options(Path::new(&executable), profile.path(), options)
                 .await?;

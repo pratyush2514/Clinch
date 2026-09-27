@@ -45,7 +45,6 @@ async fn store() -> Result<(tempfile::TempDir, PlaybookStore), Box<dyn std::erro
 fn offline_ctx() -> ResolutionContext<'static> {
     // Production wiring: no account directory, no URL adapter, no parser.
     ResolutionContext {
-        account_dir: None,
         llm: None,
         parser: None,
         shortcuts: None,

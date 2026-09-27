@@ -54,7 +54,6 @@ fn ctx<'a>(
     grounder: Option<&'a dyn DomainGrounder>,
 ) -> ResolutionContext<'a> {
     ResolutionContext {
-        account_dir: None,
         llm: None,
         parser: None,
         shortcuts: None,

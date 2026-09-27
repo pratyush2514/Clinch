@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 //! Opt-in live-Chromium proof for dynamic discovery (AX tree + Set-of-Marks).
-//! Requires `CLINCH_CHROMIUM_PATH`; launches isolated headless profiles and a
+//! Requires `CLINCH_CHROMIUM_PATH`; launches isolated off-screen profiles and a
 //! loopback fixture page. No personal profile or real portal is touched.
 use browser_driver::{LaunchOptions, ManagedBrowser, Mark};
 use std::{path::Path, time::Duration};
@@ -31,24 +31,24 @@ async fn fixture_page() -> Result<(Url, tokio::task::JoinHandle<()>), Box<dyn st
     Ok((url, task))
 }
 
-async fn headless_browser(
+async fn background_browser(
     dir: &tempfile::TempDir,
 ) -> Result<ManagedBrowser, Box<dyn std::error::Error>> {
     let executable = std::env::var("CLINCH_CHROMIUM_PATH")?;
     Ok(ManagedBrowser::launch_with_options(
         Path::new(&executable),
         &dir.path().join("profile"),
-        LaunchOptions::replay(),
+        LaunchOptions::offscreen_headed(),
     )
     .await?)
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn ax_snapshot_lists_interactive_controls() -> Result<(), Box<dyn std::error::Error>> {
     let (url, server) = fixture_page().await?;
     let dir = tempfile::tempdir()?;
-    let browser = headless_browser(&dir).await?;
+    let browser = background_browser(&dir).await?;
     browser.navigate(&url).await?;
     let (elements, _, _) = browser.ax_snapshot(&url).await;
     assert!(elements.iter().any(|element| element.role == "button"
@@ -70,14 +70,14 @@ async fn ax_snapshot_lists_interactive_controls() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn picker_overlay_pick_resolves_through_binding() -> Result<(), Box<dyn std::error::Error>> {
     // Exercises the exact production path the Pick Element button drives:
     // overlay install, real dispatched input through the overlay, binding
     // event back to Rust. A timeout here reproduces the reported no-pick.
     let (url, server) = fixture_page().await?;
     let dir = tempfile::tempdir()?;
-    let browser = headless_browser(&dir).await?;
+    let browser = background_browser(&dir).await?;
     browser.navigate(&url).await?;
     browser.enable_picker().await?;
     let (elements, _, _) = browser.ax_snapshot(&url).await;
@@ -109,11 +109,11 @@ async fn picker_overlay_pick_resolves_through_binding() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
-#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated headless fixture"]
+#[ignore = "Requires CLINCH_CHROMIUM_PATH; isolated off-screen fixture"]
 async fn som_badges_render_and_click_activates() -> Result<(), Box<dyn std::error::Error>> {
     let (url, server) = fixture_page().await?;
     let dir = tempfile::tempdir()?;
-    let browser = headless_browser(&dir).await?;
+    let browser = background_browser(&dir).await?;
     browser.navigate(&url).await?;
     let (elements, _, _) = browser.ax_snapshot(&url).await;
     let button = elements
