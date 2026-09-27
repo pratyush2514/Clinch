@@ -2,6 +2,17 @@
 
 Owner: Pratyush. Reconciled 2026-09-25 against current code.
 
+## Product direction (2026-09-27)
+
+[CONSTITUTION.md](CONSTITUTION.md) is now the product authority and
+supersedes any product-direction statement in this file. In short: Clinch
+turns a short intent into a finished action on a real website or a saved
+playbook — five v1 intents (`OPEN` / `GO` / `DO` / `WATCH` / `ASK_ME`), one
+engine with three faces (web flagship, phone wrapper, desktop pro/privacy),
+hybrid deployment (hosted Linux worker default for consumers, local worker
+for pro/privacy, personal-cloud bridge between). Everything below remains
+an accurate reconciliation of *current code*, not the target.
+
 ## Product purpose
 
 Clinch provides a local desktop workspace for repeatable browser actions, visible execution, explicit approvals, and reusable workflows. The implementation is a generic browser workflow tool; it does not ship the previously proposed Job Application Engine, Invoice Harvester product, or Deal Radar.

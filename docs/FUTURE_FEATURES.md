@@ -2,6 +2,26 @@
 
 Everything here is unimplemented or incomplete. This is an idea backlog, not a delivery schedule or description of the current product. Current behavior is documented in [FEATURES.md](FEATURES.md) and [STATUS.md](STATUS.md).
 
+## Constitution mapping (2026-09-27)
+
+[CONSTITUTION.md](CONSTITUTION.md) now decides what this backlog means.
+Items below are mapped, not deleted:
+
+- **Planned tranches:** scheduling + background execution → T3 (recurring
+  value); playbook management/import/export → T3; mobile/remote approvals
+  → T2 phone face; household administration + delegated approvals → T6;
+  credential/profile vault → prerequisite of T2 hosted sign-in (new work,
+  not previously scheduled); structured playbook approval auditing →
+  T4 trust product.
+- **Explicitly not v1:** job-application engine, ATS adapters, price
+  monitoring as a product, Notion/Slack exports, shared playbook
+  marketplace, native-app automation, proactive reminders/notifications,
+  "turn a Reel into a list"-style content features, avatars/personality
+  packs.
+- **Stays exploration:** email/bank connections (new consent and
+  data-handling contracts required first); long-running goals above
+  playbooks.
+
 ## Reliability and packaging
 
 - Real-portal regression coverage, platform parity validation, and a clear supported-browser matrix.

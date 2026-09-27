@@ -2,6 +2,11 @@
 
 This inventory follows current code. It does not imply real-portal acceptance or production readiness. See [STATUS.md](STATUS.md) for verification limits.
 
+> Constitution note (2026-09-27): [CONSTITUTION.md](CONSTITUTION.md) plans to
+> converge the command bar / workflow builder / task workspace into one
+> thread with playbooks as rows under it. Until that lands, this file
+> describes the UI as built.
+
 ## Sessions and browser visibility
 
 - Explicitly consented local-profile import for Chrome, Brave, and Edge, with macOS Keychain and Windows DPAPI implementations.

@@ -2,6 +2,10 @@
 
 Reconciled on 2026-09-25 against the current working tree. Code is the source of truth. This file summarizes that code; it does not supersede it.
 
+> Product direction moved on 2026-09-27: [CONSTITUTION.md](CONSTITUTION.md)
+> is the authority on where Clinch is going. This file stays an accurate
+> record of what is built.
+
 ## Implemented
 
 - Tauri v2/React desktop shell with resizable panes, session controls, command bar, workflow builder, task workspace, and approvals.

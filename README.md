@@ -2,6 +2,12 @@
 
 Clinch is a Tauri v2 desktop app for local browser workflows. It connects to a managed Chromium process over CDP, imports browser sessions with consent, runs recorded macros and semantic playbooks, and displays progress and approval requests.
 
+> Product direction (2026-09-27): [docs/CONSTITUTION.md](docs/CONSTITUTION.md)
+> is now the product authority — Clinch turns a short intent into a finished
+> action on a real website or a saved playbook, one engine with three faces
+> (web flagship, phone wrapper, desktop pro/privacy). This README still
+> describes the current working-tree code accurately.
+
 The current working-tree code is the source of truth. [Build status](docs/STATUS.md) records the implemented scope and validation limits; [architecture](docs/ARCHITECTURE.md) and [technical contracts](docs/TRD.md) explain the execution paths. Future ideas are isolated in [FUTURE_FEATURES.md](docs/FUTURE_FEATURES.md).
 
 ## Run locally

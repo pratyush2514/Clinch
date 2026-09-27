@@ -2,6 +2,12 @@
 
 Reconciled against the working-tree implementation on 2026-09-25. Code is authoritative; this document describes existing paths, not a target architecture.
 
+> Target direction: [CONSTITUTION.md](CONSTITUTION.md) (adopted 2026-09-27).
+> The daemon split (`clinch-daemon` + thin client, see
+> [wsl2-daemon.md](wsl2-daemon.md)) is the first step toward the
+> constitution's hybrid model: one Rust worker binary, hosted Linux worker
+> for consumers, local worker for pro/privacy.
+
 ## Runtime and ownership
 
 The React/TypeScript frontend runs in Tauri's webview. Rust commands in [lib.rs](../apps/desktop/src-tauri/src/lib.rs) delegate to [AppService](../apps/desktop/src-tauri/src/service.rs), which owns the database pool, managed browser handle, connected portal, pending approvals, and completed-run registry.

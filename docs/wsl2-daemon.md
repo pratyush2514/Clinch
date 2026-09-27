@@ -3,6 +3,11 @@
 > Status: `clinch-daemon` is a standalone Linux binary; the Windows Tauri app
 > becomes a thin client when `CLINCH_DAEMON_URL` is set. Wire protocol:
 > `packages/clinch-protocol/PROTOCOL.md`.
+>
+> Constitution alignment (2026-09-27): Linux is the worker OS and Windows is
+> a client; WSL is how *we* develop the worker, not how customers install.
+> This lab is the path toward the constitution's hybrid model
+> ([CONSTITUTION.md](CONSTITUTION.md) §6).
 
 ## 1. Goal + the deal
 
