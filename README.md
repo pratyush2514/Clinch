@@ -1,12 +1,13 @@
-# Clinch — Local Action Studio
+# Clinch
 
-Clinch is a Tauri v2 desktop app for local browser workflows. It connects to a managed Chromium process over CDP, imports browser sessions with consent, runs recorded macros and semantic playbooks, and displays progress and approval requests.
+Clinch does the boring step on a real website for you — and lets you watch it happen. You describe what you want in plain words, Clinch drives a real browser the way a person would, and it never sends, spends, or leaves the site you named without your tap.
+
+It is the local, consent-first alternative to cloud assistants for people who want control: the browser is yours, a login is lent once with your consent, every irreversible action is a tap, and when a site fights back you get the window handed to you instead of silence. Recurring admin — bills, portals, forms that stop before submit — saved as playbooks you replay next month.
 
 > Product direction (2026-09-27): [docs/CONSTITUTION.md](docs/CONSTITUTION.md)
-> is now the product authority — Clinch turns a short intent into a finished
-> action on a real website or a saved playbook, one engine with three faces
-> (web flagship, phone wrapper, desktop pro/privacy). This README still
-> describes the current working-tree code accurately.
+> is now the product authority. [docs/PRD.md](docs/PRD.md) states the product
+> the way a new reader should meet it — including how Clinch positions next
+> to Muse. This README still describes the current working-tree code accurately.
 
 The current working-tree code is the source of truth. [Build status](docs/STATUS.md) records the implemented scope and validation limits; [architecture](docs/ARCHITECTURE.md) and [technical contracts](docs/TRD.md) explain the execution paths. [Cloud transition](docs/cloud-transition.md) explains the product, the goals, and the local-to-cloud switch for new contributors (human or agent). Future ideas are isolated in [FUTURE_FEATURES.md](docs/FUTURE_FEATURES.md).
 
