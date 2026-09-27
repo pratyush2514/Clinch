@@ -41,7 +41,7 @@ Chromium is a separate process with an app-owned persistent `browser-profile`, n
 
 Application data contains `clinch.db` (SQLite WAL), `macros/<workflow>.json`, download directories, and the Chromium profile. Playbooks store their steps in SQLite; they do not require an attached macro file. Imported cookie values and Safe Storage keys are not written to the application database. Source cookie databases are temporarily copied for reading, and Chromium manages persistence of its own cookies and storage.
 
-Planning and route lookup do not require a model. Optional `CLINCH_INTENT_PROVIDER` enables structured intent parsing; optional `CLINCH_REPAIR_PROVIDER` enables local selector repair in the task lane. See [provider setup](docs/PHASE_A_FINAL_INTEGRATION.md) for the separate contracts and limits.
+Planning and route lookup do not require a model. Optional `CLINCH_INTENT_PROVIDER` enables structured intent parsing; optional `CLINCH_REPAIR_PROVIDER` enables local selector repair in the task lane. See [provider contracts](docs/TRD.md) for the separate contracts and limits.
 
 ## Verification
 
