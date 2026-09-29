@@ -10,9 +10,9 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import ActionThread from "./ActionThread";
-import { threadReducer, type ThreadAction, type ThreadEntry } from "../lib/thread";
-import type { PlaybookApproval } from "../lib/ipc";
+import ActionThread from "../../src/components/ActionThread";
+import { threadReducer, type ThreadAction, type ThreadEntry } from "../../src/lib/thread";
+import type { PlaybookApproval } from "../../src/lib/ipc";
 
 const FRAME = "/9j/4AAQSkZJRg==";
 

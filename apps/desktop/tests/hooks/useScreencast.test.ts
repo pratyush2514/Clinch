@@ -14,8 +14,8 @@ import {
   isCursorStream,
   isIntactJpegFrame,
   useScreencast,
-} from "./useScreencast";
-import { CURSOR_EVENT, SCREENCAST_EVENT } from "../lib/ipc";
+} from "../../src/hooks/useScreencast";
+import { CURSOR_EVENT, SCREENCAST_EVENT } from "../../src/lib/ipc";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),

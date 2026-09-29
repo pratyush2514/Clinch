@@ -17,7 +17,7 @@ import {
   tierFor,
   type ThreadAction,
   type ThreadEntry,
-} from "./thread";
+} from "../../src/lib/thread";
 
 function fold(actions: ThreadAction[]): ThreadEntry[] {
   return actions.reduce(threadReducer, [] as ThreadEntry[]);

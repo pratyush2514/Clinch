@@ -8,8 +8,8 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
-import ScreencastCard, { contentRect, cursorOffset, sessionBadgeLabel } from "./ScreencastCard";
-import type { AgentCursor } from "../lib/ipc";
+import ScreencastCard, { contentRect, cursorOffset, sessionBadgeLabel } from "../../src/components/ScreencastCard";
+import type { AgentCursor } from "../../src/lib/ipc";
 
 describe("sessionBadgeLabel", () => {
   it("labels an off-screen headed session as headed, not headless", () => {

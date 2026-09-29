@@ -8,8 +8,8 @@ export default defineConfig({
   server: { host: "127.0.0.1", port: 1420, strictPort: true },
   test: {
     environment: "jsdom",
-    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
-    setupFiles: ["./src/test/setup.ts"],
+    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
+    setupFiles: ["./tests/setup.ts"],
     // The thread's behavior is proven against the DOM, not against a running
     // backend: no Tauri runtime is available under jsdom.
     restoreMocks: true,
