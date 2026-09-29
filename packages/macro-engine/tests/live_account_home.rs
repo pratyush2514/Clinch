@@ -192,6 +192,7 @@ async fn live_account_home_proof() {
             label,
             landed,
             username,
+            ..
         }) => {
             assert_eq!(label, "Profile");
             assert_eq!(landed.path(), "/user/kx7");

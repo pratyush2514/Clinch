@@ -30,6 +30,7 @@ fn verifier_accepts_page_revealed_username_in_path() {
             label,
             landed,
             username,
+            ..
         } => {
             assert_eq!(label, "u/someuser");
             assert_eq!(landed, current);

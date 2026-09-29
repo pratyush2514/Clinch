@@ -3940,7 +3940,14 @@ impl AppService {
         }
         match macro_engine::pursue_page_goal(&browser, &portal, &noun, navigator, escalation).await
         {
-            Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
+            Ok(macro_engine::PageGoalOutcome::Navigated {
+                label,
+                landed,
+                hit_lines,
+            }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: '{label}' → {}",
@@ -4322,7 +4329,11 @@ impl AppService {
                 label,
                 landed,
                 username,
+                hit_lines,
             }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: verified '{label}' → {}",
@@ -4503,7 +4514,14 @@ impl AppService {
         // against the live page here and becomes a miss when it fails.
         match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
         {
-            Ok(macro_engine::PageGoalOutcome::Navigated { label, landed }) => {
+            Ok(macro_engine::PageGoalOutcome::Navigated {
+                label,
+                landed,
+                hit_lines,
+            }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
                 // The worker reached a token-named landing but could not
                 // verify it from the page itself. The run completes only
                 // when the live page now passes the verb's verifier —
@@ -4532,7 +4550,15 @@ impl AppService {
                     Err(AppError::WorkflowFailed(journal))
                 }
             }
-            Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
+            Ok(macro_engine::PageGoalOutcome::Verified {
+                label,
+                landed,
+                hit_lines,
+                ..
+            }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: verified '{label}' → {}",
@@ -4604,7 +4630,15 @@ impl AppService {
     ) -> Result<DispatchOutcome, AppError> {
         match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
         {
-            Ok(macro_engine::PageGoalOutcome::Verified { label, landed, .. }) => {
+            Ok(macro_engine::PageGoalOutcome::Verified {
+                label,
+                landed,
+                hit_lines,
+                ..
+            }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: signed out via '{label}' → {}",

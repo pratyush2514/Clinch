@@ -147,11 +147,14 @@ fn role_admits(intent_role: &str, element_role: &str) -> bool {
         || (element_role == "tab" && matches!(intent_role, "button" | "link" | "menuitem"))
 }
 
-/// What an executed intent acted on: the badge shown and the rect clicked.
+/// What an executed intent acted on: the badge shown and the rect clicked,
+/// plus the click's `click_hit_test:` journal line (what the page itself had
+/// under the click point).
 #[derive(Clone, Debug, PartialEq)]
 pub struct IntentOutcome {
     pub mark: Mark,
     pub highlight: Highlight,
+    pub hit_line: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -848,7 +851,14 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageGoalOutcome {
     /// A click navigated somewhere new: the clicked label plus the URL.
-    Navigated { label: String, landed: url::Url },
+    ///
+    /// `hit_lines` are the `click_hit_test:` journal lines of the clicks
+    /// that got here, one per click, in click order.
+    Navigated {
+        label: String,
+        landed: url::Url,
+        hit_lines: Vec<String>,
+    },
     /// The goal was already achieved on the current page; nothing to click.
     AlreadyThere { landed: url::Url },
     /// Verified goal landing: the label that got us there, the landed URL,
@@ -859,10 +869,31 @@ pub enum PageGoalOutcome {
         label: String,
         landed: url::Url,
         username: Option<String>,
+        /// The `click_hit_test:` lines of the clicks before verification
+        /// (empty when no click happened, e.g. a cookie-clear or href
+        /// navigation).
+        hit_lines: Vec<String>,
     },
     /// The page is a signed-out guest landing: there is no identity
     /// chrome to pursue, so the worker stops before any click.
     SignedOut,
+}
+
+impl PageGoalOutcome {
+    /// Attach the `click_hit_test:` lines found in a tried-journal to a
+    /// click-produced outcome. Other variants carry no clicks and pass
+    /// through untouched.
+    #[must_use]
+    fn with_hit_lines(mut self, tried: &[String]) -> Self {
+        if let Self::Navigated { hit_lines, .. } | Self::Verified { hit_lines, .. } = &mut self {
+            *hit_lines = tried
+                .iter()
+                .filter(|line| line.starts_with("click_hit_test:"))
+                .cloned()
+                .collect();
+        }
+        self
+    }
 }
 
 /// In-page follow-up budget: observe-act steps before the pursuit gives up
@@ -1148,6 +1179,7 @@ async fn logout_cookie_fallback<B: ChromeActionBrowser>(
             label: "session cookies cleared".to_string(),
             landed,
             username: None,
+            hit_lines: Vec::new(),
         });
     }
     Err(IntentError::NoMatch(format!("{ui_miss}; {line}")))
@@ -1544,7 +1576,7 @@ async fn act_on_identity_target<B: ChromeActionBrowser>(
         let landed = browser.settings_current_url().await.unwrap_or(url);
         return verify_account_home(browser, origin, label, &landed, username.as_deref())
             .await
-            .map(Some);
+            .map(|outcome| Some(outcome.with_hit_lines(tried)));
     }
     // No usable href: click the revealed control and watch the URL.
     browser.menu_click_reported(target, tried).await?;
@@ -1555,7 +1587,7 @@ async fn act_on_identity_target<B: ChromeActionBrowser>(
         let username = username_from_menu_text(label);
         return verify_account_home(browser, origin, label, &landed, username.as_deref())
             .await
-            .map(Some);
+            .map(|outcome| Some(outcome.with_hit_lines(tried)));
     }
     Ok(None)
 }
@@ -1603,11 +1635,15 @@ async fn act_on_path_tokens_target<B: ChromeActionBrowser>(
             .settings_current_url()
             .await
             .unwrap_or_else(|| origin.clone());
-        return Ok(Some(PageGoalOutcome::Verified {
-            label,
-            landed,
-            username: None,
-        }));
+        return Ok(Some(
+            PageGoalOutcome::Verified {
+                label,
+                landed,
+                username: None,
+                hit_lines: Vec::new(),
+            }
+            .with_hit_lines(tried),
+        ));
     }
     tried.push(tried_label(target, "clicked, no evidence"));
     Ok(None)
@@ -1641,11 +1677,15 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
         .await
         .unwrap_or_else(|| origin.clone());
     if browser.chrome_auth_state().await == AuthState::LoggedOut {
-        return Ok(Some(PageGoalOutcome::Verified {
-            label: label.to_owned(),
-            landed,
-            username: None,
-        }));
+        return Ok(Some(
+            PageGoalOutcome::Verified {
+                label: label.to_owned(),
+                landed,
+                username: None,
+                hit_lines: Vec::new(),
+            }
+            .with_hit_lines(tried),
+        ));
     }
     tried.push(tried_label(target, "clicked, still signed in"));
     Ok(None)
@@ -2356,7 +2396,9 @@ fn verify_path_tokens_landing(
         Ok(PageGoalOutcome::Navigated {
             label: label.to_owned(),
             landed: landed.clone(),
-        })
+            hit_lines: Vec::new(),
+        }
+        .with_hit_lines(tried))
     } else {
         Err(IntentError::NoMatch(chrome_action_miss_diagnostic(
             spec, tried,
@@ -2548,7 +2590,7 @@ impl MenuBrowser for ManagedBrowser {
     }
 
     async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
-        click_element(self, element).await.map(|_| ())
+        click_element_reported(self, element).await.map(|_| ())
     }
 
     async fn menu_click_reported(
@@ -2556,8 +2598,8 @@ impl MenuBrowser for ManagedBrowser {
         element: &AxElement,
         tried: &mut Vec<String>,
     ) -> Result<(), IntentError> {
-        let (_, hit_line) = click_element_reported(self, element).await?;
-        tried.push(hit_line);
+        let outcome = click_element_reported(self, element).await?;
+        tried.push(outcome.hit_line);
         Ok(())
     }
 
@@ -3224,6 +3266,7 @@ pub fn verify_account_landing(
             label: label.to_owned(),
             landed: current.clone(),
             username: username.map(str::to_owned),
+            hit_lines: Vec::new(),
         })
     } else {
         Err(format!(
@@ -3265,6 +3308,8 @@ async fn pursue_deterministic(
     noun: &str,
 ) -> Result<PageGoalOutcome, IntentError> {
     let mut clicked: Vec<ClickedControl> = Vec::new();
+    // Every click's `click_hit_test:` line, kept for the miss diagnostic.
+    let mut tried: Vec<String> = Vec::new();
     for _ in 0..PAGE_GOAL_MAX_STEPS {
         // Untruncated: a revealed menu renders at document end (React
         // portal), past the 300-element head the capped snapshot keeps —
@@ -3275,10 +3320,15 @@ async fn pursue_deterministic(
         if let Some(target) = select_page_control(&elements, noun, &clicked) {
             let label = target.name.clone();
             let tried_key = ClickedControl::of(target);
-            click_element(browser, target).await?;
+            tried.push(click_element_reported(browser, target).await?.hit_line);
             clicked.push(tried_key);
             if let Some(landed) = wait_for_url_change(browser).await {
-                return Ok(PageGoalOutcome::Navigated { label, landed });
+                return Ok(PageGoalOutcome::Navigated {
+                    label,
+                    landed,
+                    hit_lines: Vec::new(),
+                }
+                .with_hit_lines(&tried));
             }
             // No navigation: a menu or popover may have opened. Loop and
             // re-snapshot against the new tree.
@@ -3303,27 +3353,43 @@ async fn pursue_deterministic(
         )
         .await?
         {
-            OpenMenuOutcome::Opened { .. } => continue,
-            OpenMenuOutcome::Miss { .. } => {}
+            OpenMenuOutcome::Opened { tried: line, .. } => {
+                tried.push(line);
+                continue;
+            }
+            OpenMenuOutcome::Miss { tried: lines } => tried.extend(lines),
         }
         if let Some(menu) = select_menu_button(&elements, &clicked) {
             let tried_key = ClickedControl::of(menu);
-            click_element(browser, menu).await?;
+            tried.push(click_element_reported(browser, menu).await?.hit_line);
             clicked.push(tried_key);
             continue;
         }
         if let Some(rightmost) = select_rightmost_button(browser, &elements, &clicked).await {
             let tried_key = ClickedControl::of(rightmost);
-            click_element(browser, rightmost).await?;
+            tried.push(click_element_reported(browser, rightmost).await?.hit_line);
             clicked.push(tried_key);
             continue;
         }
         // 3. Nothing left to try.
-        return Err(IntentError::NoMatch(page_goal_diagnostic(&elements, noun)));
+        return Err(IntentError::NoMatch(with_tried(
+            page_goal_diagnostic(&elements, noun),
+            &tried,
+        )));
     }
-    Err(IntentError::NoMatch(format!(
-        "In-page goal '{noun}' not reached after {PAGE_GOAL_MAX_STEPS} steps."
+    Err(IntentError::NoMatch(with_tried(
+        format!("In-page goal '{noun}' not reached after {PAGE_GOAL_MAX_STEPS} steps."),
+        &tried,
     )))
+}
+
+/// `diagnostic` with the tried-click lines appended, when there are any.
+fn with_tried(diagnostic: String, tried: &[String]) -> String {
+    if tried.is_empty() {
+        diagnostic
+    } else {
+        format!("{diagnostic}; tried [{}]", tried.join("; "))
+    }
 }
 
 /// Escalation for gear 2's model loop: when the main pass's tail fails
@@ -3750,11 +3816,15 @@ async fn model_loop_click<B: ChromeActionBrowser>(
                 .settings_current_url()
                 .await
                 .unwrap_or_else(|| origin.clone());
-            return Ok(Some(PageGoalOutcome::Verified {
-                label,
-                landed,
-                username: revealed_username.clone(),
-            }));
+            return Ok(Some(
+                PageGoalOutcome::Verified {
+                    label,
+                    landed,
+                    username: revealed_username.clone(),
+                    hit_lines: Vec::new(),
+                }
+                .with_hit_lines(tried),
+            ));
         }
         tried.push(tried_label(
             element,
@@ -3767,7 +3837,14 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     } else if let Some(landed) = navigated {
         // Generic noun hunt: no verifier exists, so a
         // navigation ends the loop as before.
-        return Ok(Some(PageGoalOutcome::Navigated { label, landed }));
+        return Ok(Some(
+            PageGoalOutcome::Navigated {
+                label,
+                landed,
+                hit_lines: Vec::new(),
+            }
+            .with_hit_lines(tried),
+        ));
     } else {
         tried.push(tried_label(element, "clicked, no navigation"));
     }
@@ -3966,7 +4043,9 @@ async fn model_loop_tail<B: ChromeActionBrowser>(
             label: last_label.unwrap_or(goal).to_owned(),
             landed,
             username: revealed_username.map(str::to_owned),
-        });
+            hit_lines: Vec::new(),
+        }
+        .with_hit_lines(tried));
     }
     Err(IntentError::NoMatch(journal))
 }
@@ -4280,7 +4359,7 @@ pub async fn execute_intent(
     let (elements, _, _) = browser.ax_snapshot(origin).await;
     let resolved = resolve_intent(&elements, intent)
         .ok_or_else(|| IntentError::NoMatch(grounding_diagnostic(&elements, intent)))?;
-    click_element(browser, &resolved.element).await
+    click_element_reported(browser, &resolved.element).await
 }
 
 /// Batch terminal states: every click landed, or the run stopped early at
@@ -4424,7 +4503,7 @@ async fn click_batch(
                 return Ok(halted_early(outcomes.len(), index, element, &now));
             }
         }
-        outcomes.push(click_element(browser, element).await?);
+        outcomes.push(click_element_reported(browser, element).await?);
         if outcomes.len() < batch.len() {
             tokio::time::sleep(std::time::Duration::from_millis(BATCH_SETTLE_MS)).await;
         }
@@ -4443,7 +4522,7 @@ async fn click_batch(
 async fn click_element_reported(
     browser: &ManagedBrowser,
     element: &AxElement,
-) -> Result<(IntentOutcome, String), IntentError> {
+) -> Result<IntentOutcome, IntentError> {
     let highlight = browser.node_rect(element.backend_node_id).await?;
     let mark = Mark {
         index: 0,
@@ -4464,24 +4543,10 @@ async fn click_element_reported(
             return Err(error.into());
         }
     };
-    let line = hit.journal_line(&element.role, &element.name);
-    Ok((IntentOutcome { mark, highlight }, line))
-}
-
-/// Badge one resolved element and click it: rect resolution, visible mark,
-/// press. Shared by single and batch paths so both act identically; the
-/// badge stays visible on success as evidence, failures clear it so no
-/// stale overlay survives. The unjournaled twin of
-/// [`click_element_reported`] for paths without a tried log; both act
-/// identically.
-///
-/// # Errors
-/// Returns [`IntentError::Browser`] on CDP failure.
-async fn click_element(
-    browser: &ManagedBrowser,
-    element: &AxElement,
-) -> Result<IntentOutcome, IntentError> {
-    click_element_reported(browser, element)
-        .await
-        .map(|(outcome, _)| outcome)
+    let hit_line = hit.journal_line(&element.role, &element.name);
+    Ok(IntentOutcome {
+        mark,
+        highlight,
+        hit_line,
+    })
 }

@@ -427,7 +427,7 @@ async fn settings_flow_navigates_to_settings_path() {
         .with_navigate_on_click(10, url("/settings"));
 
     match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
-        Ok(PageGoalOutcome::Navigated { label, landed }) => {
+        Ok(PageGoalOutcome::Navigated { label, landed, .. }) => {
             assert_eq!(label, "Settings");
             assert_eq!(landed.path(), "/settings");
         }
@@ -458,6 +458,7 @@ async fn settings_flow_verifies_disclosure_via_heading() {
             label,
             landed,
             username,
+            ..
         }) => {
             assert_eq!(label, "Preferences");
             assert_eq!(landed, origin());
@@ -628,6 +629,7 @@ async fn account_home_flow_navigates_revealed_href_and_verifies() {
             label,
             landed,
             username,
+            ..
         }) => {
             assert_eq!(label, "Profile");
             assert_eq!(landed.path(), "/user/someuser/");
@@ -677,6 +679,7 @@ async fn logout_flow_verifies_signed_out_after_click() {
             label,
             landed,
             username,
+            ..
         }) => {
             assert_eq!(label, "Log out");
             assert_eq!(landed.path(), "/login");
@@ -811,7 +814,7 @@ async fn already_open_menu_clicks_destination_directly() {
     ];
     let fake = FakeChromeActionBrowser::new(tree).with_navigate_on_click(10, url("/settings"));
     match pursue_chrome_action(&fake, &origin(), settings_spec()).await {
-        Ok(PageGoalOutcome::Navigated { label, landed }) => {
+        Ok(PageGoalOutcome::Navigated { label, landed, .. }) => {
             assert_eq!(label, "Settings");
             assert_eq!(landed.path(), "/settings");
         }
