@@ -16,6 +16,72 @@ use std::{
 };
 use tokio::sync::{OnceCell, Semaphore, oneshot};
 
+/// Verdict word carried by an observed-state caption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedVerdict {
+    Completed,
+    Failed,
+}
+
+/// Values read from the live page after a run ended. Every field is an
+/// observation (or `None` when it could not be read), never intent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObservedState<'a> {
+    pub final_url: Option<&'a str>,
+    pub page_title: Option<&'a str>,
+    /// Label of the control the run acted on, when one was recorded.
+    pub acted_on: Option<&'a str>,
+    /// Verifier note (completions) or failure reason (failures).
+    pub note: Option<&'a str>,
+}
+
+/// Deterministic caption of where a run actually ended: the live URL
+/// (host + path only — queries and fragments can carry tokens), the page
+/// title, the acted-on label and the verifier note or failure reason. A
+/// pure function of observed inputs; a missing observation is stated as
+/// unread, never filled from intent.
+pub fn caption_observed_state(verdict: ObservedVerdict, observed: &ObservedState<'_>) -> String {
+    let verdict = match verdict {
+        ObservedVerdict::Completed => "completed",
+        ObservedVerdict::Failed => "failed",
+    };
+    let page = match observed.final_url {
+        Some(raw) => match url::Url::parse(raw) {
+            Ok(parsed) => format!("{}{}", parsed.host_str().unwrap_or("?"), parsed.path()),
+            Err(_) => "unparseable url".to_owned(),
+        },
+        None => "unread".to_owned(),
+    };
+    let title = observed
+        .page_title
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty())
+        .map_or_else(
+            || "unread".to_owned(),
+            |title| format!("'{}'", title.chars().take(120).collect::<String>()),
+        );
+    let mut caption = format!("observed_outcome: {verdict} · landed {page} · title {title}");
+    if let Some(label) = observed.acted_on.filter(|label| !label.is_empty()) {
+        caption.push_str(&format!(" · acted on '{label}'"));
+    }
+    if let Some(note) = observed.note.filter(|note| !note.is_empty()) {
+        caption.push_str(&format!(" · {note}"));
+    }
+    caption
+}
+
+/// Honest label for an auth reading that classified nothing: says whether
+/// the page could be read at all instead of blaming a probe failure when
+/// the page was simply unclassified.
+pub fn auth_unknown_label(observed_url: Option<&str>) -> String {
+    match observed_url {
+        Some(_) => {
+            "auth_state_detected: unknown · page read, no logged-out markers matched".to_owned()
+        }
+        None => "auth_state_detected: unknown · no readable page to probe".to_owned(),
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
 pub enum AppError {
@@ -2225,6 +2291,17 @@ impl AppService {
                     .await
                     .map_err(|_| AppError::BrowserUnavailable)?;
                 let line = "browser_opened: about:blank · lifecycle";
+                let (final_url, page_title) = self.describe_final_page().await;
+                let caption = caption_observed_state(
+                    ObservedVerdict::Completed,
+                    &ObservedState {
+                        final_url: final_url.as_deref(),
+                        page_title: page_title.as_deref(),
+                        acted_on: None,
+                        note: None,
+                    },
+                );
+                let _ = self.record(&caption).await;
                 let _ = self.record(line).await;
                 Ok(DispatchOutcome {
                     kind: "lifecycle",
@@ -2239,7 +2316,10 @@ impl AppService {
                     run_id: None,
                     lend_id: None,
                     route_log: None,
-                    telemetry_log: Some(line.to_owned()),
+                    telemetry_log: Some(format!(
+                        "{caption}
+{line}"
+                    )),
                     // Lifecycle commands show no page: no final frame.
                     // Lifecycle commands show no page: no challenge to detect.
                     final_frame: None,
@@ -2758,6 +2838,8 @@ impl AppService {
                 landed.host_str().unwrap_or("?")
             ))
             .await;
+        self.journal_observed_failure(None, &format!("landing does not belong to '{site}'"))
+            .await;
         Err(AppError::WorkflowFailed(self.recent_journal(16).await))
     }
 
@@ -3073,6 +3155,27 @@ impl AppService {
         // launch placeholder instead of showing the destination.
         self.attach_final_frame(outcome).await;
         let completed = outcome.result.status == orchestration_engine::SequenceStatus::Completed;
+        // Caption from the live re-read `attach_final_frame` just took, not
+        // from the intended entry. Journaled before any completion record.
+        let verdict = if completed {
+            ObservedVerdict::Completed
+        } else {
+            ObservedVerdict::Failed
+        };
+        let caption = caption_observed_state(
+            verdict,
+            &ObservedState {
+                final_url: outcome.final_url.as_deref(),
+                page_title: outcome.page_title.as_deref(),
+                acted_on: None,
+                note: None,
+            },
+        );
+        let caption = self.journal_line(caption).await;
+        outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
+            Some(existing) => format!("{existing}\n{caption}"),
+            None => caption,
+        });
         // A completed run that landed on a human-verification gate is not
         // a silent success. Interactive gates (reCAPTCHA checkbox) skip L1:
         // no off-screen re-navigation can click a checkbox, so escalation
@@ -3200,9 +3303,7 @@ impl AppService {
                     }
                 }
                 AuthState::Authenticated => "auth_state_detected: authenticated".to_string(),
-                AuthState::Unknown => {
-                    "auth_state_detected: unknown · probe failed or page unclassifiable".to_string()
-                }
+                AuthState::Unknown => auth_unknown_label(outcome.final_url.as_deref()),
             };
             let line = self.journal_line(probe_line).await;
             outcome.telemetry_log = Some(match outcome.telemetry_log.take() {
@@ -3967,6 +4068,8 @@ impl AppService {
                 let _ = self
                     .record(&format!("in_page_goal_miss: {diagnostic}"))
                     .await;
+                self.journal_observed_failure(None, &format!("miss: {diagnostic}"))
+                    .await;
                 let journal = self.recent_journal(16).await;
                 return Err(AppError::WorkflowFailed(journal));
             }
@@ -4220,6 +4323,7 @@ impl AppService {
                     let _ = self
                         .record(&format!("verb_led_miss: site='{site}' ungrounded"))
                         .await;
+                    self.journal_observed_failure(None, "site ungrounded").await;
                     let journal = self.recent_journal(16).await;
                     return Err(AppError::WorkflowFailed(journal));
                 };
@@ -4391,6 +4495,8 @@ impl AppService {
                 let _ = self
                     .record(&format!("in_page_goal_miss: {diagnostic}"))
                     .await;
+                self.journal_observed_failure(None, &format!("miss: {diagnostic}"))
+                    .await;
                 let journal = self.recent_journal(16).await;
                 Err(AppError::WorkflowFailed(journal))
             }
@@ -4546,6 +4652,8 @@ impl AppService {
                             landed.as_str()
                         ))
                         .await;
+                    self.journal_observed_failure(Some(&label), "navigation not verified")
+                        .await;
                     let journal = self.recent_journal(16).await;
                     Err(AppError::WorkflowFailed(journal))
                 }
@@ -4593,6 +4701,8 @@ impl AppService {
             Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
                 let _ = self
                     .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                self.journal_observed_failure(None, &format!("miss: {diagnostic}"))
                     .await;
                 let journal = self.recent_journal(16).await;
                 Err(AppError::WorkflowFailed(journal))
@@ -4672,6 +4782,8 @@ impl AppService {
                     let _ = self
                         .record("in_page_goal_miss: page no longer reads signed out")
                         .await;
+                    self.journal_observed_failure(None, "page no longer reads signed out")
+                        .await;
                     let journal = self.recent_journal(16).await;
                     Err(AppError::WorkflowFailed(journal))
                 }
@@ -4679,6 +4791,8 @@ impl AppService {
             Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
                 let _ = self
                     .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                self.journal_observed_failure(None, &format!("miss: {diagnostic}"))
                     .await;
                 let journal = self.recent_journal(16).await;
                 Err(AppError::WorkflowFailed(journal))
@@ -5564,6 +5678,24 @@ impl AppService {
         let (final_url, page_title) = self.describe_final_page().await;
         outcome.final_url = final_url;
         outcome.page_title = page_title;
+    }
+
+    /// Failure-path counterpart of the settle caption: re-read the live
+    /// page and journal what was observed alongside the honest reason, so
+    /// the journal payload carried by `WorkflowFailed` states where the
+    /// run stopped. Fail-open.
+    async fn journal_observed_failure(&self, acted_on: Option<&str>, reason: &str) {
+        let (final_url, page_title) = self.describe_final_page().await;
+        let caption = caption_observed_state(
+            ObservedVerdict::Failed,
+            &ObservedState {
+                final_url: final_url.as_deref(),
+                page_title: page_title.as_deref(),
+                acted_on,
+                note: Some(reason),
+            },
+        );
+        let _ = self.record(&caption).await;
     }
 
     /// Best-effort final-page description: the live page's URL plus
