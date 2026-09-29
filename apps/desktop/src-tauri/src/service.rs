@@ -2786,7 +2786,7 @@ impl AppService {
             .await;
         // Settle contract (D.1) before settle: the observed landing must
         // belong to the site slot.
-        self.verify_funnel_landing(site).await?;
+        self.verify_funnel_landing(site, Some(&site_url)).await?;
         let name = orchestration_engine::ephemeral_name(&prompt);
         let mut outcome = DispatchOutcome {
             kind: "ephemeral",
@@ -2819,17 +2819,35 @@ impl AppService {
     /// naming the site, never a quiet COMPLETED. In-page object goals keep
     /// their existing verifier semantics; this fires only where the funnel
     /// threaded a site slot.
-    async fn verify_funnel_landing(&self, site: &str) -> Result<(), AppError> {
+    async fn verify_funnel_landing(
+        &self,
+        site: &str,
+        entry: Option<&url::Url>,
+    ) -> Result<(), AppError> {
         let browser = self
             .browser(BrowserIntent::Background)
             .await
             .map_err(|_| AppError::BrowserUnavailable)?;
+        // Re-read the landing now (URL plus title): navigation merely not
+        // erroring does not mean the destination was reached.
         let landed = browser
             .current_url()
             .await
             .map_err(|_| AppError::BrowserUnavailable)?
             .ok_or(AppError::BrowserUnavailable)?;
-        if orchestration_engine::funnel_landing_matches(site, &landed) {
+        let title = browser.page_title().await;
+        if Self::open_landing_valid(site, entry, &landed) {
+            let _ = self
+                .record(&format!(
+                    "funnel_landing_read: {} · title {}",
+                    landed.host_str().unwrap_or("?"),
+                    if title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                        "present"
+                    } else {
+                        "empty"
+                    }
+                ))
+                .await;
             return Ok(());
         }
         let _ = self
@@ -2841,6 +2859,60 @@ impl AppService {
         self.journal_observed_failure(None, &format!("landing does not belong to '{site}'"))
             .await;
         Err(AppError::WorkflowFailed(self.recent_journal(16).await))
+    }
+
+    /// Whether an observed direct-open landing is the intended destination:
+    /// the host belongs to the resolved site slot (alias-aware) and, when
+    /// the entry is known, is the entry's own site (`www.` folded); a deep
+    /// entry path must also survive the landing — a redirect elsewhere on
+    /// the same host (e.g. to a login page) is not the destination. Pure.
+    #[must_use]
+    pub fn open_landing_valid(site: &str, entry: Option<&url::Url>, landed: &url::Url) -> bool {
+        if !orchestration_engine::funnel_landing_matches(site, landed) {
+            return false;
+        }
+        let Some(entry) = entry else {
+            return true;
+        };
+        if !macro_engine::same_site_host(
+            landed.host_str().unwrap_or(""),
+            entry.host_str().unwrap_or(""),
+        ) {
+            return false;
+        }
+        let want = entry.path().trim_end_matches('/');
+        want.is_empty() || landed.path().trim_end_matches('/').starts_with(want)
+    }
+
+    /// Journal line for a batch that stopped on a failed click dispatch:
+    /// names the click (1-based position and label) and how many landed.
+    #[must_use]
+    pub fn batch_click_failure_line(
+        clicks_completed: usize,
+        failed_index: usize,
+        label: &str,
+    ) -> String {
+        format!(
+            "batch:partial_failure: click {} '{label}' failed to dispatch · {clicks_completed} click(s) landed before it",
+            failed_index + 1
+        )
+    }
+
+    /// Live-page verification for the generic noun-hunt lane: re-read URL,
+    /// title and headings and require a positive noun signal. A failed
+    /// browser read fails closed.
+    async fn noun_landing_verified(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        noun: &str,
+    ) -> bool {
+        let Ok(Some(current)) = browser.current_url().await else {
+            return false;
+        };
+        let title = browser.page_title().await;
+        let (elements, _, _) = browser.ax_snapshot(portal).await;
+        macro_engine::verify_noun_landing(noun, &current, portal, title.as_deref(), &elements)
     }
 
     /// Tier 2B, routing lane: the fenced parser gets one bounded shot at
@@ -2973,7 +3045,7 @@ impl AppService {
         // can report a quiet success. In-page object goals keep their
         // existing verifier semantics; only the site-domain check is added.
         if let Some(site) = site_slot {
-            self.verify_funnel_landing(site).await?;
+            self.verify_funnel_landing(site, None).await?;
         }
         self.settle_ephemeral_outcome(&mut outcome).await;
         Ok(outcome)
@@ -4049,14 +4121,35 @@ impl AppService {
                 for line in &hit_lines {
                     let _ = self.record(line).await;
                 }
+                // A URL change is not evidence: the live landing must
+                // positively name the noun before the run may complete.
+                if !self.noun_landing_verified(&browser, &portal, &noun).await {
+                    let _ = self
+                        .record(&format!(
+                            "in_page_goal_miss: '{label}' → {} (navigation not verified)",
+                            landed.host_str().unwrap_or("?")
+                        ))
+                        .await;
+                    self.journal_observed_failure(Some(&label), "navigation not verified")
+                        .await;
+                    return Err(AppError::WorkflowFailed(self.recent_journal(16).await));
+                }
                 let _ = self
                     .record(&format!(
-                        "in_page_goal_done: '{label}' → {}",
+                        "in_page_goal_done: '{label}' → {} (verified at completion)",
                         landed.host_str().unwrap_or("?")
                     ))
                     .await;
             }
             Ok(macro_engine::PageGoalOutcome::AlreadyThere { landed }) => {
+                if !self.noun_landing_verified(&browser, &portal, &noun).await {
+                    let _ = self
+                        .record("in_page_goal_miss: already-there claim not verified")
+                        .await;
+                    self.journal_observed_failure(None, "already-there claim not verified")
+                        .await;
+                    return Err(AppError::WorkflowFailed(self.recent_journal(16).await));
+                }
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: already at {}",
@@ -5048,7 +5141,12 @@ impl AppService {
             ));
         }
         match macro_engine::execute_batch(&browser, &portal, &intent).await {
-            Ok(macro_engine::ExecuteOutcome::Completed(_)) => {
+            Ok(macro_engine::ExecuteOutcome::Completed(clicks)) => {
+                // The consented plan executed: one `click_hit_test:` line
+                // of per-click evidence per dispatch.
+                for click in &clicks {
+                    let _ = self.record(&click.hit_line).await;
+                }
                 Self::finish_batch_run(journal.as_ref(), &journal_id, "completed", 1).await;
                 Self::emit_batch_phase(
                     &events,
@@ -5060,6 +5158,29 @@ impl AppService {
                     orchestration_engine::SequenceStatus::Completed,
                     1,
                     None,
+                ))
+            }
+            Ok(macro_engine::ExecuteOutcome::HaltedEarly {
+                reason: macro_engine::CLICK_FAILED_REASON,
+                clicks_completed,
+                failed_candidate_index,
+                failed_candidate_label,
+                ..
+            }) => {
+                Self::finish_batch_run(journal.as_ref(), &journal_id, "failed", clicks_completed)
+                    .await;
+                let _ = self
+                    .record(&Self::batch_click_failure_line(
+                        clicks_completed,
+                        failed_candidate_index,
+                        &failed_candidate_label,
+                    ))
+                    .await;
+                Self::emit_batch_blocked(&events, run_id);
+                Ok(outcome(
+                    orchestration_engine::SequenceStatus::Failed,
+                    clicks_completed,
+                    Some(failed_candidate_index),
                 ))
             }
             Ok(macro_engine::ExecuteOutcome::HaltedEarly {

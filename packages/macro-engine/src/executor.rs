@@ -2483,6 +2483,41 @@ fn url_path_has_tokens(url: &url::Url, tokens: &[&str]) -> bool {
     }
 }
 
+/// Verifier for the generic noun-hunt lane, pure. A navigation only counts
+/// when the landing is same-site AND positively names the user's noun: a
+/// path segment, the page title, or a heading carries a noun word
+/// (stemmed, 3+ letters). A URL change alone is not evidence.
+#[must_use]
+pub fn verify_noun_landing(
+    noun: &str,
+    current: &url::Url,
+    origin: &url::Url,
+    title: Option<&str>,
+    elements: &[AxElement],
+) -> bool {
+    if !same_site_host(
+        current.host_str().unwrap_or(""),
+        origin.host_str().unwrap_or(""),
+    ) {
+        return false;
+    }
+    let words: Vec<String> = noun
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(|word| word.strip_suffix('s').unwrap_or(word).to_owned())
+        .collect();
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    url_path_has_tokens(current, &tokens)
+        || title.is_some_and(|title| text_mentions_vocabulary(title, &tokens))
+        || elements.iter().any(|element| {
+            element.role == "heading" && text_mentions_vocabulary(&element.name, &tokens)
+        })
+}
+
 /// Post-click disclosure check for the path-token lane: with no navigation,
 /// the click only counts when the fresh page names the verb in its title or
 /// a heading. Generic words only — the spec's own vocabulary.
@@ -4572,6 +4607,10 @@ pub enum ExecuteOutcome {
     },
 }
 
+/// [`ExecuteOutcome::HaltedEarly::reason`] when a click failed to dispatch
+/// (as opposed to `UrlDriftDetected`).
+pub const CLICK_FAILED_REASON: &str = "ClickDispatchFailed";
+
 /// Whether the live page left the batch route: origin or path differ.
 /// Query strings and hash fragments never count as drift, and `blob:` /
 /// `data:` targets (download handoffs) are exempt — the next click then
@@ -4683,22 +4722,75 @@ async fn click_batch(
     browser: &ManagedBrowser,
     batch: &[AxElement],
 ) -> Result<ExecuteOutcome, IntentError> {
-    let initial = browser
-        .current_url()
+    click_batch_with(browser, batch).await
+}
+
+/// The two browser touches the batch loop makes, so the loop's ordering and
+/// failure contract is provable against a scripted fake.
+pub trait BatchDriver {
+    /// Live page URL, `None` when unreadable.
+    fn batch_current_url(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<url::Url>, IntentError>> + Send;
+    /// One reported click (hit-test line included).
+    fn batch_click(
+        &self,
+        element: &AxElement,
+    ) -> impl std::future::Future<Output = Result<IntentOutcome, IntentError>> + Send;
+}
+
+impl BatchDriver for ManagedBrowser {
+    async fn batch_current_url(&self) -> Result<Option<url::Url>, IntentError> {
+        Ok(self.current_url().await?)
+    }
+
+    async fn batch_click(&self, element: &AxElement) -> Result<IntentOutcome, IntentError> {
+        click_element_reported(self, element).await
+    }
+}
+
+/// The batch loop over any [`BatchDriver`]. A failed click dispatch stops
+/// the run as [`ExecuteOutcome::HaltedEarly`] with
+/// [`CLICK_FAILED_REASON`], naming the failed click and keeping the count
+/// of clicks that landed; `Completed` therefore means every click in the
+/// plan dispatched, each carrying its own hit-test line.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] when the route URL cannot be read.
+pub async fn click_batch_with<D: BatchDriver>(
+    driver: &D,
+    batch: &[AxElement],
+) -> Result<ExecuteOutcome, IntentError> {
+    let initial = driver
+        .batch_current_url()
         .await?
         .ok_or(browser_driver::BrowserError::WrongOrigin)?;
     let mut outcomes = Vec::with_capacity(batch.len());
     for (index, element) in batch.iter().enumerate() {
         if index > 0 {
-            let now = browser
-                .current_url()
+            let now = driver
+                .batch_current_url()
                 .await?
                 .ok_or(browser_driver::BrowserError::WrongOrigin)?;
             if url_drifted(&initial, &now) {
                 return Ok(halted_early(outcomes.len(), index, element, &now));
             }
         }
-        outcomes.push(click_element_reported(browser, element).await?);
+        match driver.batch_click(element).await {
+            Ok(outcome) => outcomes.push(outcome),
+            // A failed dispatch is an honest partial failure naming the
+            // click, never an error that erases the clicks that landed.
+            Err(IntentError::Browser(_)) => {
+                return Ok(ExecuteOutcome::HaltedEarly {
+                    reason: CLICK_FAILED_REASON,
+                    clicks_completed: outcomes.len(),
+                    failed_candidate_index: index,
+                    failed_candidate_label: element.name.clone(),
+                    diverged_url: String::new(),
+                });
+            }
+            Err(other) => return Err(other),
+        }
         if outcomes.len() < batch.len() {
             tokio::time::sleep(std::time::Duration::from_millis(BATCH_SETTLE_MS)).await;
         }
