@@ -94,8 +94,11 @@ pub fn has_app_bound_key(browser: BrowserKey) -> bool {
 
 /// Pure shape check for `has_app_bound_key`, kept testable without a real
 /// browser profile on disk.
+///
+/// Public so the integration test (`tests/crate_root.rs`) can reach it:
+/// integration tests link the crate externally and cannot see private items.
 #[cfg(target_os = "windows")]
-fn has_app_bound_bytes(document: &[u8]) -> bool {
+pub fn has_app_bound_bytes(document: &[u8]) -> bool {
     use base64::Engine;
     serde_json::from_slice::<serde_json::Value>(document)
         .ok()
@@ -167,11 +170,14 @@ fn local_state_path(browser: BrowserKey) -> Option<std::path::PathBuf> {
 /// This is the one function in the crate where `unsafe` is the point: DPAPI
 /// is an OS FFI boundary with no safe wrapper at this dependency weight.
 /// Every `unsafe` block below carries its own `SAFETY` justification.
+/// Public so the integration test (`tests/crate_root.rs`) can reach it:
+/// integration tests link the crate externally and cannot see private items.
+///
 /// # Errors
 /// Returns sanitized `Unavailable` for malformed documents or DPAPI failures.
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
-fn decrypt_local_state_key(document: &[u8]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+pub fn decrypt_local_state_key(document: &[u8]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     use base64::Engine;
     use windows_sys::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptUnprotectData};
     // Chrome prefixes the DPAPI blob with ASCII `DPAPI`.
