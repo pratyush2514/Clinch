@@ -219,3 +219,12 @@ back, and it never sent that email without me.*
    honesty, AX-not-DOM, Rust URL validation, caption-from-frame,
    Take Control-first on interactive challenges, Linux worker OS,
    daemon split, playbooks-as-verified-recipes.
+6. **Flowing consent, browser-level Take Control.** Per-operation
+   approve/deny gates are retired: the user's intent authorizes the
+   agent's deterministic click-through within the named site. Take
+   Control is a browser-level mode switch, always available during a
+   run — the human may seize input, drive the browser directly, and
+   return control, whereupon the agent re-observes and continues or
+   reports honestly. Agent input is hard-locked while the human drives.
+   Explicit taps remain only for agent-initiated send, spend,
+   leave-the-named-site, persist (shortcuts/playbooks), or sign-in.
