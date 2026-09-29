@@ -60,7 +60,7 @@ fn logout_phrases_map_to_logout_spec_case_insensitively() {
 #[test]
 fn other_nouns_stay_generic() {
     assert_eq!(spec_for_noun("pricing"), None);
-    assert_eq!(spec_for_noun("notifications"), None);
+    assert_eq!(spec_for_noun("messages"), None);
     assert_eq!(spec_for_noun(""), None);
     // Multi-word phrases never map: the grammar hands the dispatcher a
     // single artifact noun (or a verb phrase for log-out), so a phrase
@@ -72,9 +72,9 @@ fn other_nouns_stay_generic() {
 }
 
 #[test]
-fn verb_table_has_three_rows_with_generic_vocabulary() {
+fn verb_table_has_four_rows_with_generic_vocabulary() {
     let specs = verb_specs();
-    assert_eq!(specs.len(), 3);
+    assert_eq!(specs.len(), 4);
     // Generic words only — no site names, selectors, or URLs in the
     // match vocabulary.
     for spec in specs {
@@ -91,7 +91,12 @@ fn verb_table_has_three_rows_with_generic_vocabulary() {
         }
     }
     // Every VerbKind is covered, exactly once.
-    for kind in [VerbKind::AccountHome, VerbKind::Settings, VerbKind::LogOut] {
+    for kind in [
+        VerbKind::AccountHome,
+        VerbKind::Settings,
+        VerbKind::LogOut,
+        VerbKind::Notifications,
+    ] {
         assert_eq!(
             specs.iter().filter(|spec| spec.kind == kind).count(),
             1,

@@ -23,7 +23,7 @@ use macro_engine::semantic::SemanticMatcher;
 use macro_engine::{
     ChromeActionBrowser, ClickedControl, IntentError, MenuBrowser, PageAction, PageGoalOutcome,
     PageNavigator, SettingsBrowser, VerbKind, VerbSpec, chrome_action_miss_diagnostic,
-    logout_header_candidates, pursue_chrome_action, pursue_verb_goal,
+    header_strip_candidates, pursue_chrome_action, pursue_verb_goal,
     select_already_open_menu_target, select_revealed_action, semantic_opener_winner,
     strong_openers,
 };
@@ -886,13 +886,13 @@ fn strong_openers_excludes_clicked() {
     assert_eq!(ids, vec![2]);
 }
 
-// ---- logout_header_candidates: LogOut model-phase filter (pure) ----
+// ---- header_strip_candidates: LogOut model-phase filter (pure) ----
 
 #[test]
 fn logout_header_filter_keeps_header_controls() {
     // Center-y at or above the strip bottom stays: the header avatar and
     // the strip boundary itself.
-    let kept = logout_header_candidates(&[1, 2, 3], &[50.0, 200.0, 199.9], 200.0);
+    let kept = header_strip_candidates(&[1, 2, 3], &[50.0, 200.0, 199.9], 200.0);
     assert_eq!(kept, vec![1, 2, 3]);
 }
 
@@ -900,21 +900,21 @@ fn logout_header_filter_keeps_header_controls() {
 fn logout_header_filter_drops_feed_and_ad_controls() {
     // The live miss shape: the header avatar stays, the feed ad's options
     // control is never a model candidate.
-    let kept = logout_header_candidates(&[1, 7], &[60.0, 900.0], 200.0);
+    let kept = header_strip_candidates(&[1, 7], &[60.0, 900.0], 200.0);
     assert_eq!(kept, vec![1], "below-strip controls never reach the model");
 }
 
 #[test]
 fn logout_header_filter_drops_unmeasurable_centers() {
     // No geometry means no header placement: NaN never qualifies.
-    let kept = logout_header_candidates(&[1, 2], &[f64::NAN, 60.0], 200.0);
+    let kept = header_strip_candidates(&[1, 2], &[f64::NAN, 60.0], 200.0);
     assert_eq!(kept, vec![2]);
 }
 
 #[test]
 fn logout_header_filter_empty_input_yields_empty() {
     // Empty in, empty out — the caller falls back to the full list.
-    assert!(logout_header_candidates(&[], &[], 200.0).is_empty());
+    assert!(header_strip_candidates(&[], &[], 200.0).is_empty());
 }
 
 #[tokio::test]

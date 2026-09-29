@@ -4253,6 +4253,73 @@ impl AppService {
                 )
                 .await
             }
+            orchestration_engine::VerbKind::Notifications => {
+                self.dispatch_notifications_goal(
+                    browser, portal, name, spec, goal_line, navigator, escalation,
+                )
+                .await
+            }
+        }
+    }
+
+    /// `notifications` dispatch: no memory shape — the action engine with
+    /// the surface verifier. `Verified` means the same-site notifications
+    /// surface (page or revealed panel) was observed; anything else is the
+    /// honest miss.
+    async fn dispatch_notifications_goal(
+        &self,
+        browser: &std::sync::Arc<browser_driver::ManagedBrowser>,
+        portal: &url::Url,
+        name: &str,
+        spec: &'static orchestration_engine::VerbSpec,
+        goal_line: String,
+        navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        escalation: Option<macro_engine::ModelEscalation>,
+    ) -> Result<DispatchOutcome, AppError> {
+        match macro_engine::pursue_verb_goal(&**browser, portal, spec, navigator, escalation).await
+        {
+            Ok(macro_engine::PageGoalOutcome::Verified {
+                label,
+                landed,
+                hit_lines,
+                ..
+            }) => {
+                for line in &hit_lines {
+                    let _ = self.record(line).await;
+                }
+                let _ = self
+                    .record(&format!(
+                        "in_page_goal_done: verified '{label}' → {}",
+                        landed.as_str()
+                    ))
+                    .await;
+                Ok(Self::in_page_goal_outcome(
+                    name,
+                    goal_line,
+                    Some(landed.as_str().to_owned()),
+                ))
+            }
+            Err(macro_engine::IntentError::NoMatch(diagnostic)) => {
+                let _ = self
+                    .record(&format!("in_page_goal_miss: {diagnostic}"))
+                    .await;
+                self.journal_observed_failure(None, &format!("miss: {diagnostic}"))
+                    .await;
+                let journal = self.recent_journal(16).await;
+                Err(AppError::WorkflowFailed(journal))
+            }
+            Err(macro_engine::IntentError::Browser(_)) => {
+                let _ = self.record("in_page_goal_miss: browser error").await;
+                Err(AppError::BrowserUnavailable)
+            }
+            Ok(
+                macro_engine::PageGoalOutcome::Navigated { .. }
+                | macro_engine::PageGoalOutcome::AlreadyThere { .. }
+                | macro_engine::PageGoalOutcome::SignedOut,
+            ) => {
+                // The notifications lane only yields `Verified`; defensive.
+                Err(AppError::Internal)
+            }
         }
     }
 

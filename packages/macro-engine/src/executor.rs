@@ -906,11 +906,12 @@ const PAGE_GOAL_MAX_STEPS: usize = 3;
 /// hostile page still cannot burn the run.
 const MODEL_GOAL_MAX_STEPS: usize = 8;
 
-/// `LogOut`-only model budget: the `LogOut` UI attempt is a bounded chain
+/// Model budget of the bounded identity-menu policy
+/// ([`IdentityMenuPolicy::BOUNDED`]): the UI attempt is a bounded chain
 /// (gear-1 click → menu-open verify → one opener retry → one short model
-/// pass → cookie fallback), so gear 2 gets a short pass instead of the
-/// full [`MODEL_GOAL_MAX_STEPS`] hunt. Other verbs keep 8.
-const LOGOUT_MODEL_MAX_STEPS: usize = 3;
+/// pass → the verb's deterministic backstop), so gear 2 gets a short pass
+/// instead of the full [`MODEL_GOAL_MAX_STEPS`] hunt.
+const BOUNDED_MODEL_MAX_STEPS: usize = 3;
 
 /// Actionable roles a follow-up can meaningfully click: links plus the
 /// controls menus are made of. Wider than a link-only contract on
@@ -1089,7 +1090,10 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
         // with `navigator: None` there is no model_pass stage to hand off
         // from.
         let ui_miss = if model_ran {
-            format!("{ui_miss}; logout_ui_bounded: model_pass -> fallback")
+            format!(
+                "{ui_miss}; {}_ui_bounded: model_pass -> fallback",
+                spec.menu_policy().journal_tag
+            )
         } else {
             ui_miss
         };
@@ -1199,6 +1203,9 @@ fn verb_goal_text(spec: &VerbSpec) -> &'static str {
         VerbKind::LogOut => {
             "log out: open the account menu in the page header, then the log-out control, to sign out"
         }
+        VerbKind::Notifications => {
+            "notifications: open the notifications control in the page header (or the account menu) to reach the notifications page or panel"
+        }
     }
 }
 
@@ -1253,6 +1260,10 @@ pub enum VerbKind {
     /// "log out", "log off", "sign out": end the session on the current
     /// origin. Verified by the live page reading signed out afterwards.
     LogOut,
+    /// "notifications": the origin's notifications surface — a page or a
+    /// revealed panel. Pursued through the same identity chrome, verified
+    /// by [`verify_notifications_surface`].
+    Notifications,
 }
 
 impl VerbKind {
@@ -1263,6 +1274,7 @@ impl VerbKind {
             VerbKind::AccountHome => "account_home",
             VerbKind::Settings => "settings",
             VerbKind::LogOut => "log_out",
+            VerbKind::Notifications => "notifications",
         }
     }
 }
@@ -1279,6 +1291,9 @@ pub enum VerifierKind {
     IdentityEvidence,
     /// The live page reads signed out after the action.
     AuthSignedOut,
+    /// A notifications surface is observably present on the same site: see
+    /// [`verify_notifications_surface`].
+    NotificationSurface,
 }
 
 /// One row of the verb table: the verb, the closed vocabulary that names
@@ -1308,8 +1323,63 @@ impl VerbSpec {
             VerbKind::AccountHome => &ACCOUNT_HOME_SPEC,
             VerbKind::Settings => &SETTINGS_SPEC,
             VerbKind::LogOut => &LOG_OUT_SPEC,
+            VerbKind::Notifications => &NOTIFICATIONS_SPEC,
         }
     }
+
+    /// The identity-menu policy this verb runs under.
+    #[must_use]
+    pub fn menu_policy(&self) -> IdentityMenuPolicy {
+        match self.kind {
+            VerbKind::LogOut => IdentityMenuPolicy::BOUNDED,
+            VerbKind::AccountHome | VerbKind::Settings | VerbKind::Notifications => {
+                IdentityMenuPolicy::STANDARD
+            }
+        }
+    }
+}
+
+/// The knobs of the one shared identity-menu path (open the identity
+/// menu, pick a noun). Every verb runs the same primitive; a policy only
+/// parameterizes the extras around it, so a verb's behavior is data, not a
+/// private code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityMenuPolicy {
+    /// One re-grounded retry of the same opener (by stable role+name
+    /// identity) when the menu primitive missed; also journals the
+    /// bounded-chain handoffs.
+    pub opener_retry: bool,
+    /// Offer the model only header-strip candidates (see
+    /// [`header_strip_candidates`]).
+    pub header_strip_filter: bool,
+    /// Acting budget of one model pass.
+    pub model_max_steps: usize,
+    /// Whether a failed main model pass may escalate to the stronger model.
+    pub model_escalation: bool,
+    /// Prefix of the bounded-chain journal lines (`{tag}_ui_bounded: …`,
+    /// `{tag} opener retry: …`, `{tag} model filter …`).
+    pub journal_tag: &'static str,
+}
+
+impl IdentityMenuPolicy {
+    /// Default: no opener retry, no header filter, the full model budget,
+    /// escalation allowed.
+    pub const STANDARD: Self = Self {
+        opener_retry: false,
+        header_strip_filter: false,
+        model_max_steps: MODEL_GOAL_MAX_STEPS,
+        model_escalation: true,
+        journal_tag: "",
+    };
+    /// Bounded chain (log out): one opener retry, header-strip candidates
+    /// only, one short model pass, no escalation.
+    pub const BOUNDED: Self = Self {
+        opener_retry: true,
+        header_strip_filter: true,
+        model_max_steps: BOUNDED_MODEL_MAX_STEPS,
+        model_escalation: false,
+        journal_tag: "logout",
+    };
 }
 
 /// Stemmed path tokens for the settings verifier: "settings" and
@@ -1338,7 +1408,17 @@ static LOG_OUT_SPEC: VerbSpec = VerbSpec {
     vocabulary: &["log out", "log off", "sign out"],
     verifier: VerifierKind::AuthSignedOut,
 };
-static VERB_SPECS: &[VerbSpec] = &[ACCOUNT_HOME_SPEC, SETTINGS_SPEC, LOG_OUT_SPEC];
+static NOTIFICATIONS_SPEC: VerbSpec = VerbSpec {
+    kind: VerbKind::Notifications,
+    vocabulary: &["notification", "notifications"],
+    verifier: VerifierKind::NotificationSurface,
+};
+static VERB_SPECS: &[VerbSpec] = &[
+    ACCOUNT_HOME_SPEC,
+    SETTINGS_SPEC,
+    LOG_OUT_SPEC,
+    NOTIFICATIONS_SPEC,
+];
 
 /// Every verb the chrome worker can pursue.
 #[must_use]
@@ -1434,7 +1514,9 @@ async fn select_revealed_target<'a, B: ChromeActionBrowser>(
             select_revealed_action_href(elements, clicked, previously_seen, browser, origin, tokens)
                 .await
         }
-        VerifierKind::IdentityEvidence | VerifierKind::AuthSignedOut => None,
+        VerifierKind::IdentityEvidence
+        | VerifierKind::AuthSignedOut
+        | VerifierKind::NotificationSurface => None,
     }
 }
 
@@ -1488,8 +1570,8 @@ async fn open_menu_within_budget<B: ChromeActionBrowser>(
     Ok(opened)
 }
 
-/// `LogOut`-only single opener retry for the chrome worker's step 2: the
-/// menu primitive missed with the gate's chosen opener. Re-snapshot,
+/// Single opener retry for the chrome worker's step 2 (policies with
+/// [`IdentityMenuPolicy::opener_retry`]): the menu primitive missed with the gate's chosen opener. Re-snapshot,
 /// re-ground the SAME opener by stable identity
 /// ([`ClickedControl::matches`] — backend node ids churn, so the retry
 /// keys on role+name, never the id), click it once through the menu seam,
@@ -1503,9 +1585,10 @@ async fn open_menu_within_budget<B: ChromeActionBrowser>(
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
-async fn logout_opener_retry<B: ChromeActionBrowser>(
+async fn identity_opener_retry<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
+    tag: &str,
     opener: &AxElement,
     clicked: &mut Vec<ClickedControl>,
     tried: &mut Vec<String>,
@@ -1516,7 +1599,7 @@ async fn logout_opener_retry<B: ChromeActionBrowser>(
     let Some(candidate) = elements.iter().find(|element| key.matches(element)) else {
         let name: String = opener.name.chars().take(40).collect();
         tried.push(format!(
-            "logout opener retry: {} '{name}' not in fresh snapshot, no click spent",
+            "{tag} opener retry: {} '{name}' not in fresh snapshot, no click spent",
             opener.role
         ));
         return Ok(false);
@@ -1541,7 +1624,7 @@ async fn logout_opener_retry<B: ChromeActionBrowser>(
         check_after.node_count,
     );
     tried.push(format!(
-        "logout opener retry: {}",
+        "{tag} opener retry: {}",
         tried_label(candidate, &effect)
     ));
     Ok(menu_opened)
@@ -1691,6 +1774,47 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
     Ok(None)
 }
 
+/// Notifications lane: click the revealed control, then the surface
+/// verifier decides — the click may navigate to a page or reveal a
+/// panel/overlay in place. Returns `Some` on a decided outcome, `None`
+/// when no notifications surface is observable and the hunt continues.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn act_on_notifications_target<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    target: &AxElement,
+    spec: &VerbSpec,
+    clicked: &mut Vec<ClickedControl>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    let label = revealed_label(target, spec);
+    browser.menu_click_reported(target, tried).await?;
+    clicked.push(ClickedControl::of(target));
+    *clicks_used += 1;
+    tried.push(tried_label(target, "clicked, watching URL"));
+    let _ = wait_for_url_change(browser).await;
+    if verify_verb(browser, origin, spec, Some(&label), None).await {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        return Ok(Some(
+            PageGoalOutcome::Verified {
+                label,
+                landed,
+                username: None,
+                hit_lines: Vec::new(),
+            }
+            .with_hit_lines(tried),
+        ));
+    }
+    tried.push(tried_label(target, "clicked, no notifications surface"));
+    Ok(None)
+}
+
 /// Run the spec's act lane on a revealed (or already-open-menu) target:
 /// the single dispatch behind the main loop's revealed step, the
 /// already-open-menu step (1a), and the semantic fallback — one
@@ -1721,6 +1845,10 @@ async fn act_on_verb_target<B: ChromeActionBrowser>(
         }
         VerifierKind::AuthSignedOut => {
             act_on_signed_out_target(browser, origin, target, &label, clicked, tried, clicks_used)
+                .await
+        }
+        VerifierKind::NotificationSurface => {
+            act_on_notifications_target(browser, origin, target, spec, clicked, tried, clicks_used)
                 .await
         }
     }
@@ -1911,7 +2039,7 @@ async fn chrome_action_prestate<B: ChromeActionBrowser>(
                 return Ok(Some(PageGoalOutcome::AlreadyThere { landed }));
             }
         }
-        VerbKind::Settings => {}
+        VerbKind::Settings | VerbKind::Notifications => {}
     }
     Ok(None)
 }
@@ -1954,8 +2082,8 @@ async fn chrome_action_prestate<B: ChromeActionBrowser>(
 ///    remaining click budget opening the account menu — its internal
 ///    rank → click → poll loop is not reimplemented here, and a Miss ends
 ///    the worker instead of re-looping over candidates it exhausted — with
-///    one exception: the `LogOut` verb gets exactly one re-grounded retry
-///    of the same opener (same stable identity, never a new candidate)
+///    one exception: a policy with [`IdentityMenuPolicy::opener_retry`]
+///    (log out) gets exactly one re-grounded retry of the same opener (same stable identity, never a new candidate)
 ///    before the Miss, covering actuation misses where the click never
 ///    landed.
 ///
@@ -1999,17 +2127,19 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // menu (or a false positive) and must be dismissed before the next
     // attempt clicks — otherwise its light-dismiss swallows that click.
     let mut menu_maybe_open = false;
-    // `LogOut`-only single opener retry (step 2): the menu primitive can
+    // The verb's identity-menu policy parameterizes the shared path.
+    let policy = spec.menu_policy();
+    // Single opener retry (step 2, policy-gated): the menu primitive can
     // spend its whole budget on an opener whose click never lands
     // (recorded, but no menu evidence on a live page). Exactly one
-    // re-grounded retry of the SAME opener per run; any other verb keeps
-    // today's miss path.
-    let mut logout_opener_retried = false;
-    // `LogOut`-only bounded-chain marker: the UI attempt is a fixed
+    // re-grounded retry of the SAME opener per run; policies without it
+    // keep the plain miss path.
+    let mut opener_retried = false;
+    // Bounded-chain marker: with the retry policy the UI attempt is a fixed
     // chain — gear-1 click → menu-open verify → one opener retry → one
-    // short model pass → cookie fallback — and each handoff is journaled
-    // once per run so the bound is visible in the tried log.
-    let mut logout_bounded_g1_journaled = false;
+    // short model pass → backstop — and each handoff is journaled once per
+    // run so the bound is visible in the tried log.
+    let mut bounded_g1_journaled = false;
     // Per-run semantic matchers, created once: the verb's generic words
     // score revealed items when the closed vocabulary is inconclusive,
     // and "account menu" disambiguates the opener when several strong
@@ -2119,25 +2249,27 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
             Some(chosen_opener),
         )
         .await?;
-        // `LogOut`-only single retry: when the primitive missed, re-ground
+        // Policy-gated single retry: when the primitive missed, re-ground
         // the SAME opener by stable identity and spend one more click on
         // it. An actuation miss (click recorded, menu never opened) reads
         // identically to a wrong-opener miss, and the retry distinguishes
         // them. At most one per run; a second miss breaks exactly as
-        // before, and other verbs never enter this branch. The bounded
-        // chain's handoffs are journaled (`logout_ui_bounded`) so the
-        // fail-fast path is visible in the tried log.
-        let logout_bounded = spec.kind == VerbKind::LogOut;
-        if logout_bounded && !logout_bounded_g1_journaled {
-            logout_bounded_g1_journaled = true;
-            tried.push("logout_ui_bounded: gear1_click -> menu_verify".to_owned());
+        // before, and policies without it never enter this branch. The
+        // bounded chain's handoffs are journaled (`{tag}_ui_bounded`) so
+        // the fail-fast path is visible in the tried log.
+        let bounded = policy.opener_retry;
+        let tag = policy.journal_tag;
+        if bounded && !bounded_g1_journaled {
+            bounded_g1_journaled = true;
+            tried.push(format!("{tag}_ui_bounded: gear1_click -> menu_verify"));
         }
-        let opened = if !opened && logout_bounded && !logout_opener_retried {
-            logout_opener_retried = true;
-            tried.push("logout_ui_bounded: menu_verify -> opener_retry".to_owned());
-            logout_opener_retry(
+        let opened = if !opened && bounded && !opener_retried {
+            opener_retried = true;
+            tried.push(format!("{tag}_ui_bounded: menu_verify -> opener_retry"));
+            identity_opener_retry(
                 browser,
                 origin,
+                tag,
                 chosen_opener,
                 &mut clicked,
                 &mut tried,
@@ -2148,8 +2280,8 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
             opened
         };
         if !opened {
-            if logout_bounded {
-                tried.push("logout_ui_bounded: opener_retry -> model_pass".to_owned());
+            if bounded {
+                tried.push(format!("{tag}_ui_bounded: opener_retry -> model_pass"));
             }
             break;
         }
@@ -2414,6 +2546,7 @@ pub fn chrome_action_miss_diagnostic(spec: &VerbSpec, tried: &[String]) -> Strin
         VerbKind::AccountHome => "identity",
         VerbKind::Settings => "settings",
         VerbKind::LogOut => "log out",
+        VerbKind::Notifications => "notifications",
     };
     let key = spec.kind.as_str();
     if tried.is_empty() {
@@ -2479,7 +2612,68 @@ pub async fn verify_verb<B: ChromeActionBrowser>(
             verify_account_landing(&current, origin, label.unwrap_or(""), username).is_ok()
         }
         VerifierKind::AuthSignedOut => browser.chrome_auth_state().await == AuthState::LoggedOut,
+        VerifierKind::NotificationSurface => {
+            let Some(current) = browser.settings_current_url().await else {
+                return false;
+            };
+            let (fresh, _, _) = browser.menu_snapshot(origin).await;
+            let title = browser.settings_page_title().await;
+            verify_notifications_surface(&current, origin, title.as_deref(), &fresh)
+        }
     }
+}
+
+/// Roles whose accessible name may carry the notifications vocabulary:
+/// headings, landmarks and dialogs. AX only — never DOM text, container
+/// rollups or descriptions.
+const NOTIFICATION_NAME_ROLES: &[&str] = &[
+    "heading",
+    "dialog",
+    "alertdialog",
+    "region",
+    "complementary",
+    "navigation",
+    "main",
+];
+
+/// Roles that make a revealed panel/overlay observable in place.
+const OVERLAY_ROLES: &[&str] = &["dialog", "alertdialog", "menu", "complementary", "region"];
+
+/// Strict notifications verifier, pure (no browser). All three must hold:
+///
+/// 1. **Same site**: `current` is on `origin`'s site.
+/// 2. **A surface is observably present**: a non-root landing path, OR a
+///    revealed panel/overlay (an overlay-role element in the AX snapshot).
+/// 3. **Notification vocabulary** in the page title or in the accessible
+///    name of an AX heading/landmark/dialog element.
+///
+/// Anything else is `false` — the honest miss.
+#[must_use]
+pub fn verify_notifications_surface(
+    current: &url::Url,
+    origin: &url::Url,
+    title: Option<&str>,
+    elements: &[AxElement],
+) -> bool {
+    let vocabulary = NOTIFICATIONS_SPEC.vocabulary;
+    if !same_site_host(
+        current.host_str().unwrap_or(""),
+        origin.host_str().unwrap_or(""),
+    ) {
+        return false;
+    }
+    let non_root = !matches!(current.path(), "" | "/");
+    let overlay = elements
+        .iter()
+        .any(|element| OVERLAY_ROLES.contains(&element.role.as_str()));
+    if !non_root && !overlay {
+        return false;
+    }
+    title.is_some_and(|title| text_mentions_vocabulary(title, vocabulary))
+        || elements.iter().any(|element| {
+            NOTIFICATION_NAME_ROLES.contains(&element.role.as_str())
+                && text_mentions_vocabulary(&element.name, vocabulary)
+        })
 }
 
 /// What one shared menu-opening attempt did. Both in-page lanes route
@@ -3472,16 +3666,16 @@ pub async fn pursue_with_model<B: ChromeActionBrowser>(
     escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
     let mut state = ModelLoopState::default();
-    // `LogOut` runs a bounded chain: one short model pass, no escalation —
-    // the cookie fallback is the deterministic backstop, so the extra
-    // escalation pass would only burn model calls on the way to it.
-    let logout_bounded = spec.is_some_and(|spec| spec.kind == VerbKind::LogOut);
-    let max_steps = if logout_bounded {
-        LOGOUT_MODEL_MAX_STEPS
+    // The verb's policy sets the budget and escalation: the bounded chain
+    // (log out) runs one short model pass, no escalation — its
+    // deterministic backstop makes an extra pass pure model-call burn.
+    let policy = spec.map_or(IdentityMenuPolicy::STANDARD, VerbSpec::menu_policy);
+    let max_steps = policy.model_max_steps;
+    let escalation = if policy.model_escalation {
+        escalation
     } else {
-        MODEL_GOAL_MAX_STEPS
+        None
     };
-    let escalation = if logout_bounded { None } else { escalation };
     let main_miss = match model_loop_pass(
         browser,
         origin,
@@ -3596,8 +3790,7 @@ async fn model_loop_exit<B: ChromeActionBrowser>(
 /// [`model_loop_tail`], whose [`IntentError::NoMatch`] carries the
 /// journal. Exactly one pass escalates — this helper never escalates
 /// itself. `max_steps` is the acting budget: [`MODEL_GOAL_MAX_STEPS`]
-/// for most verbs, [`LOGOUT_MODEL_MAX_STEPS`] for the bounded `LogOut`
-/// chain.
+/// from the verb's [`IdentityMenuPolicy`].
 ///
 /// # Errors
 /// Returns [`IntentError::NoMatch`] when the goal is not reached or not
@@ -3621,8 +3814,9 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
     // open, whose light-dismiss would swallow the pass's first click.
     // Best-effort no-op when nothing is open.
     browser.menu_dismiss().await;
-    // The LogOut filter's fail-safe line is journaled once per pass.
-    let mut logout_filter_fallback_journaled = false;
+    let policy = spec.map_or(IdentityMenuPolicy::STANDARD, VerbSpec::menu_policy);
+    // The header filter's fail-safe line is journaled once per pass.
+    let mut filter_fallback_journaled = false;
 
     for _ in 0..max_steps {
         // Untruncated: the pick is validated against the same full list
@@ -3637,23 +3831,24 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
             .take(crate::MAX_NAVIGATOR_ELEMENTS)
             .cloned()
             .collect();
-        // One measurement round feeds both the zones and the LogOut
-        // header filter — never a second CDP pass.
+        // One measurement round feeds both the zones and the header
+        // filter — never a second CDP pass.
         let points = model_zone_points(browser, &head).await;
         let mut zones = zones_from_points(&points);
-        // `LogOut`-only guard: offer the model only header-strip
-        // candidates (see [`logout_model_filter`); the live miss clicked
-        // a feed ad's options button from this very turn.
-        if spec.is_some_and(|spec| spec.kind == VerbKind::LogOut)
+        // Policy-gated guard: offer the model only header-strip
+        // candidates (see [`header_strip_model_filter`]); the live miss
+        // clicked a feed ad's options button from this very turn.
+        if policy.header_strip_filter
             && let Some(strip_bottom) = header_strip_bottom(browser).await
         {
-            (head, zones) = logout_model_filter(
+            (head, zones) = header_strip_model_filter(
                 head,
                 zones,
                 &points,
                 strip_bottom,
+                policy.journal_tag,
                 &mut state.tried,
-                &mut logout_filter_fallback_journaled,
+                &mut filter_fallback_journaled,
             );
         }
         // Phase 2: the visual turn — a best-effort viewport screenshot
@@ -3871,7 +4066,7 @@ fn model_goal_text(goal: &str, spec: Option<&VerbSpec>) -> String {
 /// one `(x, y)` center per element, in order; `(NaN, NaN)` when the rect
 /// won't resolve. Measured through [`MenuBrowser::menu_node_rect`].
 /// Best-effort and time-bounded — geometry that won't resolve degrades to
-/// unmeasured points, never a stall. Split out so the `LogOut` header
+/// unmeasured points, never a stall. Split out so the header-strip
 /// filter reuses the same measurement round instead of paying a second
 /// CDP pass.
 async fn model_zone_points<B: MenuBrowser>(browser: &B, elements: &[AxElement]) -> Vec<(f64, f64)> {
@@ -3937,10 +4132,10 @@ fn zones_from_points(points: &[(f64, f64)]) -> Vec<Option<crate::navigator::Posi
         .collect()
 }
 
-/// `LogOut` model-phase candidate filter, pure: keep the head element ids
+/// Header-strip model-phase candidate filter (policy-gated), pure: keep the head element ids
 /// whose rect center-y sits inside the header strip (at or above
 /// `strip_bottom`). The account menu renders near the header, so
-/// feed/ad/main-content controls below the strip are never `LogOut`
+/// feed/ad/main-content controls below the strip are never identity-menu
 /// candidates — this is the guard that keeps a generalist model from
 /// clicking a feed ad's options button when it should be opening the
 /// account menu. Unmeasurable centers (NaN) are excluded: a control with
@@ -3948,7 +4143,7 @@ fn zones_from_points(points: &[(f64, f64)]) -> Vec<Option<crate::navigator::Posi
 /// empty result means the caller falls back to the unfiltered list —
 /// never blind the model.
 #[must_use]
-pub fn logout_header_candidates(ids: &[i64], y_centers: &[f64], strip_bottom: f64) -> Vec<i64> {
+pub fn header_strip_candidates(ids: &[i64], y_centers: &[f64], strip_bottom: f64) -> Vec<i64> {
     ids.iter()
         .zip(y_centers.iter())
         .filter(|(_, y)| y.is_finite() && **y <= strip_bottom)
@@ -3956,36 +4151,36 @@ pub fn logout_header_candidates(ids: &[i64], y_centers: &[f64], strip_bottom: f6
         .collect()
 }
 
-/// `LogOut` model-guard application for [`model_loop_pass`]: narrow the
+/// Header-strip guard application for [`model_loop_pass`]: narrow the
 /// navigator's head slice (and its 1:1 zones) to header-strip candidates
-/// via [`logout_header_candidates`], so the generalist can't wander into
+/// via [`header_strip_candidates`], so the generalist can't wander into
 /// feed/ad controls — the live miss clicked a feed ad's options button
 /// from this very turn. An emptied list keeps the full head and journals
 /// one line per pass (`fallback_journaled`) instead of blinding the
 /// model; the caller fails closed to the unfiltered head when the
 /// viewport won't read. Returns the (possibly filtered) head and zones,
 /// still aligned.
-fn logout_model_filter(
+fn header_strip_model_filter(
     head: Vec<AxElement>,
     zones: Vec<Option<crate::navigator::PositionZone>>,
     points: &[(f64, f64)],
     strip_bottom: f64,
+    tag: &str,
     tried: &mut Vec<String>,
     fallback_journaled: &mut bool,
 ) -> (Vec<AxElement>, Vec<Option<crate::navigator::PositionZone>>) {
     let ids: Vec<i64> = head.iter().map(|element| element.backend_node_id).collect();
     let y_centers: Vec<f64> = points.iter().map(|(_, y)| *y).collect();
     let kept: std::collections::HashSet<i64> =
-        logout_header_candidates(&ids, &y_centers, strip_bottom)
+        header_strip_candidates(&ids, &y_centers, strip_bottom)
             .into_iter()
             .collect();
     if kept.is_empty() {
         if !*fallback_journaled {
             *fallback_journaled = true;
-            tried.push(
-                "logout model filter found no header-strip candidates; showing the full list"
-                    .to_owned(),
-            );
+            tried.push(format!(
+                "{tag} model filter found no header-strip candidates; showing the full list"
+            ));
         }
         return (head, zones);
     }
