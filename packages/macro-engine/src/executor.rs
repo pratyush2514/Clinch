@@ -873,6 +873,10 @@ pub enum PageGoalOutcome {
         /// (empty when no click happened, e.g. a cookie-clear or href
         /// navigation).
         hit_lines: Vec<String>,
+        /// Attempt-trail journal lines (bounded-chain handoffs, miss
+        /// reasons), oldest first. Never click evidence: that stays in
+        /// `hit_lines`.
+        tried_lines: Vec<String>,
     },
     /// The page is a signed-out guest landing: there is no identity
     /// chrome to pursue, so the worker stops before any click.
@@ -1184,9 +1188,24 @@ async fn logout_cookie_fallback<B: ChromeActionBrowser>(
             landed,
             username: None,
             hit_lines: Vec::new(),
+            tried_lines: fallback_tried_lines(ui_miss, &line),
         });
     }
     Err(IntentError::NoMatch(format!("{ui_miss}; {line}")))
+}
+
+/// Attempt trail for a fallback-completed run: the UI tried-journal split
+/// on `"; "` (order preserved, empty segments dropped), then the
+/// already-formatted fallback line last.
+#[must_use]
+pub fn fallback_tried_lines(ui_miss: &str, fallback_line: &str) -> Vec<String> {
+    let mut lines: Vec<String> = ui_miss
+        .split("; ")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.push(fallback_line.to_string());
+    lines
 }
 
 /// Goal sentence for the generalist loop, per verb: what the destination
@@ -1724,6 +1743,7 @@ async fn act_on_path_tokens_target<B: ChromeActionBrowser>(
                 landed,
                 username: None,
                 hit_lines: Vec::new(),
+                tried_lines: Vec::new(),
             }
             .with_hit_lines(tried),
         ));
@@ -1766,6 +1786,7 @@ async fn act_on_signed_out_target<B: ChromeActionBrowser>(
                 landed,
                 username: None,
                 hit_lines: Vec::new(),
+                tried_lines: Vec::new(),
             }
             .with_hit_lines(tried),
         ));
@@ -1807,6 +1828,7 @@ async fn act_on_notifications_target<B: ChromeActionBrowser>(
                 landed,
                 username: None,
                 hit_lines: Vec::new(),
+                tried_lines: Vec::new(),
             }
             .with_hit_lines(tried),
         ));
@@ -3496,6 +3518,7 @@ pub fn verify_account_landing(
             landed: current.clone(),
             username: username.map(str::to_owned),
             hit_lines: Vec::new(),
+            tried_lines: Vec::new(),
         })
     } else {
         Err(format!(
@@ -4052,6 +4075,7 @@ async fn model_loop_click<B: ChromeActionBrowser>(
                     landed,
                     username: revealed_username.clone(),
                     hit_lines: Vec::new(),
+                    tried_lines: Vec::new(),
                 }
                 .with_hit_lines(tried),
             ));
@@ -4274,6 +4298,7 @@ async fn model_loop_tail<B: ChromeActionBrowser>(
             landed,
             username: revealed_username.map(str::to_owned),
             hit_lines: Vec::new(),
+            tried_lines: Vec::new(),
         }
         .with_hit_lines(tried));
     }

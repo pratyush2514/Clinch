@@ -4594,6 +4594,7 @@ impl AppService {
                 landed,
                 username,
                 hit_lines,
+                ..
             }) => {
                 for line in &hit_lines {
                     let _ = self.record(line).await;
@@ -4904,8 +4905,12 @@ impl AppService {
                 label,
                 landed,
                 hit_lines,
+                tried_lines,
                 ..
             }) => {
+                for line in &tried_lines {
+                    let _ = self.record(line).await;
+                }
                 for line in &hit_lines {
                     let _ = self.record(line).await;
                 }
