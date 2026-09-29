@@ -1516,7 +1516,10 @@ const CHROME_ACTION_MAX_CLICKS: usize = 3;
 /// matcher first, then — for path-token verbs — the href half (a
 /// blank-named link to a matching path). [`AxElement`] carries no href,
 /// so hrefs resolve lazily per genuinely-new candidate, never for the
-/// whole snapshot.
+/// whole snapshot. The pick's tier is journaled in `tried`.
+// Eight parameters: the href lane's inputs plus the journal; bundling would
+// only hide the data flow.
+#[allow(clippy::too_many_arguments)]
 async fn select_revealed_target<'a, B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
@@ -1524,8 +1527,12 @@ async fn select_revealed_target<'a, B: ChromeActionBrowser>(
     clicked: &[ClickedControl],
     previously_seen: &std::collections::HashSet<i64>,
     spec: &VerbSpec,
+    tried: &mut Vec<String>,
 ) -> Option<&'a AxElement> {
-    if let Some(target) = select_revealed_action(elements, clicked, previously_seen, spec) {
+    if let Some((target, tier)) =
+        select_revealed_action_tiered(elements, clicked, previously_seen, spec)
+    {
+        tried.push(format!("revealed pick: {}", tier.label()));
         return Some(target);
     }
     match spec.verifier {
@@ -1608,11 +1615,24 @@ async fn identity_opener_retry<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
     tag: &str,
+    picked_on: &url::Url,
     opener: &AxElement,
     clicked: &mut Vec<ClickedControl>,
     tried: &mut Vec<String>,
     clicks_used: &mut usize,
 ) -> Result<bool, IntentError> {
+    // The lane never legitimately navigates before this point, so a live URL
+    // that differs from the page the opener was picked on means a wander
+    // click navigated: re-grounding by role+name there would accept a
+    // same-named control on the wrong page. An unreadable URL fails open.
+    if let Some(live) = browser.settings_current_url().await
+        && !same_page(&live, picked_on)
+    {
+        tried.push(format!(
+            "{tag}_ui_bounded: opener_retry skipped (page navigated)"
+        ));
+        return Ok(false);
+    }
     let (elements, check, _) = browser.menu_snapshot(origin).await;
     let key = ClickedControl::of(opener);
     let Some(candidate) = elements.iter().find(|element| key.matches(element)) else {
@@ -1647,6 +1667,11 @@ async fn identity_opener_retry<B: ChromeActionBrowser>(
         tried_label(candidate, &effect)
     ));
     Ok(menu_opened)
+}
+
+/// Whether two URLs name the same page, ignoring a trailing slash.
+fn same_page(a: &url::Url, b: &url::Url) -> bool {
+    a.as_str().trim_end_matches('/') == b.as_str().trim_end_matches('/')
 }
 
 /// Identity lane: navigate a page-revealed, Rust-validated href when the
@@ -1915,12 +1940,13 @@ async fn already_open_menu_step<B: ChromeActionBrowser>(
     if !clicked.is_empty() {
         return Ok(AlreadyOpenMenuOutcome::Skipped);
     }
-    let Some(target) = select_already_open_menu_target(elements, spec) else {
+    let Some((target, tier)) = select_already_open_menu_target_tiered(elements, spec) else {
         return Ok(AlreadyOpenMenuOutcome::Skipped);
     };
     let name: String = target.name.chars().take(40).collect();
     tried.push(format!(
-        "menu already open: clicked '{name}' directly (no opener)"
+        "menu already open: clicked '{name}' directly (no opener) [{}]",
+        tier.label()
     ));
     if let Some(outcome) =
         act_on_verb_target(browser, origin, target, spec, clicked, tried, clicks_used).await?
@@ -2018,8 +2044,16 @@ async fn select_revealed_destination<'a, B: ChromeActionBrowser>(
     tried: &mut Vec<String>,
     spec: &VerbSpec,
 ) -> Option<&'a AxElement> {
-    if let Some(target) =
-        select_revealed_target(browser, origin, elements, clicked, previously_seen, spec).await
+    if let Some(target) = select_revealed_target(
+        browser,
+        origin,
+        elements,
+        clicked,
+        previously_seen,
+        spec,
+        tried,
+    )
+    .await
     {
         return Some(target);
     }
@@ -2157,6 +2191,12 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     // re-grounded retry of the SAME opener per run; policies without it
     // keep the plain miss path.
     let mut opener_retried = false;
+    // The page the opener is picked on: the live URL at hunt start (a
+    // redirect from the requested origin is not a wander), else the origin.
+    let picked_on = browser
+        .settings_current_url()
+        .await
+        .unwrap_or_else(|| origin.clone());
     // Bounded-chain marker: with the retry policy the UI attempt is a fixed
     // chain — gear-1 click → menu-open verify → one opener retry → one
     // short model pass → backstop — and each handoff is journaled once per
@@ -2292,6 +2332,7 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
                 browser,
                 origin,
                 tag,
+                &picked_on,
                 chosen_opener,
                 &mut clicked,
                 &mut tried,
@@ -2330,17 +2371,47 @@ pub fn select_revealed_action<'a, S: std::hash::BuildHasher>(
     previously_seen: &std::collections::HashSet<i64, S>,
     spec: &VerbSpec,
 ) -> Option<&'a AxElement> {
+    select_revealed_action_tiered(elements, clicked, previously_seen, spec)
+        .map(|(element, _)| element)
+}
+
+/// [`select_revealed_action`] plus the [`MatchTier`] that produced the pick.
+/// Two passes over the same candidate set: pass 1 wants the control that
+/// itself carries the vocabulary (name/description, or the identity-lane
+/// username handle); pass 2 falls back to the container rollup, which an
+/// opened menu shares across every item — so it only decides when no control
+/// names the destination itself.
+#[must_use]
+pub fn select_revealed_action_tiered<'a, S: std::hash::BuildHasher>(
+    elements: &'a [AxElement],
+    clicked: &[ClickedControl],
+    previously_seen: &std::collections::HashSet<i64, S>,
+    spec: &VerbSpec,
+) -> Option<(&'a AxElement, MatchTier)> {
     if clicked.is_empty() {
         return None;
     }
     let identity_lane = matches!(spec.verifier, VerifierKind::IdentityEvidence);
-    elements.iter().find(|element| {
+    let eligible = |element: &&AxElement| {
         PAGE_GOAL_ROLES.contains(&element.role.as_str())
             && !already_clicked(clicked, element)
             && !previously_seen.contains(&element.backend_node_id)
-            && (mentions_vocabulary(element, spec.vocabulary)
-                || (identity_lane && username_from_menu_text(&element.name).is_some()))
-    })
+    };
+    elements
+        .iter()
+        .filter(eligible)
+        .find(|element| {
+            mentions_vocabulary_direct(element, spec.vocabulary)
+                || (identity_lane && username_from_menu_text(&element.name).is_some())
+        })
+        .map(|element| (element, MatchTier::Direct))
+        .or_else(|| {
+            elements
+                .iter()
+                .filter(eligible)
+                .find(|element| mentions_vocabulary(element, spec.vocabulary))
+                .map(|element| (element, MatchTier::Container))
+        })
 }
 
 /// The href half of the revealed-item matcher for the
@@ -2401,17 +2472,39 @@ pub fn select_already_open_menu_target<'a>(
     elements: &'a [AxElement],
     spec: &VerbSpec,
 ) -> Option<&'a AxElement> {
+    select_already_open_menu_target_tiered(elements, spec).map(|(element, _)| element)
+}
+
+/// [`select_already_open_menu_target`] plus the [`MatchTier`] that produced
+/// the pick: a control that itself names the vocabulary beats one that only
+/// matches through the menu's shared container text.
+#[must_use]
+pub fn select_already_open_menu_target_tiered<'a>(
+    elements: &'a [AxElement],
+    spec: &VerbSpec,
+) -> Option<(&'a AxElement, MatchTier)> {
     if !elements
         .iter()
         .any(|element| is_menu_role(&element.role) || element.role == "dialog")
     {
         return None;
     }
-    elements.iter().find(|element| {
+    let eligible = |element: &&AxElement| {
         (is_menu_role(&element.role) || element.role == "dialog")
             && PAGE_GOAL_ROLES.contains(&element.role.as_str())
-            && mentions_vocabulary(element, spec.vocabulary)
-    })
+    };
+    elements
+        .iter()
+        .filter(eligible)
+        .find(|element| mentions_vocabulary_direct(element, spec.vocabulary))
+        .map(|element| (element, MatchTier::Direct))
+        .or_else(|| {
+            elements
+                .iter()
+                .filter(eligible)
+                .find(|element| mentions_vocabulary(element, spec.vocabulary))
+                .map(|element| (element, MatchTier::Container))
+        })
 }
 
 /// How many menu-layer candidates the semantic revealed fallback scores
@@ -2462,6 +2555,36 @@ pub async fn semantic_revealed_target<'a, S: std::hash::BuildHasher>(
         }
     }
     None
+}
+
+/// Which evidence produced a revealed-menu pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchTier {
+    /// The control's own name or description carries the vocabulary.
+    Direct,
+    /// Only the surrounding container text carries the vocabulary.
+    Container,
+}
+
+impl MatchTier {
+    /// Short journal label for the tried log.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct name match",
+            Self::Container => "container-only match",
+        }
+    }
+}
+
+/// [`mentions_vocabulary`] without the container rollup: only the element's
+/// own normalized name and description count.
+fn mentions_vocabulary_direct(element: &AxElement, vocabulary: &[&str]) -> bool {
+    let name = normalize(&element.name);
+    let description = normalize(&element.description);
+    vocabulary
+        .iter()
+        .any(|word| name.contains(word) || description.contains(word))
 }
 
 /// Whether the element's name, description, or container rollup mentions a

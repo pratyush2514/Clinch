@@ -294,13 +294,14 @@ fn revealed_profile_ignores_stale_header_buttons() {
 }
 
 #[test]
-fn revealed_profile_without_freshness_would_pick_stale_chrome() {
+fn revealed_profile_without_freshness_prefers_direct_name_over_stale_chrome() {
     use macro_engine::{ClickedControl, VerbKind, VerbSpec, select_revealed_action};
     use std::collections::HashSet;
     let spec = VerbSpec::for_kind(VerbKind::AccountHome);
-    // Pins the failure mode the freshness set exists to prevent: without
-    // it, the first header button wins by document order. The tried
-    // control matches nothing on the page, so exclusion changes nothing.
+    // Even without the freshness set, the control that itself says
+    // "Profile" beats the earlier header button that only matches through
+    // its container rollup (see revealed_precedence.rs). The tried control
+    // matches nothing on the page, so exclusion changes nothing.
     let elements = vec![
         revealed_element(1, "button", "Search", &["Profile"]),
         revealed_element(3, "link", "Profile", &[]),
@@ -313,7 +314,7 @@ fn revealed_profile_without_freshness_would_pick_stale_chrome() {
     ))];
     let picked = select_revealed_action(&elements, &clicked, &HashSet::new(), spec)
         .expect("something picked");
-    assert_eq!(picked.backend_node_id, 1);
+    assert_eq!(picked.backend_node_id, 3);
 }
 
 #[test]
