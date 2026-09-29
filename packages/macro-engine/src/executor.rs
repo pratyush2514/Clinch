@@ -801,84 +801,12 @@ pub fn resolve_batch(elements: &[AxElement], intent: &SemanticIntent) -> Resolve
     }
 }
 
-/// Upper bound on how far down a results page Stage 2 scans for a
-/// followable link. Organic results sit near the top in document order;
-/// scanning past this means the noun never really appeared.
-const MAX_SEARCH_RESULT_SCAN: usize = 40;
-
 /// Stage-2 navigation budget: how long a followed result may take to leave
 /// the search page before the follow is reported as failed.
 pub const FOLLOW_POLL_MS: u64 = 250;
 pub const FOLLOW_TIMEOUT_MS: u64 = 10_000;
 
-/// What Stage 2 did: the followed link's visible label plus the URL the
-/// browser actually landed on. The landed URL is observed, never predicted,
-/// so confinement re-anchors to where the click really went.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FollowedResult {
-    pub label: String,
-    pub landed: url::Url,
-}
-
-/// Pick the link Stage 2 should follow on a search-results page.
-///
-/// Evidence-only — there is no engine-specific markup, selector, or result
-/// container name anywhere in here. Among `link` candidates in snapshot
-/// document order: skip page chrome (the engine's own `navigation` /
-/// `banner` / `contentinfo` / `complementary` landmarks), skip unlabeled
-/// links, and require the target noun in the link's visible text,
-/// description, or surroundings. The first survivor is the top organic
-/// result, because document order is the snapshot's ordering contract.
-///
-/// An empty noun yields `None` rather than "first link on the page": with
-/// nothing to match against, clicking anything would be a guess.
-#[must_use]
-pub fn select_search_result<'a>(elements: &'a [AxElement], noun: &str) -> Option<&'a AxElement> {
-    if noun.trim().is_empty() {
-        return None;
-    }
-    elements
-        .iter()
-        .take(MAX_SEARCH_RESULT_SCAN)
-        .find(|element| {
-            element.role == "link"
-                && !is_page_chrome(element)
-                && !element.name.trim().is_empty()
-                && mentions_noun(element, noun)
-        })
-}
-
-/// Diagnostic for a Stage-2 follow that found no candidate: the noun plus
-/// every link the page did offer, bounded like [`grounding_diagnostic`], so
-/// a failed follow reads as evidence instead of a bare failure.
-#[must_use]
-pub fn follow_diagnostic(elements: &[AxElement], noun: &str) -> String {
-    let mut rendered: Vec<String> = Vec::new();
-    let mut links = 0_usize;
-    for element in elements.iter().filter(|element| element.role == "link") {
-        links += 1;
-        if rendered.len() >= MAX_DIAGNOSTIC_CANDIDATES {
-            continue;
-        }
-        let chrome = if is_page_chrome(element) {
-            " [chrome]"
-        } else {
-            ""
-        };
-        let text: String = element.name.chars().take(MAX_DIAGNOSTIC_TEXT_LEN).collect();
-        rendered.push(format!("'{text}'{chrome}"));
-    }
-    let hidden = links.saturating_sub(rendered.len());
-    if hidden > 0 {
-        rendered.push(format!("… and {hidden} more"));
-    }
-    format!(
-        "Search follow found no result mentioning '{noun}'. Evaluated {links} links: [{}]",
-        rendered.join(", ")
-    )
-}
-
-/// Whether the live page has navigated away from `from`: origin or path
+/// What pursuing an in-page follow-up did. The landed URL is observed from
 /// differs. Reuses [`url_drifted`], which also treats `blob:` / `data:`
 /// targets as "not yet landed" — exactly right here, since a download
 /// handoff is not a site landing and the poll should keep waiting.
@@ -915,50 +843,8 @@ where
     }
 }
 
-/// Stage 2 of search-and-follow: click the top result matching `noun` and
-/// report where it landed.
-///
-/// Snapshots the settled search page, selects a candidate by visible
-/// evidence, clicks it through the same badge-and-coordinate path every
-/// other semantic click uses, then waits for the navigation to land. The
-/// returned URL is observed from the live target, so the caller can
-/// re-anchor portal confinement to the real destination instead of a
-/// predicted one.
-///
-/// # Errors
-/// Returns [`IntentError::NoMatch`] when no link mentions the noun or the
-/// click never navigated, and [`IntentError::Browser`] on CDP failure.
-pub async fn follow_search_result(
-    browser: &ManagedBrowser,
-    search_origin: &url::Url,
-    noun: &str,
-) -> Result<FollowedResult, IntentError> {
-    let (elements, _, _) = browser.ax_snapshot(search_origin).await;
-    let candidate = select_search_result(&elements, noun)
-        .ok_or_else(|| IntentError::NoMatch(follow_diagnostic(&elements, noun)))?;
-    let label = candidate.name.clone();
-    let from = browser
-        .current_url()
-        .await?
-        .ok_or(browser_driver::BrowserError::WrongOrigin)?;
-    click_element(browser, candidate).await?;
-    let landed = wait_for_navigation_with(
-        || async { browser.current_url().await.ok().flatten() },
-        &from,
-        std::time::Duration::from_millis(FOLLOW_POLL_MS),
-        std::time::Duration::from_millis(FOLLOW_TIMEOUT_MS),
-    )
-    .await
-    .ok_or_else(|| {
-        IntentError::NoMatch(format!(
-            "Search follow clicked '{label}' but the page never left the results."
-        ))
-    })?;
-    Ok(FollowedResult { label, landed })
-}
-
 /// What pursuing an in-page follow-up did. The landed URL is observed from
-/// the live page, never predicted — the same contract as [`FollowedResult`].
+/// the live page, never predicted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageGoalOutcome {
     /// A click navigated somewhere new: the clicked label plus the URL.
@@ -996,9 +882,8 @@ const MODEL_GOAL_MAX_STEPS: usize = 8;
 const LOGOUT_MODEL_MAX_STEPS: usize = 3;
 
 /// Actionable roles a follow-up can meaningfully click: links plus the
-/// controls menus are made of. Wider than [`select_search_result`]'s
-/// link-only contract on purpose — on a portal page the target often lives
-/// behind a button.
+/// controls menus are made of. Wider than a link-only contract on
+/// purpose — on a portal page the target often lives behind a button.
 const PAGE_GOAL_ROLES: &[&str] = &["link", "button", "menuitem", "menuitemlink"];
 
 /// Pursue `noun` on the already-loaded portal page: the Muse-style
@@ -4316,37 +4201,6 @@ pub fn settle_probe_text(intent: &SemanticIntent) -> &str {
         .as_deref()
         .filter(|noun| !noun.trim().is_empty())
         .unwrap_or(&intent.label_query)
-}
-
-/// Noun [`select_search_result`] should match on for one intent.
-///
-/// Stage 2 picks a *site*, while the batch gate picks *artifacts inside a
-/// site* — two different words whenever the prompt named both. The prompt's
-/// grammar decides which is available:
-///
-/// * `download all my invoices from github` parses a site complement, so
-///   `site_context` is `github` and Stage 2 follows the GitHub result. The
-///   artifact (`invoice`) stays on the intent, where [`resolve_batch`] gates
-///   with it once the destination has loaded.
-/// * `find amazon` carries no complement, so the direct object is
-///   itself the destination and this falls back to
-///   [`settle_probe_text`] — the intent's target noun. (Direct opens like
-///   `open amazon for me` never reach search-and-follow; the ladder grounds
-///   them or misses.)
-///
-/// Blank or missing site contexts fall back rather than failing: an empty
-/// noun makes [`select_search_result`] return `None`, and losing a
-/// followable result to whitespace would be a worse answer than the noun
-/// the settle loop already trusts.
-#[must_use]
-pub fn search_follow_noun<'a>(
-    intent: &'a SemanticIntent,
-    site_context: Option<&'a str>,
-) -> &'a str {
-    site_context
-        .map(str::trim)
-        .filter(|site| !site.is_empty())
-        .unwrap_or_else(|| settle_probe_text(intent))
 }
 
 /// Poll `snapshot` until its tree holds at least one valid target

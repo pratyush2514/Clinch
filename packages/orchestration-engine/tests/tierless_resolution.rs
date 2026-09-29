@@ -16,9 +16,7 @@
 //!   never a fabricated destination.
 //! * **Honest miss** — prompts that are not direct opens (retrieval
 //!   verbs like `"find"`) and that no ladder rung grounds resolve to
-//!   `None`, the miss the caller turns into ask-and-learn guidance. The
-//!   prompt's own grammar (never a site list) still supplies the noun that
-//!   Stage 2 would have picked out of a live results tree.
+//!   `None`, the miss the caller turns into ask-and-learn guidance.
 
 use browser_driver::AxElement;
 use orchestration_engine::{CommandMatch, ResolutionContext, RouteSource};
@@ -163,7 +161,7 @@ async fn honest_miss_for_non_direct_opens_without_grounding()
     // slot, it misses honestly instead of landing on a search page.
     let prompt = "find amazon";
     // No stored workflow claims this prompt, so it resolves as ephemeral.
-    let Some(CommandMatch::Ephemeral { intent }) =
+    let Some(CommandMatch::Ephemeral { .. }) =
         orchestration_engine::resolve_command(prompt, Some(&search_origin), &saved)
     else {
         return Err("unclaimed prompt resolves ephemeral".into());
@@ -174,34 +172,11 @@ async fn honest_miss_for_non_direct_opens_without_grounding()
         None,
         "ungrounded non-direct-open prompt misses, never searches"
     );
-    // The follow machinery itself is unchanged: the noun still comes from
-    // the prompt's grammar. This prompt has no prepositional complement,
-    // so the direct object drives the follow.
-    let site_context = orchestration_engine::parse_grammar(&intent.raw_prompt, None).site_context;
-    assert_eq!(site_context, None);
-    let noun = macro_engine::search_follow_noun(&intent, site_context.as_deref());
-    assert_eq!(noun, "amazon");
-    // Candidate selection over the results tree: engine chrome is skipped
-    // even though it matches, and the non-matching competitor ahead of the
-    // answer is skipped by the noun gate.
-    let elements = vec![
-        link(1, "Amazon", Some("navigation")),
-        link(2, "Flipkart Online Shopping", None),
-        link(3, "Amazon.in - Online Shopping", None),
-    ];
-    let picked =
-        macro_engine::select_search_result(&elements, noun).ok_or("a result is selected")?;
-    assert_eq!(picked.backend_node_id, 3);
-    assert!(picked.landmark.is_none());
-    // The destination is read from the click, never predicted: an absent
-    // noun fails closed rather than clicking the first link on the page.
-    assert!(macro_engine::select_search_result(&elements, "nonexistentbrand").is_none());
-    assert!(macro_engine::select_search_result(&elements, "").is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn prepositional_prompts_follow_the_site_and_batch_the_artifact()
+async fn prepositional_prompts_keep_site_and_artifact_slots_distinct()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_dir, store) = store().await?;
     let saved = store.list_playbooks().await?;
@@ -217,26 +192,15 @@ async fn prepositional_prompts_follow_the_site_and_batch_the_artifact()
     // Artifact noun rides the intent for batch gating…
     assert_eq!(intent.primary_target_noun.as_deref(), Some("invoice"));
     assert!(intent.is_plural);
-    // …while the complement names the destination Stage 2 follows.
+    // …while the complement names the destination slot.
     let site_context = orchestration_engine::parse_grammar(&intent.raw_prompt, None).site_context;
     assert_eq!(site_context.as_deref(), Some("acmecorp"));
-    let noun = macro_engine::search_follow_noun(&intent, site_context.as_deref());
-    assert_eq!(noun, "acmecorp");
-    // Stage 2 therefore lands on the site, not on an invoice article.
-    let elements = vec![
-        link(1, "Invoice templates and guides", None),
-        link(2, "AcmeCorp — Billing portal", None),
-    ];
-    let picked =
-        macro_engine::select_search_result(&elements, noun).ok_or("a result is selected")?;
-    assert_eq!(picked.backend_node_id, 2);
-    // The two slots stay distinct all the way down: the word Stage 2 follows
-    // is never the word the batch gate anchors on. Swapping them would make
-    // Stage 2 click an invoice article and the batch admit site chrome — the
-    // exact collision a single noun slot caused.
-    assert_ne!(noun, intent.primary_target_noun.as_deref().unwrap_or(""));
-    // Batch gating on the artifact noun is covered by the seeded-playbook
-    // test above, where the label and noun agree as they do after a real
-    // Stage-2 landing.
+    // The two slots stay distinct: the site slot is never the word the
+    // batch gate anchors on. Swapping them would make the batch admit site
+    // chrome — the exact collision a single noun slot caused.
+    assert_ne!(
+        site_context.as_deref().unwrap_or(""),
+        intent.primary_target_noun.as_deref().unwrap_or("")
+    );
     Ok(())
 }

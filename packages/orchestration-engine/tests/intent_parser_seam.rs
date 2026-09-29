@@ -5,12 +5,11 @@
 //!
 //! 1. Crisp commands never pay for a parser call.
 //! 2. Irregular phrasing that grammar misreads defers to the seam, and the
-//!    returned slots are what search-and-follow then grounds on.
+//!    returned slots normalize exactly like deterministic ones.
 //! 2. A stalled or absent parser degrades to an honest miss inside the
 //!    timeout instead of hanging or failing the run.
 //! 4. A saved run turns its prompt into a tier-1 hit on the next invocation.
 
-use browser_driver::AxElement;
 use orchestration_engine::{
     CommandMatch, Confidence, IntentParser, PARSER_TIMEOUT_MS, ParsedSlots, ResolutionContext,
     SlotSource, StubIntentParser, TestDoubleIntentParser,
@@ -30,18 +29,6 @@ fn slots(action: &str, artifact: Option<&str>, site: Option<&str>) -> ParsedSlot
         action: action.into(),
         artifact_noun: artifact.map(str::to_owned),
         site_context: site.map(str::to_owned),
-    }
-}
-
-/// One AX link candidate, as `interactive_elements` would report it.
-fn link(backend_node_id: i64, name: &str) -> AxElement {
-    AxElement {
-        backend_node_id,
-        role: "link".into(),
-        name: name.into(),
-        description: String::new(),
-        container_text: Vec::new(),
-        landmark: None,
     }
 }
 
@@ -121,29 +108,6 @@ fn test_low_confidence_prompt_defers_to_parser() {
     // to `bill`, so one vocabulary reaches the matcher.
     assert_eq!(resolved.grammar.artifact_noun.as_deref(), Some("bill"));
     assert_eq!(resolved.grammar.site_context.as_deref(), Some("aws"));
-    // And those slots are what search-and-follow grounds on: the AWS result
-    // wins over the billing article that merely mentions the artifact.
-    let intent = macro_engine::SemanticIntent {
-        role: "link".into(),
-        label_query: "owe".into(),
-        container_query: None,
-        raw_prompt: IRREGULAR.into(),
-        ordinal_index: None,
-        is_last: false,
-        is_plural: false,
-        entry_url: None,
-        primary_target_noun: Some("owe".into()),
-    };
-    let noun = macro_engine::search_follow_noun(&intent, resolved.grammar.site_context.as_deref());
-    assert_eq!(noun, "aws");
-    let elements = vec![
-        link(1, "What you owe: understanding cloud bills"),
-        link(2, "AWS Billing and Cost Management Console"),
-    ];
-    let Some(picked) = macro_engine::select_search_result(&elements, noun) else {
-        panic!("parser slots ground a result");
-    };
-    assert_eq!(picked.backend_node_id, 2);
 }
 
 #[test]

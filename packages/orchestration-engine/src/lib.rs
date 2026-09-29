@@ -51,7 +51,7 @@ use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
 pub use url_policy::{
-    UrlRejected, entry_url_valid, funnel_landing_matches, still_on_search_page,
+    UrlRejected, entry_url_valid, funnel_landing_matches,
     validate_proposed_url, validate_user_directed_url,
 };
 pub use verb_spec::{
