@@ -3646,8 +3646,9 @@ const OVERLAY_ROLES: &[&str] = &["dialog", "alertdialog", "menu", "complementary
 /// 1. **Same site**: `current` is on `origin`'s site.
 /// 2. **A surface is observably present**: a non-root landing path, OR a
 ///    revealed panel/overlay (an overlay-role element in the AX snapshot).
-/// 3. **Notification vocabulary** in the page title or in the accessible
-///    name of an AX heading/landmark/dialog element.
+/// 3. **Notification vocabulary** in a URL path segment (stemmed), the page
+///    title, or the accessible name of an AX heading/landmark/dialog element.
+///    A vocabulary path segment satisfies 2 and 3 together.
 ///
 /// Anything else is `false` — the honest miss.
 #[must_use]
@@ -3663,6 +3664,11 @@ pub fn verify_notifications_surface(
         origin.host_str().unwrap_or(""),
     ) {
         return false;
+    }
+    // A path segment naming the destination is a non-root landing that
+    // names itself — the same stemmed check the noun-hunt verifier uses.
+    if url_path_has_tokens(current, vocabulary) {
+        return true;
     }
     let non_root = !matches!(current.path(), "" | "/");
     let overlay = elements

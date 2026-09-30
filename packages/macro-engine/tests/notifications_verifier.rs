@@ -58,6 +58,18 @@ fn non_root_page_with_landmark_name_verifies() {
 }
 
 #[test]
+fn same_site_notifications_path_verifies_without_title_or_ax_vocabulary() {
+    // Reddit-shaped: /notifications titled "Inbox", no vocabulary in AX names.
+    let elements = [el(1, "heading", "Inbox"), el(2, "main", "")];
+    assert!(verify_notifications_surface(
+        &url("https://www.example.com/notifications"),
+        &origin(),
+        Some("Inbox"),
+        &elements,
+    ));
+}
+
+#[test]
 fn root_page_with_revealed_dialog_verifies() {
     let elements = [el(1, "button", "Home"), el(2, "dialog", "Notifications")];
     assert!(verify_notifications_surface(
