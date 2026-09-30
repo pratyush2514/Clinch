@@ -33,6 +33,10 @@ The generic account-home lane (live on native Windows Reddit, 2026-09-25: "open 
 - Forget-site: confirm the remembered identity row is cleared alongside the cookies and the next run reads the origin as signed out.
 - Generic noun-pursuit regression: confirm the account-home lane did not regress other artifact nouns ("settings", "pricing", non-identity nouns still take the generic noun-hunt lane).
 
+## Log-out acceptance (T1; preview-observed, not yet journal-confirmed)
+
+"log out from reddit" was observed on native Windows (2026-09-30, build `0e7d569`) clicking the Log Out row through the text lane. Recorded evidence still needed: the run journal with `text_lane: click_at`, the `click_hit_test:` on the Log Out row, a verifier-confirmed signed-out end state and no `session cookies cleared` line; the same run on the WSL2 daemon; and at least one other portal whose menu is role-less, plus one with a conventional `menuitem` menu (where the AX fast path should win and the text lane must not run).
+
 ## Possible later product pilot
 
 The earlier Job Application Engine pilot is blocked on features that do not exist: ATS adapters, profile/resume storage, multi-page form filling, submission previews specific to ATS, and an application tracker.

@@ -61,7 +61,8 @@ Browser launches lazily, one Chromium process reused across plain runs. `CLINCH_
 - **2026-09-27 — Cleanup:** deleted `entity_resolver.rs` + account-entity routing tier, true-headless execution (`WindowMode::Headless`, `--headless=new`), `LaunchOptions::replay()`. Macro replay is off-screen headed now. Legacy macro lane (`run_task`, selector plans) deliberately retained — converging it with playbooks needs explicit discussion first.
 - **2026-09-26 — Daemon/protocol split:** engine runs as `clinch-daemon`, Tauri app is a thin client in remote mode. Frontend event shapes untouched.
 - **Login saves the session, not the procedure.** Save-as-playbook is not offered on login/session flows (replaying a login click sequence is fragile and wrong); session persistence belongs to session-sync. Currently the save card appears only on command-bar semantic runs and batch runs.
-- **Cookie-clear is fallback only.** For logout: bounded UI attempts first (avatar → verify → one re-grounded retry → max 3 model steps), cookie deletion only as the last resort, gated to `VerbKind::LogOut`.
+- **Cookie-clear is fallback only.** For logout: bounded UI attempts first (avatar → verify → one re-grounded retry → text lane → visual fallback → max 3 model steps), cookie deletion only as the last resort, gated to `VerbKind::LogOut`.
+- **2026-09-30 — Text lane before vision.** Menu rows on live sites are role-less divs the AX pick can't see; vision grounded one row high (Display Mode) and the run "logged out" only via the cookie-clear backstop. Fix: deterministic text lane (`text_lane_step`, `executor.rs`): page JS reports visible text, Rust decides (equality match on the verb vocabulary, opener-centred region, occlusion guard on the deepest hit element), trusted click, verifier. Vision (with the 720px crop) is the backup for non-text menus. A text-echo check on vision was dropped (it would veto every vision click). Details: `docs/TRD.md`, `docs/ARCHITECTURE.md`.
 
 ## Problems already solved (do not re-debug)
 
@@ -69,6 +70,7 @@ Browser launches lazily, one Chromium process reused across plain runs. `CLINCH_
 - **Chrome 154 DevTools probe timeout:** Chrome's DevTools HTTP server ignores `Connection: close`, so `read_to_end` burned the 3s timeout on healthy Chrome. Fixed: read headers, honor `Content-Length`, read exactly the body.
 - **"Headless" was the wrong diagnosis:** the gap was input, not rendering. Clicks now dispatch hover → press → release via trusted CDP `Input.dispatchMouseEvent`, with a visible cursor overlay (SVG pointer + press ripple, presentational only). Cursor glides via mousemove waypoints for isolated jumps.
 - **Logout misclicks:** the Figma-ad misclick was targeting wander, not click failure. Fixed with: candidates hard-filtered to the header strip (center-y ≤ 25% viewport), one re-grounded retry by stable role+name identity when the menu doesn't open, `click_hit_test` journal line after every click (`document.elementFromPoint` + mismatch flag).
+- **"It logged out but never clicked Log Out":** that was the cookie-clear backstop, not a click. Read the journal: `session cookies cleared` = UI path missed. Cursor code was cleared of blame (model screenshots come from CDP `Page.captureScreenshot`, which has no cursor; the overlay is frontend-only). Don't re-debug the cursor.
 - **Poisoned frames:** frame validation drops truncated/poisoned frames, keeps the last good one.
 - **Groq model decommissioned:** `llama-3.1-8b-instant` died 2026-08-16; default is now `openai/gpt-oss-20b` (`CLINCH_GROQ_MODEL` overrides). Never use Enterprise-only `llama-3.3-70b-versatile`.
 - **MV3 offscreen limits:** offscreen documents expose only `chrome.runtime` — the worker proxies storage access via message handlers (contract in the TRD). An unclosed `/*` comment once evaded `node --check`: the pre-push ritual includes a block-comment balance grep for JS files.
@@ -76,7 +78,7 @@ Browser launches lazily, one Chromium process reused across plain runs. `CLINCH_
 
 ## Open threads / next up
 
-- **Decisive operator proof:** `log out from reddit` on the Linux lab — clean frames, menu opens, verifier passes. Not yet reported.
+- **Decisive operator proof (partly done):** on native Windows, build `0e7d569`, 2026-09-30, the preview shows the click landing on the Log Out row via the text lane. Still open: confirm it in the journal (`text_lane: click_at ... "log out"`, `click_hit_test:` on the row, `signed out via 'text pick: log out'`, no `session cookies cleared`, no `visual_fallback:`), then repeat on the Linux/WSL2 daemon and on a second portal (one role-less menu, one conventional `menuitem` menu).
 - **Flows/test panel** (proposed, not yet approved for build): one panel listing login, logout, save-as-playbook, replay, session lend — with run controls and explicit pass/fail. The user finds the current command-bar test loop inadequate; better UI comes before broad manual testing.
 - **Shared identity-menu primitive** (adopted direction, not implemented): profile/settings/notifications/logout should all open the same identity menu then pick the noun — converge the logout-specific machinery (retry, header filter) into it.
 - **Save-as-playbook coverage:** decide which successful actions offer Save, and where the affordance lives in the ordinary UX (consumer card vs dev panel vs both).
@@ -84,9 +86,10 @@ Browser launches lazily, one Chromium process reused across plain runs. `CLINCH_
 - **Session-sync ladder:** (1) stream the real login page, user types into remote browser → (2) credential vault with model-paused fill → (3) E2E extension→worker lending → (4) phone wrapper for OTP/approvals.
 - **v1.5 intents** (only after the five are boring): `DRAFT` (write, never send), `FILL` (fill a form, stop before submit).
 
-## State as of 2026-09-27
+## State as of 2026-09-30
 
-- **Proven:** WSL2 daemon lab completed a real login.
+- **Proven:** WSL2 daemon lab completed a real login. Log out via the text lane observed clicking the Log Out row on native Windows (preview only, journal pending; see open threads).
+- **Prompt files at the repo root:** `t1-followup-*-prompt.md` are implementation prompts, not docs. `t1-followup-visual-fallback-evidence-prompt.md` is superseded by `t1-followup-text-lane-prompt.md`; its text-echo idea was dropped.
 - **Known issues:** `service::tests::test_persist_ephemeral_run_to_playbook_and_replay` flakes ~20% (SQLite code 14, passes on retry — do not chase). Desktop test binaries can't link in containers missing `gdk-3`/`gdk_pixbuf-2.0` (env issue, not code). Take Control needs a display on the daemon host. Daemon's SQLite is fresh (no playbook migration from old Windows runs).
 - **Acceptance bar (T1):** a stranger can open settings on a site they named and not see a search page congratulating them.
 
@@ -99,7 +102,7 @@ cargo clippy -p <crate> --tests   # zero new warnings
 cargo fmt --all -- --check
 ```
 
-Windows native: `.\scripts\dev.ps1` (kill stale Chrome/Brave remote-debugging processes first). WSL2: plain `cargo` in the repo; daemon runbook at `docs/wsl2-daemon.md`. Set `CLINCH_CHROMIUM_PATH` to the Chromium binary. Grounder: `GROQ_API_KEY` (+ optional `CLINCH_GROUNDER_PROVIDER=groq`); without keys the grounder declines to an honest miss — that is correct behavior.
+Windows native: `.\scripts\dev.ps1` (kill stale Chrome/Brave remote-debugging processes first). WSL2: plain `cargo` in the repo; daemon runbook at `docs/wsl2-daemon.md`. Set `CLINCH_CHROMIUM_PATH` to the Chromium binary. Daemon env for the log-out model/vision backup: `CLINCH_NAVIGATOR_PROVIDER`, `CLINCH_VISION_MODEL`, `CLINCH_GROUNDER_PROVIDER` (the text lane needs none); `CLINCH_LOG_COMMANDS=1` re-enables the per-command stderr line. Grounder: `GROQ_API_KEY` (+ optional `CLINCH_GROUNDER_PROVIDER=groq`); without keys the grounder declines to an honest miss — that is correct behavior.
 
 ## Conventions & working norms
 

@@ -1,6 +1,6 @@
 # Clinch architecture
 
-Reconciled against the working-tree implementation on 2026-09-25. Code is authoritative; this document describes existing paths, not a target architecture.
+Reconciled against the tree at `0e7d569` on 2026-09-30. Code is authoritative; this document describes existing paths, not a target architecture.
 
 > Target direction: [CONSTITUTION.md](CONSTITUTION.md) (adopted 2026-09-27).
 > The daemon split (`clinch-daemon` + thin client, see
@@ -66,6 +66,12 @@ Identity artifact nouns (`profile`, `account`) map via a closed noun table to `G
 4. **Miss.** `identity_miss_diagnostic` names what the worker actually tried; the run FAILEDs with the last journal lines, and the card offers "Take control" — gated on the `account-home:` journal prefix so unrelated failures never grow the button — handing the still-on-portal window to the user through the existing take-control command. "Forget this site" deletes the remembered identity row alongside the profile's cookies (`identity_forgotten: <host> · <n> remembered profile(s) cleared`); the daily/source browser is never touched.
 
 Origin comparisons across this lane fold the `www.` alias both ways via `same_site_origin` (scheme and port strict; other subdomains never fold); the same fold governs the portal drift check, Navigate validation, `check_origin`, and `detect_auth_signal`.
+
+### In-page verbs and the log-out ladder
+
+`profile`, `settings`, `notifications` and `logout` share one worker parameterized by a `VerbSpec` (closed vocabulary, verifier, identity-menu policy); `pursue_verb_goal` runs gear 1 (`pursue_chrome_action_with_vision`) then, on a miss, gear 2 (model loop). Only the verb's Rust verifier can declare completion. For log out the bounded chain is avatar click -> menu-open verify -> one re-grounded opener retry -> text lane -> visual fallback -> one short model pass -> cookie-clear backstop, journaled as `logout_ui_bounded: ...` hand-offs.
+
+The **text lane** exists because live menus render rows as role-less elements the accessibility tree cannot see (the AX pick only considers link/button/menuitem roles). It is gated like the visual fallback: sign-out verb only, an opener already clicked, and no `MatchTier::Direct` AX match. Page JS only *reports* (visible text nodes with rendered-rect centres, plus a point probe); every decision is pure Rust: equality match of the verb's own vocabulary inside the opener-centred region (`visual_crop_rect`, or the full viewport with no opener point), first word with exactly one match wins, two matches stop as ambiguous, an occlusion guard, then the existing trusted click and verifier. A miss without a click falls through to the vision backup on the same snapshot; a click that fails verification re-snapshots and retires vision for the run, since the menu has likely closed. Vision (`CLINCH_VISION_MODEL`) is the backup for non-text menus, not the primary path; cookie clearing remains the last resort. No step in this ladder carries a site name, selector, or URL.
 
 The exported decomposition and dynamic-variable extraction helpers are tested library code; the desktop does not call them. A compound natural-language prompt is not automatically a sequence of saved steps.
 

@@ -158,6 +158,11 @@ running — see Troubleshooting.
 site shortcuts start **fresh** there — nothing migrates from the Windows
 profile in v1 (known limitation, section 10).
 
+Optional environment, exported in the **daemon's** shell before launch:
+
+- `CLINCH_LOG_COMMANDS=1`: print one `[clinch-daemon] cmd=... id=...` stderr line per request (default: silent; the desktop UI polls `bridge_status` in a loop, so it floods the terminal).
+- `CLINCH_NAVIGATOR_PROVIDER=groq`, `CLINCH_VISION_MODEL=<vision-capable model>`, `CLINCH_GROUNDER_PROVIDER=groq` (+ `GROQ_API_KEY`): enable the model pass and the visual-fallback backup for log out. The deterministic text lane runs without any of them.
+
 Useful aliases for the daemon shell:
 
 ```bash
@@ -237,8 +242,16 @@ Both must report **TcpTestSucceeded: True**. If either fails:
      **targeting wander**; the retry/re-ground path (`logout_opener_retry`)
      is what should fire.
 5. Expected end state: `COMPLETED` with `auth_state_detected:
-   www.reddit.com · logged out` (cookie-clear fallback still guards the
-   outcome even if the UI path fails).
+   www.reddit.com · logged out`. The Muse-like happy path journals
+   `text_lane: click_at (X, Y) "log out"`, a `click_hit_test:` naming the
+   Log Out row, and `in_page_goal_done: signed out via 'text pick: log out'`,
+   with **no** `session cookies cleared` and no `visual_fallback:` lines.
+   A `session cookies cleared` line means the UI path missed and only the
+   cookie-clear backstop ended the session; that is a bug to file, not a pass.
+   If the text lane misses, its reason is journaled:
+   `text_lane: missed (no text match | ambiguous | occluded: hit "...")`;
+   when vision then runs, `visual_fallback: crop_saved <path>` names the
+   exact image the model saw.
 
 ## 9. Troubleshooting
 
@@ -251,7 +264,8 @@ Both must report **TcpTestSucceeded: True**. If either fails:
 | `CLINCH_CHROMIUM_PATH` ignored | Must be exported in the **daemon's** shell, not just the Windows one. Verify with `echo $CLINCH_CHROMIUM_PATH` in WSL before launching. |
 | WSL2 localhost relay dies after sleep/resume | `wsl --shutdown` from elevated PowerShell, relaunch daemon, re-run section-7 checks. |
 | Where are the logs? | The daemon's **stderr** (the terminal you launched it from). For a persistent run: `./target/release/clinch-daemon > ~/clinch-daemon.log 2>&1 &`. |
-| Menu opens but logout never completes | Read the journal: avatar→verify→one retry→max 3 model steps→cookie fallback is the bounded sequence; a step that silently repeats is the bug to file. |
+| Terminal flooded with `[clinch-daemon] cmd=...` lines | Off by default now; unset `CLINCH_LOG_COMMANDS` (or set it to anything but `1`). |
+| Menu opens but logout never completes | Read the journal: avatar→verify→one retry→text lane→visual fallback→max 3 model steps→cookie fallback is the bounded sequence; a step that silently repeats is the bug to file. |
 
 ## 10. What's NOT in v1
 
