@@ -2169,6 +2169,151 @@ pub fn visual_target_description(spec: &VerbSpec) -> String {
     format!("the \"{word}\" item in the open user menu")
 }
 
+/// Strict target description for a cropped screenshot of the open menu:
+/// the model must read the row text, and must decline rather than guess
+/// (live runs showed it picking the menu's bottom edge at full-viewport
+/// scale). The word still comes from the verb's closed vocabulary.
+#[must_use]
+pub fn visual_crop_target_description(spec: &VerbSpec) -> String {
+    let word = spec.vocabulary.first().copied().unwrap_or("action");
+    format!(
+        "In this cropped screenshot of an open user menu, locate the row whose visible text \
+         reads exactly \"{word}\" (case-insensitive). Return the center of that row. If no \
+         such readable row exists, return {{\"found\": false}}. Do not guess a point near the \
+         bottom of the menu."
+    )
+}
+
+/// Side of the square screenshot crop around the menu opener, in viewport
+/// CSS pixels. Large enough to hold a menu opening in any direction from
+/// its opener, small enough that row text stays readable at model scale.
+/// Not derived from any site.
+pub const VISUAL_CROP_SIZE: f64 = 720.0;
+
+/// Crop rectangle centered on the opener's viewport point, clamped inside
+/// the viewport: side `min(VISUAL_CROP_SIZE, width, height)`, symmetric on
+/// purpose (no assumption about which way the menu opens). Whole pixels.
+/// `None` for a degenerate viewport or non-finite opener. Pure.
+#[must_use]
+pub fn visual_crop_rect(
+    opener: (f64, f64),
+    viewport: (f64, f64),
+) -> Option<crate::navigator::VisualCrop> {
+    let (ox, oy) = opener;
+    let (width, height) = viewport;
+    if ![ox, oy, width, height]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let side = VISUAL_CROP_SIZE.min(width).min(height).floor();
+    if side < 1.0 {
+        return None;
+    }
+    let x = (ox - side / 2.0)
+        .clamp(0.0, (width - side).max(0.0))
+        .floor();
+    let y = (oy - side / 2.0)
+        .clamp(0.0, (height - side).max(0.0))
+        .floor();
+    Some(crate::navigator::VisualCrop {
+        x,
+        y,
+        w: side,
+        h: side,
+    })
+}
+
+/// Crop a base64 JPEG viewport screenshot (no data-URI prefix) to `crop`
+/// (viewport CSS pixels; `viewport` is the CSS size the screenshot shows,
+/// so device-pixel-ratio scaling is handled) and re-encode it as base64
+/// JPEG, keeping the vision contract's format. `None` on any decode or
+/// encode failure — the caller then sends the full viewport as before.
+#[must_use]
+pub fn crop_screenshot_jpeg_b64(
+    screenshot_jpeg_b64: &str,
+    crop: crate::navigator::VisualCrop,
+    viewport: (f64, f64),
+) -> Option<String> {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = engine.decode(screenshot_jpeg_b64).ok()?;
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?;
+    let (css_width, css_height) = viewport;
+    if !(css_width > 0.0 && css_height > 0.0) {
+        return None;
+    }
+    let scale_x = f64::from(image.width()) / css_width;
+    let scale_y = f64::from(image.height()) / css_height;
+    let to_px = |value: f64, scale: f64, max: u32| -> u32 {
+        // Clamped to the image bounds first, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = (value * scale).round().clamp(0.0, f64::from(max)) as u32;
+        px
+    };
+    let left = to_px(crop.x, scale_x, image.width());
+    let top = to_px(crop.y, scale_y, image.height());
+    let right = to_px(crop.x + crop.w, scale_x, image.width());
+    let bottom = to_px(crop.y + crop.h, scale_y, image.height());
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let cropped = image
+        .crop_imm(left, top, right - left, bottom - top)
+        .to_rgb8();
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 80)
+        .encode_image(&cropped)
+        .ok()?;
+    Some(engine.encode(encoded))
+}
+
+/// The image and target description the visual fallback sends: the
+/// opener-centered crop with the strict row-text description (journaling
+/// `visual_fallback: crop (x, y, w, h)`), or — with no opener point, no
+/// viewport, or a crop that cannot be built — the full screenshot with the
+/// original description, exactly as before. Returns the crop rect when used.
+async fn visual_fallback_image<B: MenuBrowser>(
+    browser: &B,
+    spec: &VerbSpec,
+    opener: Option<(f64, f64)>,
+    full_screenshot: String,
+    tried: &mut Vec<String>,
+) -> (String, String, Option<crate::navigator::VisualCrop>) {
+    if let Some(opener) = opener
+        && let Some(viewport) = browser.menu_viewport_size().await
+        && let Some(rect) = visual_crop_rect(opener, viewport)
+        && let Some(cropped) = crop_screenshot_jpeg_b64(&full_screenshot, rect, viewport)
+    {
+        // Whole pixels by construction (`visual_crop_rect`).
+        #[allow(clippy::cast_possible_truncation)]
+        tried.push(format!(
+            "visual_fallback: crop ({}, {}, {}, {})",
+            rect.x as i64, rect.y as i64, rect.w as i64, rect.h as i64
+        ));
+        return (cropped, visual_crop_target_description(spec), Some(rect));
+    }
+    (full_screenshot, visual_target_description(spec), None)
+}
+
+/// Live viewport-pixel center of the most recently clicked control still
+/// present in `elements` — the menu opener, whose click point the crop is
+/// centered on. `None` when it cannot be measured (the fallback then sends
+/// the full viewport).
+async fn visual_opener_point<B: MenuBrowser>(
+    browser: &B,
+    elements: &[AxElement],
+    clicked: &[ClickedControl],
+) -> Option<(f64, f64)> {
+    let opener = clicked
+        .iter()
+        .rev()
+        .find_map(|control| elements.iter().find(|element| control.matches(element)))?;
+    let rect = browser.menu_node_rect(opener.backend_node_id).await.ok()?;
+    Some((rect.x + rect.width / 2.0, rect.y + rect.height / 2.0))
+}
+
 /// Visual fallback for the sign-out lane, run once per worker invocation
 /// when a menu is open but no control itself names the verb (the AX tree
 /// is blind to, or misnames, what the pixels show). Screenshot → vision
@@ -2178,6 +2323,12 @@ pub fn visual_target_description(spec: &VerbSpec) -> String {
 /// `visual_fallback: missed (<reason>)` (or `skipped`) and returns `None`
 /// so the existing chain continues unchanged.
 ///
+/// With the opener's viewport point, the screenshot is cropped to a
+/// [`VISUAL_CROP_SIZE`] square around it so the model can read row text,
+/// and the model's crop-space answer is remapped to viewport pixels.
+/// Without it (or when the crop cannot be built) the full viewport goes
+/// out exactly as before — the crop is never a new failure mode.
+///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
 async fn visual_fallback_step<B: ChromeActionBrowser>(
@@ -2185,15 +2336,19 @@ async fn visual_fallback_step<B: ChromeActionBrowser>(
     origin: &url::Url,
     spec: &VerbSpec,
     navigator: &std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    opener: Option<(f64, f64)>,
     tried: &mut Vec<String>,
     clicks_used: &mut usize,
 ) -> Result<Option<PageGoalOutcome>, IntentError> {
-    use crate::navigator::{VisualLocation, visual_point_to_pixels};
-    let Some(screenshot) = browser.menu_screenshot().await else {
+    use crate::navigator::{
+        CropRemapError, VisualLocation, crop_point_to_viewport, visual_point_to_pixels,
+    };
+    let Some(full_screenshot) = browser.menu_screenshot().await else {
         tried.push("visual_fallback: missed (no screenshot)".to_owned());
         return Ok(None);
     };
-    let target = visual_target_description(spec);
+    let (screenshot, target, crop_rect) =
+        visual_fallback_image(browser, spec, opener, full_screenshot, tried).await;
     let owned = navigator.clone();
     // The model call is synchronous and bounded by the provider's own
     // timeout; the outer timeout is a belt-and-braces bound so the worker
@@ -2227,9 +2382,24 @@ async fn visual_fallback_step<B: ChromeActionBrowser>(
         tried.push("visual_fallback: missed (no viewport)".to_owned());
         return Ok(None);
     };
-    let Some((px, py)) = visual_point_to_pixels(x, y, viewport) else {
-        tried.push("visual_fallback: missed (invalid coordinates)".to_owned());
-        return Ok(None);
+    let (px, py) = if let Some(rect) = crop_rect {
+        match crop_point_to_viewport(x, y, rect, viewport) {
+            Ok(point) => point,
+            Err(CropRemapError::InvalidCoordinates) => {
+                tried.push("visual_fallback: missed (invalid coordinates)".to_owned());
+                return Ok(None);
+            }
+            Err(CropRemapError::OutsideViewport) => {
+                tried.push("visual_fallback: missed (remapped point outside viewport)".to_owned());
+                return Ok(None);
+            }
+        }
+    } else {
+        let Some(point) = visual_point_to_pixels(x, y, viewport) else {
+            tried.push("visual_fallback: missed (invalid coordinates)".to_owned());
+            return Ok(None);
+        };
+        point
     };
     tried.push(format!(
         "visual_fallback: click_at ({}, {})",
@@ -2381,11 +2551,13 @@ pub async fn pursue_chrome_action_with_vision<B: ChromeActionBrowser>(
         {
             visual_attempted = true;
             let clicks_before = clicks_used;
+            let opener = visual_opener_point(browser, &elements, &clicked).await;
             if let Some(outcome) = visual_fallback_step(
                 browser,
                 origin,
                 spec,
                 navigator,
+                opener,
                 &mut tried,
                 &mut clicks_used,
             )

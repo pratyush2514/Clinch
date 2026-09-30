@@ -132,6 +132,55 @@ pub fn visual_point_to_pixels(x: f64, y: f64, viewport: (f64, f64)) -> Option<(f
     Some((x / 1000.0 * width, y / 1000.0 * height))
 }
 
+/// Viewport-pixel rectangle the visual fallback cropped the screenshot to;
+/// the model's 0–1000 answer is in this rectangle's space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VisualCrop {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Why a crop-space point was not converted to a clickable viewport point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropRemapError {
+    /// Non-finite, or outside `0..=1000` on either axis.
+    InvalidCoordinates,
+    /// Converted cleanly but lands outside the live viewport.
+    OutsideViewport,
+}
+
+/// Convert a model point in the crop's 0–1000 space to viewport pixels:
+/// `vx = x + round(px * w / 1000)`, `vy = y + round(py * h / 1000)`, then
+/// reject anything outside `0..=width` × `0..=height` of the live
+/// `viewport` so nothing off-page reaches the input pipeline. Pure and
+/// unit-tested.
+///
+/// # Errors
+/// [`CropRemapError::InvalidCoordinates`] for a malformed model point,
+/// [`CropRemapError::OutsideViewport`] when the remapped point is off-page.
+pub fn crop_point_to_viewport(
+    px: f64,
+    py: f64,
+    crop: VisualCrop,
+    viewport: (f64, f64),
+) -> Result<(f64, f64), CropRemapError> {
+    let in_range = |value: f64| value.is_finite() && (0.0..=1000.0).contains(&value);
+    if !in_range(px) || !in_range(py) {
+        return Err(CropRemapError::InvalidCoordinates);
+    }
+    let vx = crop.x + (px * crop.w / 1000.0).round();
+    let vy = crop.y + (py * crop.h / 1000.0).round();
+    let (width, height) = viewport;
+    let inside =
+        |value: f64, max: f64| value.is_finite() && max > 0.0 && (0.0..=max).contains(&value);
+    if !inside(vx, width) || !inside(vy, height) {
+        return Err(CropRemapError::OutsideViewport);
+    }
+    Ok((vx, vy))
+}
+
 /// Coarse on-page position of one element, rendered for the model as
 /// `top-left` … `bottom-right`. Computed against the bounding box of the
 /// rendered control set — distribution-relative, so it needs no viewport
