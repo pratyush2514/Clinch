@@ -86,6 +86,50 @@ pub trait PageNavigator: Send + Sync {
         let _ = screenshot_jpeg_b64;
         self.next_action_zoned(goal, elements, zones)
     }
+
+    /// Visual grounding: where on the screenshot is `target` (a plain-words
+    /// description of a control)? For menus the AX tree does not expose —
+    /// the model looks at pixels, not the tree. The default is
+    /// [`VisualLocation::Unsupported`], so existing implementers keep
+    /// working; navigators with a vision-capable model override this.
+    /// `screenshot_jpeg_b64` is base64 JPEG with NO data-URI prefix.
+    fn locate_visual(&self, target: &str, screenshot_jpeg_b64: &str) -> VisualLocation {
+        let _ = (target, screenshot_jpeg_b64);
+        VisualLocation::Unsupported
+    }
+}
+
+/// Answer to a [`PageNavigator::locate_visual`] query. Coordinates are the
+/// model's raw 0–1000 normalized space; [`visual_point_to_pixels`]
+/// validates and converts them before anything clicks.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VisualLocation {
+    /// The model pointed at a spot (0–1000 on each axis).
+    Point { x: f64, y: f64 },
+    /// The model answered `{"found": false}`.
+    NotFound,
+    /// The call failed (timeout, transport, malformed reply); the reason is
+    /// a short journal-safe phrase.
+    Failed(String),
+    /// No vision-capable model is configured.
+    Unsupported,
+}
+
+/// Convert a model point in 0–1000 space to viewport pixels
+/// `(width, height)`. Rejects non-finite values and anything outside
+/// `0..=1000` on either axis (returns `None`) so an out-of-viewport answer
+/// never reaches the input pipeline. Pure and unit-tested.
+#[must_use]
+pub fn visual_point_to_pixels(x: f64, y: f64, viewport: (f64, f64)) -> Option<(f64, f64)> {
+    let (width, height) = viewport;
+    let in_range = |value: f64| value.is_finite() && (0.0..=1000.0).contains(&value);
+    if !in_range(x) || !in_range(y) || !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some((x / 1000.0 * width, y / 1000.0 * height))
 }
 
 /// Coarse on-page position of one element, rendered for the model as

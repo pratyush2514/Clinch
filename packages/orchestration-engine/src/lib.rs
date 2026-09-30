@@ -33,7 +33,7 @@ pub use intent_resolver::{
 };
 pub use llm_intent_parser::LlmIntentParser;
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
-pub use page_navigator::{LlmPageNavigator, NavigatorEnv};
+pub use page_navigator::{LlmPageNavigator, NavigatorEnv, parse_visual_location};
 pub use route_proposer::{
     BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,
     LlmUrlProposer, ResolutionContext, ResolvedRoute, ResolvedSlots, RouteSource, ShortcutStore,
@@ -51,8 +51,8 @@ use std::{path::Path, time::Instant};
 pub use task::{FailureReason, Plan, RunMode, Step, StepState, Task, TaskId, TaskState};
 use url::Url;
 pub use url_policy::{
-    UrlRejected, entry_url_valid, funnel_landing_matches,
-    validate_proposed_url, validate_user_directed_url,
+    UrlRejected, entry_url_valid, funnel_landing_matches, validate_proposed_url,
+    validate_user_directed_url,
 };
 pub use verb_spec::{
     VerbKind, VerbLedAction, VerbSpec, VerifierKind, detect_verb_led_action, spec_for_noun,

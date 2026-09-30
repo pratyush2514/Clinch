@@ -1045,13 +1045,14 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
     escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
-    let deterministic_miss = match pursue_chrome_action(browser, origin, spec).await {
-        Ok(outcome) => return Ok(outcome),
-        // Browser errors fail fast: retrying them through the model would
-        // just burn model calls on a dead CDP session.
-        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
-        Err(IntentError::NoMatch(diagnostic)) => diagnostic,
-    };
+    let deterministic_miss =
+        match pursue_chrome_action_with_vision(browser, origin, spec, navigator.as_ref()).await {
+            Ok(outcome) => return Ok(outcome),
+            // Browser errors fail fast: retrying them through the model would
+            // just burn model calls on a dead CDP session.
+            Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+            Err(IntentError::NoMatch(diagnostic)) => diagnostic,
+        };
     // The UI attempt's miss journal, from gear 1 alone or both gears: it
     // rides along so the model phase — and the LogOut cookie fallback —
     // keep the full tried-click story.
@@ -2152,12 +2153,136 @@ async fn chrome_action_prestate<B: ChromeActionBrowser>(
 /// action is not verified, and [`IntentError::Browser`] on CDP failure.
 // The worker's six documented steps read as one function: splitting the
 // loop body would scatter the step ordering the doc comment narrates.
-#[allow(clippy::too_many_lines)]
 pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
     browser: &B,
     origin: &url::Url,
     spec: &VerbSpec,
 ) -> Result<PageGoalOutcome, IntentError> {
+    pursue_chrome_action_with_vision(browser, origin, spec, None).await
+}
+
+/// Plain-words description of the verb's destination control, derived from
+/// the verb's closed vocabulary — never a site string.
+#[must_use]
+pub fn visual_target_description(spec: &VerbSpec) -> String {
+    let word = spec.vocabulary.first().copied().unwrap_or("action");
+    format!("the \"{word}\" item in the open user menu")
+}
+
+/// Visual fallback for the sign-out lane, run once per worker invocation
+/// when a menu is open but no control itself names the verb (the AX tree
+/// is blind to, or misnames, what the pixels show). Screenshot → vision
+/// model proposes a 0–1000 point → Rust validates it against the live
+/// viewport → the existing trusted click → the existing signed-out
+/// verifier decides. Every non-success path journals
+/// `visual_fallback: missed (<reason>)` (or `skipped`) and returns `None`
+/// so the existing chain continues unchanged.
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure.
+async fn visual_fallback_step<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    navigator: &std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    use crate::navigator::{VisualLocation, visual_point_to_pixels};
+    let Some(screenshot) = browser.menu_screenshot().await else {
+        tried.push("visual_fallback: missed (no screenshot)".to_owned());
+        return Ok(None);
+    };
+    let target = visual_target_description(spec);
+    let owned = navigator.clone();
+    // The model call is synchronous and bounded by the provider's own
+    // timeout; the outer timeout is a belt-and-braces bound so the worker
+    // never hangs on a wedged adapter.
+    let located = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || owned.locate_visual(&target, &screenshot)),
+    )
+    .await;
+    let location = match located {
+        Ok(Ok(location)) => location,
+        Ok(Err(_)) => VisualLocation::Failed("task failed".to_owned()),
+        Err(_) => VisualLocation::Failed("timeout".to_owned()),
+    };
+    let (x, y) = match location {
+        VisualLocation::Unsupported => {
+            tried.push("visual_fallback: skipped (no vision model)".to_owned());
+            return Ok(None);
+        }
+        VisualLocation::NotFound => {
+            tried.push("visual_fallback: missed (not found)".to_owned());
+            return Ok(None);
+        }
+        VisualLocation::Failed(reason) => {
+            tried.push(format!("visual_fallback: missed ({reason})"));
+            return Ok(None);
+        }
+        VisualLocation::Point { x, y } => (x, y),
+    };
+    let Some(viewport) = browser.menu_viewport_size().await else {
+        tried.push("visual_fallback: missed (no viewport)".to_owned());
+        return Ok(None);
+    };
+    let Some((px, py)) = visual_point_to_pixels(x, y, viewport) else {
+        tried.push("visual_fallback: missed (invalid coordinates)".to_owned());
+        return Ok(None);
+    };
+    tried.push(format!(
+        "visual_fallback: click_at ({}, {})",
+        px.round() as i64,
+        py.round() as i64
+    ));
+    match browser.menu_click_at(px, py, tried).await {
+        Ok(()) => {}
+        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+        Err(IntentError::NoMatch(_)) => {
+            tried.push("visual_fallback: missed (click failed)".to_owned());
+            return Ok(None);
+        }
+    }
+    *clicks_used += 1;
+    // The existing verifier decides — a click is not success.
+    let _ = wait_for_url_change(browser).await;
+    if verify_verb(browser, origin, spec, None, None).await {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        return Ok(Some(
+            PageGoalOutcome::Verified {
+                label: "visual pick".to_owned(),
+                landed,
+                username: None,
+                hit_lines: Vec::new(),
+                tried_lines: Vec::new(),
+            }
+            .with_hit_lines(tried),
+        ));
+    }
+    tried.push("visual_fallback: missed (verification failed)".to_owned());
+    Ok(None)
+}
+
+/// [`pursue_chrome_action`] with an optional vision-capable navigator for
+/// the visual fallback (sign-out verb only). With `None` — or when the
+/// fallback skips or misses — the flow is byte-for-byte the deterministic
+/// worker.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] with the tried-lines journal when the
+/// action is not verified, and [`IntentError::Browser`] on CDP failure.
+#[allow(clippy::too_many_lines)]
+pub async fn pursue_chrome_action_with_vision<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    vision: Option<&std::sync::Arc<dyn crate::navigator::PageNavigator>>,
+) -> Result<PageGoalOutcome, IntentError> {
+    let mut visual_attempted = false;
     // Per-verb pre-state strategies, before any click.
     if let Some(outcome) = chrome_action_prestate(browser, origin, spec).await? {
         return Ok(outcome);
@@ -2240,6 +2365,41 @@ pub async fn pursue_chrome_action<B: ChromeActionBrowser>(
                 continue;
             }
             AlreadyOpenMenuOutcome::Skipped => {}
+        }
+
+        // 0b. Visual fallback (sign-out only, once): a menu is open but no
+        // control directly names the verb — AX-blind or misnamed. Look at
+        // pixels instead of falling to the container-tier pick.
+        if let Some(navigator) = vision
+            && !visual_attempted
+            && matches!(spec.verifier, VerifierKind::AuthSignedOut)
+            && !clicked.is_empty()
+            && !matches!(
+                select_revealed_action_tiered(&elements, &clicked, &previously_seen, spec),
+                Some((_, MatchTier::Direct))
+            )
+        {
+            visual_attempted = true;
+            let clicks_before = clicks_used;
+            if let Some(outcome) = visual_fallback_step(
+                browser,
+                origin,
+                spec,
+                navigator,
+                &mut tried,
+                &mut clicks_used,
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
+            // Missed after a click: the page may have changed, so the
+            // existing chain resumes on a fresh snapshot. Missed without a
+            // click: nothing changed, fall straight through to it.
+            if clicks_used > clicks_before {
+                previously_seen = currently_seen;
+                continue;
+            }
         }
 
         // 1. A revealed destination ends the hunt — but only after the worker
@@ -2944,9 +3104,58 @@ pub trait MenuBrowser {
     /// turn; a failed capture degrades to the text-only turn and must
     /// never fail the run.
     fn menu_screenshot(&self) -> impl std::future::Future<Output = Option<String>> + Send;
+    /// Click a viewport-pixel point through the same trusted hover → press
+    /// → release pipeline as [`MenuBrowser::menu_click_reported`], journaling
+    /// the hit-test line into `tried`. Used only by the visual fallback,
+    /// after Rust has validated the model's coordinates. The default
+    /// declines (`NoMatch`) so scripted fakes keep their shape.
+    ///
+    /// # Errors
+    /// Returns [`IntentError::Browser`] on CDP failure, and
+    /// [`IntentError::NoMatch`] where coordinate clicks are unsupported.
+    fn menu_click_at(
+        &self,
+        x: f64,
+        y: f64,
+        tried: &mut Vec<String>,
+    ) -> impl std::future::Future<Output = Result<(), IntentError>> + Send {
+        let _ = (x, y, tried);
+        std::future::ready(Err(IntentError::NoMatch(
+            "coordinate click unsupported".to_owned(),
+        )))
+    }
 }
 
 impl MenuBrowser for ManagedBrowser {
+    async fn menu_click_at(
+        &self,
+        x: f64,
+        y: f64,
+        tried: &mut Vec<String>,
+    ) -> Result<(), IntentError> {
+        // A 2×2 mark centered on the point: `click_mark_reported` clicks the
+        // rectangle center, so this reuses the existing input path (glide,
+        // hover → press → release, hit-test) rather than adding a new one.
+        let mark = Mark {
+            index: 0,
+            x: x - 1.0,
+            y: y - 1.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        self.show_marks(std::slice::from_ref(&mark)).await?;
+        match self.click_mark_reported(&mark).await {
+            Ok(hit) => {
+                tried.push(hit.journal_line("", ""));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.clear_marks().await;
+                Err(error.into())
+            }
+        }
+    }
+
     async fn menu_viewport_size(&self) -> Option<(f64, f64)> {
         self.viewport_size().await
     }

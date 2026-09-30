@@ -33,13 +33,26 @@
 //! run. Ollama takes the image in the `images` array of `/api/generate`
 //! (text-only local models fall back the same way).
 //!
+//! Visual fallback ([`PageNavigator::locate_visual`]): when an open menu's
+//! target is invisible to the AX tree, one screenshot goes to a
+//! vision-capable model that answers `{"x": 0-1000, "y": 0-1000}` or
+//! `{"found": false}`. It is opt-in via `CLINCH_VISION_MODEL` (the model
+//! name; unset or blank means no vision fallback). It rides the navigator's
+//! provider (`CLINCH_NAVIGATOR_PROVIDER`), base URL
+//! (`CLINCH_GROQ_BASE_URL` / `CLINCH_OLLAMA_URL`) and credential
+//! (`GROQ_API_KEY`), so any OpenAI-compatible vision endpoint works through
+//! the base-URL override. Nothing about the model is hardcoded; a model
+//! that cannot do vision fails the call and the caller journals a miss.
+//!
 //! Bounded escalation is opt-in via `CLINCH_ESCALATION_MODEL`: when set,
 //! [`LlmPageNavigator::escalation_from_env`] builds a second navigator for
 //! the wave-2 escalation wave (provider from `CLINCH_ESCALATION_PROVIDER`,
 //! `groq` default; same base URL and credential vars as above).
 
 use crate::domain_grounder::GrounderProvider;
-use macro_engine::{MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone};
+use macro_engine::{
+    MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone, VisualLocation,
+};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -82,6 +95,9 @@ pub struct NavigatorEnv {
     pub escalation_provider: Option<String>,
     /// `CLINCH_ESCALATION_MODEL`.
     pub escalation_model: Option<String>,
+    /// `CLINCH_VISION_MODEL`: the vision-capable model for the visual
+    /// fallback. Unset or blank disables the fallback.
+    pub vision_model: Option<String>,
 }
 
 /// LLM-backed [`PageNavigator`]. Synchronous by trait contract: the one
@@ -93,6 +109,9 @@ pub struct LlmPageNavigator {
     base_url: String,
     model: String,
     agent: ureq::Agent,
+    /// Model for [`PageNavigator::locate_visual`] (`CLINCH_VISION_MODEL`);
+    /// `None` means the visual fallback is unsupported.
+    vision_model: Option<String>,
     /// Set on the first failed vision request and never cleared: the model
     /// (e.g. the text-only default `openai/gpt-oss-20b`) rejected the image,
     /// so later turns skip vision and go straight to text. `&self` from
@@ -117,6 +136,7 @@ impl LlmPageNavigator {
             ollama_model: std::env::var("CLINCH_OLLAMA_MODEL").ok(),
             escalation_provider: std::env::var("CLINCH_ESCALATION_PROVIDER").ok(),
             escalation_model: std::env::var("CLINCH_ESCALATION_MODEL").ok(),
+            vision_model: std::env::var("CLINCH_VISION_MODEL").ok(),
         })
     }
 
@@ -125,6 +145,17 @@ impl LlmPageNavigator {
     /// touching the process environment.
     #[must_use]
     pub fn from_env_values(env: &NavigatorEnv) -> Option<Self> {
+        let mut navigator = Self::provider_from_values(env)?;
+        navigator.vision_model = env
+            .vision_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        Some(navigator)
+    }
+
+    fn provider_from_values(env: &NavigatorEnv) -> Option<Self> {
         let provider = GrounderProvider::from_env_value(env.provider.as_deref().unwrap_or(""))?;
         match provider {
             GrounderProvider::Groq => {
@@ -172,6 +203,7 @@ impl LlmPageNavigator {
             ollama_model: std::env::var("CLINCH_OLLAMA_MODEL").ok(),
             escalation_provider: std::env::var("CLINCH_ESCALATION_PROVIDER").ok(),
             escalation_model: std::env::var("CLINCH_ESCALATION_MODEL").ok(),
+            vision_model: None,
         })
     }
 
@@ -264,6 +296,7 @@ impl LlmPageNavigator {
             base_url: base_url.to_owned(),
             model: model.to_owned(),
             agent,
+            vision_model: None,
             vision_disabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -349,20 +382,31 @@ impl LlmPageNavigator {
     /// content is the raw strict-JSON payload, or `None` on any failure
     /// (transport, non-2xx, malformed envelope).
     fn groq_completion_raw(&self, user_content: &serde_json::Value) -> Option<String> {
+        self.chat_completion(&self.model, SYSTEM_PROMPT, user_content)
+    }
+
+    /// One OpenAI-compatible chat completion against an explicit model and
+    /// system prompt; the assistant content, or `None` on any failure.
+    fn chat_completion(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_content: &serde_json::Value,
+    ) -> Option<String> {
         let auth = format!("Bearer {}", self.api_key.as_str());
         // gpt-oss is a reasoning model: its reasoning tokens draw from
         // max_tokens before any content is emitted. 256 leaves headroom for
         // the ~15-token JSON answer; the cost is negligible.
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "temperature": 0,
             "max_tokens": 256,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
         });
-        if self.model.contains("gpt-oss") {
+        if model.contains("gpt-oss") {
             body["reasoning_effort"] = serde_json::Value::String("low".to_owned());
         }
         let payload = self
@@ -478,6 +522,82 @@ impl PageNavigator for LlmPageNavigator {
         };
         parse_page_action(&content)
     }
+
+    fn locate_visual(&self, target: &str, screenshot_jpeg_b64: &str) -> VisualLocation {
+        let Some(model) = self.vision_model.as_deref() else {
+            return VisualLocation::Unsupported;
+        };
+        let content = match self.provider {
+            GrounderProvider::Groq => {
+                let user = serde_json::json!([
+                    {"type": "text", "text": format!("target: {target}")},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{screenshot_jpeg_b64}")}},
+                ]);
+                self.chat_completion(model, VISION_SYSTEM_PROMPT, &user)
+            }
+            GrounderProvider::Ollama => {
+                let body = serde_json::json!({
+                    "model": model,
+                    "stream": false,
+                    "format": "json",
+                    "prompt": format!("{VISION_SYSTEM_PROMPT}\ntarget: {target}"),
+                    "images": [screenshot_jpeg_b64],
+                });
+                self.post_json(&format!("{}/api/generate", self.base_url), None, body)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("response")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+            }
+        };
+        match content {
+            Some(content) => parse_visual_location(&content),
+            None => VisualLocation::Failed("vision request failed".to_owned()),
+        }
+    }
+}
+
+/// System prompt of the visual fallback. Names no sites and no controls —
+/// the target description arrives in the user line.
+const VISION_SYSTEM_PROMPT: &str = "You locate one control in a screenshot of a web page. Reply with ONLY one JSON object, no other text.\n\n{\"x\": 512, \"y\": 340} — the center of the requested control, each axis a number from 0 to 1000 (0,0 is the top-left corner of the screenshot, 1000,1000 the bottom-right)\n{\"found\": false} — the requested control is not visibly present\n\nDo not guess: if you cannot see the control, answer found false.";
+
+/// Parse the vision reply into a [`VisualLocation`]. Same tolerance as
+/// [`parse_page_action`] (fences, surrounding prose); anything that is not
+/// `{"x","y"}` numbers or `{"found": false}` is a `Failed` — no coordinate
+/// is ever inferred from prose. Range checking against the viewport is the
+/// caller's job ([`macro_engine::visual_point_to_pixels`]).
+#[must_use]
+pub fn parse_visual_location(content: &str) -> VisualLocation {
+    let trimmed = content.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map_or(trimmed, str::trim);
+    let value: Option<serde_json::Value> = serde_json::from_str(unfenced).ok().or_else(|| {
+        let start = unfenced.find('{')?;
+        let end = unfenced.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        serde_json::from_str(unfenced[start..=end].trim()).ok()
+    });
+    let Some(value) = value else {
+        return VisualLocation::Failed("malformed reply".to_owned());
+    };
+    if let (Some(x), Some(y)) = (
+        value.get("x").and_then(serde_json::Value::as_f64),
+        value.get("y").and_then(serde_json::Value::as_f64),
+    ) {
+        return VisualLocation::Point { x, y };
+    }
+    if value.get("found").and_then(serde_json::Value::as_bool) == Some(false) {
+        return VisualLocation::NotFound;
+    }
+    VisualLocation::Failed("malformed reply".to_owned())
 }
 
 /// Build the Groq chat-completion user-message `content` value. Pure —
