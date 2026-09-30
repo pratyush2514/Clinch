@@ -1061,14 +1061,28 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
     navigator: Option<std::sync::Arc<dyn crate::navigator::PageNavigator>>,
     escalation: Option<ModelEscalation>,
 ) -> Result<PageGoalOutcome, IntentError> {
-    let deterministic_miss =
+    // Notifications skip the deterministic account-menu preamble (find
+    // opener → open avatar menu → text-lane scan → dismiss → next
+    // candidate) and go straight to the model phase. Across the web the
+    // notifications surface lives behind a header bell, not in the account
+    // menu: on live Reddit the preamble never succeeded and misfired onto
+    // content-area overflow menus before the model reached the bell. The
+    // preamble itself is unchanged; the other verbs still run it.
+    let skip_preamble = spec.kind == VerbKind::Notifications;
+    let deterministic_miss = if skip_preamble {
+        format!(
+            "{}: account-menu preamble skipped (header bell, not the account menu)",
+            spec.kind.as_str()
+        )
+    } else {
         match pursue_chrome_action_with_vision(browser, origin, spec, navigator.as_ref()).await {
             Ok(outcome) => return Ok(outcome),
             // Browser errors fail fast: retrying them through the model would
             // just burn model calls on a dead CDP session.
             Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
             Err(IntentError::NoMatch(diagnostic)) => diagnostic,
-        };
+        }
+    };
     // The UI attempt's miss journal, from gear 1 alone or both gears: it
     // rides along so the model phase — and the LogOut cookie fallback —
     // keep the full tried-click story.
@@ -1078,10 +1092,14 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
             // it the model re-proposes (or fails to recognize) controls the
             // deterministic phase already evaluated — e.g. concluding "no avatar
             // present" while staring at the "Open user actions" button it tried.
-            let goal = format!(
-                "{}. Already tried without success: {deterministic_miss}",
-                verb_goal_text(spec)
-            );
+            let goal = if skip_preamble {
+                verb_goal_text(spec).to_owned()
+            } else {
+                format!(
+                    "{}. Already tried without success: {deterministic_miss}",
+                    verb_goal_text(spec)
+                )
+            };
             match pursue_with_model(
                 browser,
                 origin,

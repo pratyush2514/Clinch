@@ -1137,6 +1137,50 @@ async fn settle_time_verification_turns_a_late_landing_into_a_pass() {
 }
 
 #[tokio::test]
+async fn notifications_skip_the_account_menu_preamble_and_go_straight_to_the_model() {
+    // An avatar opener the gear-1 preamble would try, plus a header bell.
+    // Notifications bypass the preamble: the only click is the model's
+    // step-1 bell click, and the landing verifies on its path alone.
+    let tree = vec![
+        button(1, "Expand user menu"),
+        button(2, "Open inbox"),
+        button(3, "alpha"),
+        button(4, "beta"),
+        button(5, "gamma"),
+    ];
+    let browser = HarnessBrowser::new(tree, AuthState::Authenticated)
+        .with_landing_on_click(2, "https://www.example.com/notifications");
+    let navigator = Arc::new(TurnNavigator::singles(vec![PageAction::Click {
+        target: 2,
+    }]));
+    let result = pursue_verb_goal(
+        &browser,
+        &origin(),
+        VerbSpec::for_kind(VerbKind::Notifications),
+        Some(Arc::clone(&navigator) as Arc<dyn PageNavigator>),
+        None,
+    )
+    .await;
+    match result {
+        Ok(PageGoalOutcome::Verified { landed, .. }) => {
+            assert_eq!(landed.path(), "/notifications");
+        }
+        other => panic!("expected Verified, got {other:?}"),
+    }
+    assert_eq!(
+        browser.clicks(),
+        vec![2],
+        "no preamble click before the bell"
+    );
+    let seen = navigator.seen();
+    assert!(
+        seen.first()
+            .is_some_and(|turn| !turn.goal.contains("Already tried")),
+        "the model starts cold, not after a preamble miss: {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn settle_time_verification_journals_the_final_page_on_a_miss() {
     let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated);
     let navigator = Arc::new(TurnNavigator::new(vec![Some(vec![PageAction::GiveUp {
