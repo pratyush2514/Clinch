@@ -229,3 +229,30 @@ fn unavailable_reason_is_bounded() {
     let hit = ClickHitTest::unavailable(0.0, 0.0, &"x".repeat(1000));
     assert!(hit.journal_line("", "").len() < 250);
 }
+
+#[test]
+fn navigating_click_reports_the_pre_click_target_not_the_next_page() {
+    // The post-click probe succeeded, but on the NEXT page (its heading).
+    let next_page = ClickHitTest::from_probe(
+        60.4,
+        40.2,
+        &json!({"tag": "H1", "role": "", "name": "Notifications"}),
+    );
+    let line = next_page
+        .resolve_with_pre_click(available_hit(), true)
+        .journal_line("button", "avatar");
+    assert_eq!(
+        line,
+        "click_hit_test: (60, 40) -> BUTTON role=button name=\"User avatar\" [pre-click probe; the click navigated]"
+    );
+}
+
+#[test]
+fn non_navigating_click_keeps_the_post_click_report() {
+    let pre =
+        ClickHitTest::from_probe(1.0, 2.0, &json!({"tag": "SPAN", "role": "", "name": "old"}));
+    let line = available_hit()
+        .resolve_with_pre_click(pre, false)
+        .journal_line("button", "avatar");
+    assert_eq!(line, available_hit().journal_line("button", "avatar"));
+}

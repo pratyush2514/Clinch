@@ -169,8 +169,13 @@ pub fn click_event_sequence(x: f64, y: f64) -> Result<[DispatchMouseEventParams;
 /// capped at 80 characters page-side; [`ClickHitTest::from_probe`] caps
 /// again so any raw payload stays bounded.
 const HIT_TEST_EXPRESSION: &str = "(() => {
-  const el = document.elementFromPoint({x}, {y});
+  let el = document.elementFromPoint({x}, {y});
   if (!el) return null;
+  for (let depth = 0; depth < 32 && el.shadowRoot; depth++) {
+    const inner = el.shadowRoot.elementFromPoint({x}, {y});
+    if (!inner || inner === el) break;
+    el = inner;
+  }
   return {tag: el.tagName, role: el.getAttribute('role')||'', name: (el.getAttribute('aria-label')||el.innerText||'').trim().slice(0,80), idcls: ('#'+(el.id||'')+' .'+(el.className||'').toString().split(/\\s+/).join('.')).slice(0,80)};
 })()";
 
@@ -252,6 +257,22 @@ impl ClickHitTest {
         }
         let reason = format!("post-click: {}; pre-click: {}", self.reason, pre.reason);
         ClickHitTest { reason, ..self }
+    }
+
+    /// [`ClickHitTest::with_pre_click_fallback`], plus: when the click
+    /// `navigated` (the page URL changed between the two probes), the
+    /// post-click probe describes the next page, not the click target, so
+    /// an available pre-click report wins, flagged as such. Without
+    /// navigation this is exactly [`ClickHitTest::with_pre_click_fallback`].
+    #[must_use]
+    pub fn resolve_with_pre_click(self, pre: ClickHitTest, navigated: bool) -> Self {
+        if navigated && pre.available {
+            return ClickHitTest {
+                note: "pre-click probe; the click navigated".to_owned(),
+                ..pre
+            };
+        }
+        self.with_pre_click_fallback(pre)
     }
 
     /// Parse a `Runtime.evaluate` probe payload into a report. Public so the
@@ -389,10 +410,18 @@ impl ManagedBrowser {
         } else {
             None
         };
+        let url_before = self.current_url().await.ok().flatten();
         let (x, y) = self.click_mark_core(mark).await?;
         let post = self.hit_test(x, y).await;
+        // A click that navigated leaves the post-click probe reading the
+        // NEXT page (seen live: the bell click reported the notifications
+        // page's H1 as a MISMATCH). The pre-click probe is then the only
+        // truthful record of what the press landed on.
+        let url_after = self.current_url().await.ok().flatten();
+        let navigated =
+            matches!((&url_before, &url_after), (Some(before), Some(after)) if before != after);
         Ok(match pre {
-            Some(pre) => post.with_pre_click_fallback(pre),
+            Some(pre) => post.resolve_with_pre_click(pre, navigated),
             None => post,
         })
     }

@@ -24,6 +24,9 @@ fn hit_test_expression_substitutes_coordinates() {
     assert!(!expr.contains("}}"));
     assert!(expr.contains("return {tag:"));
     assert!(expr.contains("if (!el) return null;"));
+    // Shadow-DOM controls (web-component headers) resolve to the deepest
+    // element, not the host.
+    assert!(expr.contains("el.shadowRoot.elementFromPoint(120.5, 80.25)"));
 }
 
 #[test]

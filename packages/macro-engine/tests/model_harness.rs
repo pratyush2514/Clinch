@@ -6,13 +6,13 @@
 //! is tested directly; the loop behavior runs against a scripted fake
 //! browser and a scripted navigator that records what each turn saw.
 
-use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight};
+use browser_driver::{AuthState, AxElement, AxResyncCheck, BrowserError, Highlight, LayoutBoxes};
 use macro_engine::{
     ChromeActionBrowser, IntentError, LOOP_NUDGE_REPEATS, LOOP_WINDOW, LoopDetector,
-    MAX_SCREENSHOTS_PER_PASS, MenuBrowser, NavigatorTurn, NormalizedAction, PageAction,
-    PageGoalOutcome, PageNavigator, STAGNATION_NUDGE_TURNS, ScreenshotReason, SettingsBrowser,
-    VerbKind, VerbSpec, click_point_in_viewport, page_fingerprint, pursue_with_model,
-    screenshot_reason,
+    MAX_NAVIGATOR_ELEMENTS, MAX_SCREENSHOTS_PER_PASS, MenuBrowser, NavigatorTurn, NormalizedAction,
+    PageAction, PageGoalOutcome, PageNavigator, STAGNATION_NUDGE_TURNS, ScreenshotReason,
+    SettingsBrowser, VerbKind, VerbSpec, click_point_in_viewport, model_candidates,
+    page_fingerprint, pursue_with_model, screenshot_reason,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -71,6 +71,7 @@ struct HarnessBrowser {
     detached: HashSet<i64>,
     refused: HashSet<i64>,
     screenshot: Option<String>,
+    layout: Option<LayoutBoxes>,
 }
 
 impl HarnessBrowser {
@@ -84,6 +85,7 @@ impl HarnessBrowser {
             detached: HashSet::new(),
             refused: HashSet::new(),
             screenshot: None,
+            layout: None,
         }
     }
 
@@ -101,6 +103,13 @@ impl HarnessBrowser {
     /// target still outside the viewport after scrolling).
     fn with_refused(mut self, id: i64) -> Self {
         self.refused.insert(id);
+        self
+    }
+
+    /// Layout boxes for the model's candidate selection (viewport
+    /// 1200x800, from `menu_viewport_size`).
+    fn with_layout(mut self, layout: LayoutBoxes) -> Self {
+        self.layout = Some(layout);
         self
     }
 
@@ -184,6 +193,10 @@ impl MenuBrowser for HarnessBrowser {
     async fn menu_screenshot(&self) -> Option<String> {
         self.screenshot.clone()
     }
+
+    async fn menu_layout_boxes(&self) -> Option<LayoutBoxes> {
+        self.layout.clone()
+    }
 }
 
 impl SettingsBrowser for HarnessBrowser {
@@ -219,6 +232,7 @@ impl ChromeActionBrowser for HarnessBrowser {
 /// What one turn handed the navigator.
 #[derive(Clone, Debug)]
 struct SeenTurn {
+    ids: Vec<i64>,
     goal: String,
     screenshot: bool,
     notes: Vec<String>,
@@ -273,6 +287,11 @@ impl PageNavigator for TurnNavigator {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(SeenTurn {
+                ids: turn
+                    .elements
+                    .iter()
+                    .map(|element| element.backend_node_id)
+                    .collect(),
                 goal: turn.goal.to_owned(),
                 screenshot: turn.screenshot_jpeg_b64.is_some(),
                 notes: turn.notes.to_vec(),
@@ -860,5 +879,139 @@ async fn refused_model_click_is_journaled_with_the_whole_trail() {
     assert!(
         !diagnostic.contains("click_hit_test:"),
         "no hit-test line for a click that never happened: {diagnostic}"
+    );
+}
+
+// ---- model candidates: same tree, on-screen first ----
+
+/// A portal-shaped snapshot in document order: 80 sidebar links (ids
+/// 100..180, the first 12 on screen), then the header's bell (1) and
+/// avatar (2) at the top-right, then 20 off-screen feed buttons.
+fn portal_snapshot() -> (Vec<AxElement>, LayoutBoxes) {
+    let mut elements = Vec::new();
+    let mut layout = HashMap::new();
+    for i in 0..80_i64 {
+        let id = 100 + i;
+        elements.push(button(id, &format!("community {i}")));
+        #[allow(clippy::cast_precision_loss)]
+        layout.insert(id, (0.0, 70.0 + 60.0 * i as f64, 200.0, 20.0));
+    }
+    elements.push(button(1, "Open inbox"));
+    layout.insert(1, (1100.0, 10.0, 32.0, 32.0));
+    elements.push(button(2, "Open user actions"));
+    layout.insert(2, (1150.0, 10.0, 32.0, 32.0));
+    for i in 0..20_i64 {
+        let id = 300 + i;
+        elements.push(button(id, &format!("share {i}")));
+        #[allow(clippy::cast_precision_loss)]
+        layout.insert(id, (400.0, 900.0 + 100.0 * i as f64, 80.0, 20.0));
+    }
+    (elements, layout)
+}
+
+#[test]
+fn document_order_head_drops_the_header_the_screen_shows() {
+    // The lab miss, pinned: without layout the model gets the first 60 in
+    // document order, and the header is past them.
+    let (elements, _) = portal_snapshot();
+    let candidates = model_candidates::<std::collections::hash_map::RandomState>(
+        &elements,
+        None,
+        None,
+        MAX_NAVIGATOR_ELEMENTS,
+    );
+    let ids: Vec<i64> = candidates.head.iter().map(|e| e.backend_node_id).collect();
+    assert_eq!(candidates.in_view, None);
+    assert!(!ids.contains(&1) && !ids.contains(&2), "{ids:?}");
+}
+
+#[test]
+fn on_screen_controls_lead_top_to_bottom_then_document_order() {
+    let (elements, layout) = portal_snapshot();
+    let candidates = model_candidates(
+        &elements,
+        Some(&layout),
+        Some((1200.0, 800.0)),
+        MAX_NAVIGATOR_ELEMENTS,
+    );
+    let ids: Vec<i64> = candidates.head.iter().map(|e| e.backend_node_id).collect();
+    assert_eq!(&ids[..2], &[1, 2], "header first, left to right: {ids:?}");
+    // 12 sidebar links have their centers on screen (y 80..740).
+    assert_eq!(candidates.in_view, Some(14));
+    assert_eq!(&ids[2..14], &(100..112).collect::<Vec<_>>()[..]);
+    // Then the off-screen rest in document order.
+    assert_eq!(ids[14], 112);
+    assert_eq!(ids.len(), MAX_NAVIGATOR_ELEMENTS);
+    assert_eq!(candidates.total, 102);
+}
+
+#[test]
+fn more_on_screen_than_the_cap_keeps_the_top_of_the_page() {
+    // 70 on-screen controls ABOVE the header in document order, all in a
+    // tall viewport: top-to-bottom still keeps the header strip.
+    let mut elements: Vec<AxElement> = (0..70_i64)
+        .map(|i| button(100 + i, &format!("row {i}")))
+        .collect();
+    let mut layout: LayoutBoxes = (0..70_i64)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let y = 60.0 + 20.0 * i as f64;
+            (100 + i, (10.0, y, 100.0, 10.0))
+        })
+        .collect();
+    elements.push(button(1, "Open inbox"));
+    layout.insert(1, (900.0, 5.0, 30.0, 30.0));
+    let candidates = model_candidates(&elements, Some(&layout), Some((1200.0, 2000.0)), 60);
+    assert_eq!(candidates.head[0].backend_node_id, 1);
+    assert_eq!(candidates.head.len(), 60);
+}
+
+#[test]
+fn unmeasured_and_zero_size_controls_follow_in_document_order() {
+    let elements = vec![
+        button(7, "hidden"),
+        button(8, "unmeasured"),
+        button(9, "visible"),
+    ];
+    let layout: LayoutBoxes = [(7, (10.0, 10.0, 0.0, 0.0)), (9, (10.0, 10.0, 20.0, 20.0))]
+        .into_iter()
+        .collect();
+    let candidates = model_candidates(&elements, Some(&layout), Some((1200.0, 800.0)), 60);
+    let ids: Vec<i64> = candidates.head.iter().map(|e| e.backend_node_id).collect();
+    assert_eq!(ids, vec![9, 7, 8]);
+    assert_eq!(candidates.in_view, Some(1));
+}
+
+#[tokio::test]
+async fn model_turn_is_offered_the_header_and_journals_the_selection() {
+    let (elements, layout) = portal_snapshot();
+    let browser = HarnessBrowser::new(elements, AuthState::Authenticated).with_layout(layout);
+    let navigator = Arc::new(TurnNavigator::singles(vec![]));
+    let diagnostic = miss(run(&browser, navigator.clone(), settings_spec()).await);
+    let seen = navigator.seen();
+    assert!(
+        seen[0].ids.starts_with(&[1, 2]),
+        "the bell and avatar lead the model's list: {:?}",
+        seen[0].ids
+    );
+    assert!(
+        diagnostic.contains(
+            "model_candidates: 102 actionable, 14 on screen; offered 60 (on-screen first, top to bottom)"
+        ),
+        "{diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn layout_unavailable_journals_the_document_order_truncation() {
+    let (elements, _) = portal_snapshot();
+    let browser = HarnessBrowser::new(elements, AuthState::Authenticated);
+    let navigator = Arc::new(TurnNavigator::singles(vec![]));
+    let diagnostic = miss(run(&browser, navigator, settings_spec()).await);
+    assert!(
+        diagnostic.contains(
+            "model_candidates: 102 actionable; offered the first 60 in document order (layout unavailable)"
+        ),
+        "{diagnostic}"
     );
 }

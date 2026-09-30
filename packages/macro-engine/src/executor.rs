@@ -3738,6 +3738,16 @@ pub trait MenuBrowser {
     /// turn; a failed capture degrades to the text-only turn and must
     /// never fail the run.
     fn menu_screenshot(&self) -> impl std::future::Future<Output = Option<String>> + Send;
+    /// Viewport-relative layout boxes `(x, y, width, height)` keyed by
+    /// backend node id, from one layout snapshot of the same page the AX
+    /// tree describes. Feeds the model phase's candidate selection
+    /// ([`model_candidates`]). Best-effort: `None` keeps document order.
+    /// The default reports nothing so scripted fakes keep their shape.
+    fn menu_layout_boxes(
+        &self,
+    ) -> impl std::future::Future<Output = Option<browser_driver::LayoutBoxes>> + Send {
+        std::future::ready(None)
+    }
     /// Click a viewport-pixel point through the same trusted hover → press
     /// → release pipeline as [`MenuBrowser::menu_click_reported`], journaling
     /// the hit-test line into `tried`. Used only by the visual fallback,
@@ -3873,6 +3883,10 @@ impl MenuBrowser for ManagedBrowser {
         // Best-effort: the visual turn degrades to text-only when capture
         // fails, and the failure must never fail the run.
         self.viewport().await.map(|viewport| viewport.data).ok()
+    }
+
+    async fn menu_layout_boxes(&self) -> Option<browser_driver::LayoutBoxes> {
+        self.layout_boxes().await
     }
 }
 
@@ -5110,11 +5124,84 @@ async fn model_turn_call(
     Ok(actions)
 }
 
-/// The element slice one model turn renders, with its 1:1 zones. The
-/// navigator renders the head slice ([`crate::MAX_NAVIGATOR_ELEMENTS`]);
-/// zones describe exactly that slice, best-effort — unzoned on failure.
-/// One measurement round feeds both the zones and the policy-gated
-/// header-strip filter — never a second CDP pass.
+/// The model phase's candidate slice from the full snapshot, plus how it
+/// was chosen (for the journal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCandidates {
+    /// At most `cap` elements, in the order the model sees them.
+    pub head: Vec<AxElement>,
+    /// Actionable elements in the full snapshot.
+    pub total: usize,
+    /// Elements whose layout box center lies in the viewport; `None` when
+    /// layout was unavailable and the slice fell back to document order.
+    pub in_view: Option<usize>,
+}
+
+/// Choose the model's candidates from the SAME full AX snapshot the
+/// deterministic walk reads. Document order alone is the wrong key: a page
+/// whose sidebar, feed, or skip links precede the header in AX order pushes
+/// the header (bell, avatar) past any fixed-size head, while the
+/// screenshot plainly shows them. With layout (`boxes` keyed by backend
+/// node id, viewport-relative, and the live `viewport`): every element
+/// whose box center is on screen comes first, top-to-bottom then
+/// left-to-right, so the header can never be crowded out; the rest follow
+/// in document order (still clickable — off-screen targets are scrolled
+/// into view). Without layout: the plain document-order head, as before.
+/// Pure and unit-tested; truncation to `cap` happens last.
+#[must_use]
+pub fn model_candidates<S: std::hash::BuildHasher>(
+    elements: &[AxElement],
+    boxes: Option<&std::collections::HashMap<i64, browser_driver::LayoutBox, S>>,
+    viewport: Option<(f64, f64)>,
+    cap: usize,
+) -> ModelCandidates {
+    let total = elements.len();
+    let (Some(boxes), Some(viewport)) = (boxes, viewport) else {
+        return ModelCandidates {
+            head: elements.iter().take(cap).cloned().collect(),
+            total,
+            in_view: None,
+        };
+    };
+    let center_of = |element: &AxElement| {
+        boxes
+            .get(&element.backend_node_id)
+            .filter(|(_, _, width, height)| *width > 0.0 && *height > 0.0)
+            .map(|(x, y, width, height)| (x + width / 2.0, y + height / 2.0))
+            .filter(|center| click_point_in_viewport(*center, viewport))
+    };
+    let mut visible: Vec<(f64, f64, &AxElement)> = Vec::new();
+    let mut rest: Vec<&AxElement> = Vec::new();
+    for element in elements {
+        match center_of(element) {
+            Some((x, y)) => visible.push((y, x, element)),
+            None => rest.push(element),
+        }
+    }
+    // Stable sort: equal positions keep document order.
+    visible.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let in_view = visible.len();
+    let head = visible
+        .into_iter()
+        .map(|(_, _, element)| element)
+        .chain(rest)
+        .take(cap)
+        .cloned()
+        .collect();
+    ModelCandidates {
+        head,
+        total,
+        in_view: Some(in_view),
+    }
+}
+
+/// The element slice one model turn renders, with its 1:1 zones: the
+/// [`model_candidates`] slice ([`crate::MAX_NAVIGATOR_ELEMENTS`]) of the
+/// full snapshot. Zones describe exactly that slice, best-effort —
+/// unzoned on failure. One measurement round feeds both the zones and
+/// the policy-gated header-strip filter — never a second CDP pass. The
+/// selection is journaled whenever layout drove it or the document-order
+/// head actually dropped elements.
 async fn model_turn_head<B: MenuBrowser>(
     browser: &B,
     elements: &[AxElement],
@@ -5122,11 +5209,28 @@ async fn model_turn_head<B: MenuBrowser>(
     tried: &mut Vec<String>,
     filter_fallback_journaled: &mut bool,
 ) -> (Vec<AxElement>, Vec<Option<crate::navigator::PositionZone>>) {
-    let head: Vec<AxElement> = elements
-        .iter()
-        .take(crate::MAX_NAVIGATOR_ELEMENTS)
-        .cloned()
-        .collect();
+    let boxes = browser.menu_layout_boxes().await;
+    let viewport = browser.menu_viewport_size().await;
+    let candidates = model_candidates(
+        elements,
+        boxes.as_ref(),
+        viewport,
+        crate::MAX_NAVIGATOR_ELEMENTS,
+    );
+    match candidates.in_view {
+        Some(in_view) => tried.push(format!(
+            "model_candidates: {} actionable, {in_view} on screen; offered {} (on-screen first, top to bottom)",
+            candidates.total,
+            candidates.head.len()
+        )),
+        None if candidates.total > candidates.head.len() => tried.push(format!(
+            "model_candidates: {} actionable; offered the first {} in document order (layout unavailable)",
+            candidates.total,
+            candidates.head.len()
+        )),
+        None => {}
+    }
+    let head = candidates.head;
     let points = model_zone_points(browser, &head).await;
     let zones = zones_from_points(&points);
     // Policy-gated guard: offer the model only header-strip candidates

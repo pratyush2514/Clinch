@@ -425,6 +425,76 @@ impl ManagedBrowser {
         })
     }
 
+    /// Viewport-relative layout boxes `(x, y, width, height)` for every
+    /// laid-out node of the main document, keyed by backend node id — the
+    /// same ids the AX snapshot carries — from ONE
+    /// `DOMSnapshot.captureSnapshot` call (shadow roots included). The
+    /// snapshot's bounds are document coordinates; subtracting the
+    /// document's scroll offset yields the viewport space `DOM.getBoxModel`
+    /// and input events use (checked against live Chrome: bounds − scrollY
+    /// equals the box-model y). `None` on any failure.
+    pub async fn layout_boxes(&self) -> Option<LayoutBoxes> {
+        use chromiumoxide::cdp::browser_protocol::dom_snapshot::CaptureSnapshotParams;
+        // `computedStyles` is required by the protocol, but chromiumoxide
+        // skips serializing an EMPTY list, and Chrome then rejects the call
+        // (-32602 "Invalid parameters", seen live). One cheap style keeps
+        // the field on the wire.
+        let snapshot = tokio::time::timeout(
+            IO_TIMEOUT,
+            self.page
+                .execute(CaptureSnapshotParams::new(vec!["display".to_owned()])),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .result;
+        // Snapshot bounds are DEVICE pixels (seen live: a 56px CSS box
+        // reported as 70 at devicePixelRatio 1.25 on a scaled display);
+        // the box model and input events are CSS pixels.
+        let scale: f64 = tokio::time::timeout(IO_TIMEOUT, async {
+            self.page
+                .evaluate("window.devicePixelRatio")
+                .await
+                .ok()?
+                .into_value::<f64>()
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)?;
+        let document = snapshot.documents.first()?;
+        let backend_ids = document.nodes.backend_node_id.as_ref()?;
+        let scroll_x = document.scroll_offset_x.unwrap_or(0.0);
+        let scroll_y = document.scroll_offset_y.unwrap_or(0.0);
+        let mut boxes = std::collections::HashMap::new();
+        for (node_index, bounds) in document
+            .layout
+            .node_index
+            .iter()
+            .zip(document.layout.bounds.iter())
+        {
+            let Some(backend) = usize::try_from(*node_index)
+                .ok()
+                .and_then(|index| backend_ids.get(index))
+            else {
+                continue;
+            };
+            let [x, y, width, height] = bounds.inner().as_slice() else {
+                continue;
+            };
+            // A node can own several layout objects (e.g. wrapped inline
+            // text); the first is its principal box.
+            boxes.entry(*backend.inner()).or_insert((
+                x / scale - scroll_x,
+                y / scale - scroll_y,
+                width / scale,
+                height / scale,
+            ));
+        }
+        Some(boxes)
+    }
+
     /// Scroll the node's center into the viewport if it is not already
     /// visible (`DOM.scrollIntoViewIfNeeded`, the same behavior as
     /// `Element.scrollIntoView` centering). A no-op for visible nodes.
@@ -667,3 +737,11 @@ const DOM_CLOSEST_EXPRESSION: &str = "function(){var el=this;if(!el||!el.closest
     var c=el.closest('tr,[role=\"row\"],li,article,fieldset');\
     if(!c){return '';}\
     return (c.innerText||'').slice(0,2000);}";
+
+/// One node's viewport-relative layout box `(x, y, width, height)` in CSS
+/// pixels — the space `DOM.getBoxModel` and input events use.
+pub type LayoutBox = (f64, f64, f64, f64);
+
+/// Layout boxes keyed by backend node id (the ids the AX snapshot carries),
+/// as [`crate::ManagedBrowser::layout_boxes`] returns them.
+pub type LayoutBoxes = std::collections::HashMap<i64, LayoutBox>;
