@@ -2263,10 +2263,53 @@ pub fn crop_screenshot_jpeg_b64(
         .crop_imm(left, top, right - left, bottom - top)
         .to_rgb8();
     let mut encoded = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 80)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, VISUAL_CROP_JPEG_QUALITY)
         .encode_image(&cropped)
         .ok()?;
     Some(engine.encode(encoded))
+}
+
+/// JPEG quality of the model-bound crop re-encode: high enough that small
+/// menu-row text survives compression.
+pub const VISUAL_CROP_JPEG_QUALITY: u8 = 90;
+
+/// Persist the model-bound crop — the exact bytes the vision model
+/// receives (the base64 payload, decoded) — to
+/// `{dir}/clinch-visual-crop-<unix_millis>.jpg`. Returns the written path,
+/// or the reason it could not be written. Debug evidence only: callers
+/// journal a failure and continue; it must never fail the run.
+///
+/// # Errors
+/// Returns the decode or write failure as a plain reason string.
+pub fn save_visual_crop(
+    dir: &std::path::Path,
+    crop_jpeg_b64: &str,
+    unix_millis: u128,
+) -> Result<std::path::PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(crop_jpeg_b64)
+        .map_err(|error| format!("decode: {error}"))?;
+    let path = dir.join(format!("clinch-visual-crop-{unix_millis}.jpg"));
+    std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+/// Best-effort crop save into `dir` (production passes the OS temp dir),
+/// journaling `visual_fallback: crop_saved <path>` or
+/// `visual_fallback: crop_save_failed (<reason>)`. Never fails.
+pub fn journal_visual_crop_save(
+    dir: &std::path::Path,
+    crop_jpeg_b64: &str,
+    tried: &mut Vec<String>,
+) {
+    let unix_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    match save_visual_crop(dir, crop_jpeg_b64, unix_millis) {
+        Ok(path) => tried.push(format!("visual_fallback: crop_saved {}", path.display())),
+        Err(reason) => tried.push(format!("visual_fallback: crop_save_failed ({reason})")),
+    }
 }
 
 /// The image and target description the visual fallback sends: the
@@ -2292,6 +2335,8 @@ async fn visual_fallback_image<B: MenuBrowser>(
             "visual_fallback: crop ({}, {}, {}, {})",
             rect.x as i64, rect.y as i64, rect.w as i64, rect.h as i64
         ));
+        // The same buffer that goes to the model is what gets saved.
+        journal_visual_crop_save(&std::env::temp_dir(), &cropped, tried);
         return (cropped, visual_crop_target_description(spec), Some(rect));
     }
     (full_screenshot, visual_target_description(spec), None)
@@ -2312,6 +2357,340 @@ async fn visual_opener_point<B: MenuBrowser>(
         .find_map(|control| elements.iter().find(|element| control.matches(element)))?;
     let rect = browser.menu_node_rect(opener.backend_node_id).await.ok()?;
     Some((rect.x + rect.width / 2.0, rect.y + rect.height / 2.0))
+}
+
+/// One visible text node the page reported: its raw text and the center of
+/// its rendered `Range` rect in viewport CSS pixels. Raw facts only — every
+/// decision about it is made in Rust ([`pick_text_lane_target`]).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct TextCandidate {
+    pub text: String,
+    pub cx: f64,
+    pub cy: f64,
+}
+
+/// What the page reports under a point for the text lane's occlusion
+/// guard: the deepest element's composed visible text (capped) and whether
+/// a visible text node inside it normalizes to the matched word.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct TextProbe {
+    pub hit_text: String,
+    pub contains_match: bool,
+}
+
+/// Text-lane normalization: trim, collapse every whitespace run (NBSP
+/// included — Rust's `char::is_whitespace` covers it) to one space,
+/// lowercase. Pure.
+#[must_use]
+pub fn normalize_text_lane(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Text-lane pick result. `Ambiguous` and `NoMatch` carry nothing: the
+/// lane never guesses between equal rows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextLanePick {
+    /// Exactly one visible in-region text node equals `word`.
+    Found { word: String, cx: f64, cy: f64 },
+    /// A word matched two or more in-region nodes; later words are not
+    /// tried (an ambiguous page is not made less ambiguous by a synonym).
+    Ambiguous { word: String },
+    /// No word matched any in-region node.
+    NoMatch,
+}
+
+/// Pure text-lane decision: for each vocabulary word in declared order,
+/// count candidates whose normalized text EQUALS the word and whose center
+/// lies inside `region` (edges inclusive). The first word with exactly one
+/// match wins; a word with 2+ matches stops the lane as ambiguous; zero
+/// tries the next word. No site strings — the words are the verb's closed
+/// vocabulary.
+#[must_use]
+pub fn pick_text_lane_target(
+    candidates: &[TextCandidate],
+    vocabulary: &[&str],
+    region: crate::navigator::VisualCrop,
+) -> TextLanePick {
+    let inside = |candidate: &TextCandidate| {
+        candidate.cx.is_finite()
+            && candidate.cy.is_finite()
+            && candidate.cx >= region.x
+            && candidate.cx <= region.x + region.w
+            && candidate.cy >= region.y
+            && candidate.cy <= region.y + region.h
+    };
+    for word in vocabulary {
+        let word = normalize_text_lane(word);
+        if word.is_empty() {
+            continue;
+        }
+        let mut matches = candidates
+            .iter()
+            .filter(|candidate| inside(candidate) && normalize_text_lane(&candidate.text) == word);
+        match (matches.next(), matches.next()) {
+            (None, _) => {}
+            (Some(only), None) => {
+                return TextLanePick::Found {
+                    word,
+                    cx: only.cx,
+                    cy: only.cy,
+                };
+            }
+            (Some(_), Some(_)) => return TextLanePick::Ambiguous { word },
+        }
+    }
+    TextLanePick::NoMatch
+}
+
+/// The text lane's search region: the same opener-centered square the
+/// visual fallback crops to, or the full viewport when there is no opener
+/// point (or the square cannot be built). `None` only for an unusable
+/// viewport. Pure.
+#[must_use]
+pub fn text_lane_region(
+    opener: Option<(f64, f64)>,
+    viewport: (f64, f64),
+) -> Option<crate::navigator::VisualCrop> {
+    if let Some(rect) = opener.and_then(|point| visual_crop_rect(point, viewport)) {
+        return Some(rect);
+    }
+    let (width, height) = viewport;
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0).then_some(
+        crate::navigator::VisualCrop {
+            x: 0.0,
+            y: 0.0,
+            w: width,
+            h: height,
+        },
+    )
+}
+
+/// Occlusion-guard decision, pure: the deepest element under the point
+/// must contain a visible text node equal to `word` AND its own composed
+/// text must equal `word`. Accepts the text's own element and an
+/// icon + label row; rejects a neighboring row ("Display Mode"), a wide
+/// container whose text is every row, an overlay, and a missing probe.
+#[must_use]
+pub fn text_lane_guard_passes(probe: Option<&TextProbe>, word: &str) -> bool {
+    probe.is_some_and(|probe| {
+        probe.contains_match && normalize_text_lane(&probe.hit_text) == normalize_text_lane(word)
+    })
+}
+
+/// Page-side candidate collector for the text lane. Read-only: no
+/// attributes, listeners, or globals are written (a detached `Range` is
+/// not a page mutation). Walks the document and every open shadow root
+/// for non-whitespace text nodes; keeps one only when its rendered rect
+/// is non-empty, intersects the viewport, and no ancestor on the composed
+/// chain is `display:none`, `visibility:hidden`, or `opacity:0`. Capped at
+/// 2000 candidates.
+const TEXT_LANE_CANDIDATES_EXPRESSION: &str = r"(() => {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const hiddenCache = new Map();
+  const hidden = (el) => {
+    const chain = [];
+    let node = el, verdict = false;
+    while (node) {
+      if (node.nodeType === 1) {
+        if (hiddenCache.has(node)) { verdict = hiddenCache.get(node); break; }
+        chain.push(node);
+        const s = getComputedStyle(node);
+        if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') { verdict = true; break; }
+      }
+      node = node.parentNode || node.host || null;
+    }
+    for (const seen of chain) hiddenCache.set(seen, verdict);
+    return verdict;
+  };
+  const out = [];
+  const walk = (root) => {
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let node = tw.nextNode();
+    while (node && out.length < 2000) {
+      if (node.nodeType === 1) {
+        if (node.shadowRoot) walk(node.shadowRoot);
+      } else if (node.nodeValue && node.nodeValue.trim()) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const r = range.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh
+            && node.parentElement && !hidden(node.parentElement)) {
+          out.push({text: node.nodeValue.slice(0, 200), cx: r.left + r.width / 2, cy: r.top + r.height / 2});
+        }
+      }
+      node = tw.nextNode();
+    }
+  };
+  walk(document);
+  return out;
+})()";
+
+/// Page-side occlusion probe for the text lane. Read-only. Resolves the
+/// deepest element at the point (descending through open shadow roots via
+/// `shadowRoot.elementFromPoint`), then reports its composed visible text
+/// (capped at 200 chars) and whether a visible text node inside its
+/// composed subtree normalizes to the word. `{x}`, `{y}`, `{word}` are
+/// substituted by [`text_lane_probe_expression`].
+const TEXT_LANE_PROBE_EXPRESSION: &str = r"((x, y, word) => {
+  const norm = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+  let hit = document.elementFromPoint(x, y);
+  if (!hit) return null;
+  for (let i = 0; i < 32 && hit.shadowRoot; i++) {
+    const inner = hit.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  const texts = [];
+  let contains = false;
+  const walk = (root) => {
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let node = tw.nextNode();
+    while (node && texts.length < 200) {
+      if (node.nodeType === 1) {
+        if (node.shadowRoot) walk(node.shadowRoot);
+      } else if (node.nodeValue && node.nodeValue.trim()) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const r = range.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          texts.push(node.nodeValue);
+          if (norm(node.nodeValue) === word) contains = true;
+        }
+      }
+      node = tw.nextNode();
+    }
+  };
+  if (hit.shadowRoot) walk(hit.shadowRoot);
+  walk(hit);
+  return {hit_text: texts.join(' ').slice(0, 200), contains_match: contains};
+})({x}, {y}, {word})";
+
+/// Substitute the point and the JSON-quoted word into the probe
+/// expression. Pure so the substitution stays testable.
+#[must_use]
+pub fn text_lane_probe_expression(x: f64, y: f64, word: &str) -> String {
+    let word = serde_json::to_string(&normalize_text_lane(word)).unwrap_or_else(|_| "\"\"".into());
+    TEXT_LANE_PROBE_EXPRESSION
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string())
+        .replace("{word}", &word)
+}
+
+/// How one text-lane attempt ended.
+#[derive(Debug)]
+enum TextLaneOutcome {
+    /// The verifier confirmed the goal after the text-lane click.
+    Verified(PageGoalOutcome),
+    /// No click was dispatched (no match, ambiguous, occluded, no
+    /// viewport, budget exhausted): the visual fallback may still run on
+    /// this same snapshot.
+    MissedWithoutClick,
+    /// A click was dispatched and the verifier refused it: the menu has
+    /// likely closed, so the caller re-snapshots instead of running
+    /// vision on a stale page.
+    MissedAfterClick,
+}
+
+/// Deterministic text lane (sign-out only): find the verb's word as
+/// rendered text inside the menu region, guard the point against
+/// occlusion, click through the trusted path, and let the existing
+/// signed-out verifier decide. No model is involved. Every non-success
+/// path journals `text_lane: missed (<reason>)` and never fails the run
+/// (only a CDP failure of the click itself propagates, exactly like the
+/// other menu clicks).
+///
+/// # Errors
+/// Returns [`IntentError::Browser`] on CDP failure of the click.
+async fn text_lane_step<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    opener: Option<(f64, f64)>,
+    tried: &mut Vec<String>,
+    clicks_used: &mut usize,
+) -> Result<TextLaneOutcome, IntentError> {
+    let Some(region) = browser
+        .menu_viewport_size()
+        .await
+        .and_then(|viewport| text_lane_region(opener, viewport))
+    else {
+        tried.push("text_lane: missed (no viewport)".to_owned());
+        return Ok(TextLaneOutcome::MissedWithoutClick);
+    };
+    let candidates = browser.menu_text_candidates().await;
+    let (word, cx, cy) = match pick_text_lane_target(&candidates, spec.vocabulary, region) {
+        TextLanePick::Found { word, cx, cy } => (word, cx, cy),
+        TextLanePick::Ambiguous { .. } => {
+            tried.push("text_lane: missed (ambiguous)".to_owned());
+            return Ok(TextLaneOutcome::MissedWithoutClick);
+        }
+        TextLanePick::NoMatch => {
+            tried.push("text_lane: missed (no text match)".to_owned());
+            return Ok(TextLaneOutcome::MissedWithoutClick);
+        }
+    };
+    let (x, y) = (cx.round(), cy.round());
+    let probe = browser.menu_text_probe(x, y, &word).await;
+    if !text_lane_guard_passes(probe.as_ref(), &word) {
+        let hit: String = probe
+            .map(|probe| probe.hit_text)
+            .unwrap_or_default()
+            .chars()
+            .take(40)
+            .collect();
+        tried.push(format!("text_lane: missed (occluded: hit \"{hit}\")"));
+        return Ok(TextLaneOutcome::MissedWithoutClick);
+    }
+    if *clicks_used >= CHROME_ACTION_MAX_CLICKS {
+        tried.push("text_lane: missed (click budget exhausted)".to_owned());
+        return Ok(TextLaneOutcome::MissedWithoutClick);
+    }
+    // Whole pixels by construction (`round`).
+    #[allow(clippy::cast_possible_truncation)]
+    tried.push(format!(
+        "text_lane: click_at ({}, {}) \"{word}\"",
+        x as i64, y as i64
+    ));
+    match browser.menu_click_at(x, y, tried).await {
+        Ok(()) => {}
+        Err(IntentError::Browser(error)) => return Err(IntentError::Browser(error)),
+        Err(IntentError::NoMatch(_)) => {
+            tried.push("text_lane: missed (click failed)".to_owned());
+            return Ok(TextLaneOutcome::MissedWithoutClick);
+        }
+    }
+    *clicks_used += 1;
+    // The existing verifier decides — a click is not success.
+    let _ = wait_for_url_change(browser).await;
+    if verify_verb(browser, origin, spec, None, None).await {
+        let landed = browser
+            .settings_current_url()
+            .await
+            .unwrap_or_else(|| origin.clone());
+        // The attempt trail (including `text_lane: click_at`) rides in
+        // `tried_lines` so a verified run still journals how it got there;
+        // click evidence stays in `hit_lines`.
+        let tried_lines = tried
+            .iter()
+            .filter(|line| !line.starts_with("click_hit_test:"))
+            .cloned()
+            .collect();
+        return Ok(TextLaneOutcome::Verified(
+            PageGoalOutcome::Verified {
+                label: format!("text pick: {word}"),
+                landed,
+                username: None,
+                hit_lines: Vec::new(),
+                tried_lines,
+            }
+            .with_hit_lines(tried),
+        ));
+    }
+    tried.push("text_lane: missed (verification failed)".to_owned());
+    Ok(TextLaneOutcome::MissedAfterClick)
 }
 
 /// Visual fallback for the sign-out lane, run once per worker invocation
@@ -2537,27 +2916,62 @@ pub async fn pursue_chrome_action_with_vision<B: ChromeActionBrowser>(
             AlreadyOpenMenuOutcome::Skipped => {}
         }
 
-        // 0b. Visual fallback (sign-out only, once): a menu is open but no
-        // control directly names the verb — AX-blind or misnamed. Look at
-        // pixels instead of falling to the container-tier pick.
-        if let Some(navigator) = vision
-            && !visual_attempted
-            && matches!(spec.verifier, VerifierKind::AuthSignedOut)
+        // Shared gate for the text lane and the visual fallback (sign-out
+        // only): an opener was clicked, and no control directly names the
+        // verb — the menu rows are AX-blind (role-less) or misnamed.
+        let ax_blind_signout = matches!(spec.verifier, VerifierKind::AuthSignedOut)
             && !clicked.is_empty()
             && !matches!(
                 select_revealed_action_tiered(&elements, &clicked, &previously_seen, spec),
                 Some((_, MatchTier::Direct))
+            );
+        let menu_origin_point = if ax_blind_signout {
+            visual_opener_point(browser, &elements, &clicked).await
+        } else {
+            None
+        };
+
+        // 0a. Text lane (deterministic, no model): read the verb's word as
+        // rendered text inside the menu region and click it. Runs with or
+        // without a vision model. A miss without a click falls through to
+        // vision on this same snapshot; a clicked miss re-snapshots and
+        // retires vision for the run (the menu has likely closed).
+        if ax_blind_signout {
+            match text_lane_step(
+                browser,
+                origin,
+                spec,
+                menu_origin_point,
+                &mut tried,
+                &mut clicks_used,
             )
+            .await?
+            {
+                TextLaneOutcome::Verified(outcome) => return Ok(outcome),
+                TextLaneOutcome::MissedAfterClick => {
+                    visual_attempted = true;
+                    previously_seen = currently_seen;
+                    continue;
+                }
+                TextLaneOutcome::MissedWithoutClick => {}
+            }
+        }
+
+        // 0b. Visual fallback (sign-out only, once): the text lane found no
+        // readable row. Look at pixels instead of falling to the
+        // container-tier pick.
+        if let Some(navigator) = vision
+            && !visual_attempted
+            && ax_blind_signout
         {
             visual_attempted = true;
             let clicks_before = clicks_used;
-            let opener = visual_opener_point(browser, &elements, &clicked).await;
             if let Some(outcome) = visual_fallback_step(
                 browser,
                 origin,
                 spec,
                 navigator,
-                opener,
+                menu_origin_point,
                 &mut tried,
                 &mut clicks_used,
             )
@@ -3296,9 +3710,52 @@ pub trait MenuBrowser {
             "coordinate click unsupported".to_owned(),
         )))
     }
+    /// Visible text nodes (document plus open shadow roots) with their
+    /// rendered-rect centers, for the text lane. Best-effort and read-only:
+    /// any failure is an empty list (a text-lane miss, never an error). The
+    /// default reports nothing so scripted fakes keep their shape.
+    fn menu_text_candidates(&self) -> impl std::future::Future<Output = Vec<TextCandidate>> + Send {
+        std::future::ready(Vec::new())
+    }
+    /// The text lane's occlusion probe at a viewport point for `word`.
+    /// Best-effort and read-only: any failure is `None`, which fails the
+    /// guard (no click). The default reports nothing.
+    fn menu_text_probe(
+        &self,
+        x: f64,
+        y: f64,
+        word: &str,
+    ) -> impl std::future::Future<Output = Option<TextProbe>> + Send {
+        let _ = (x, y, word);
+        std::future::ready(None)
+    }
 }
 
 impl MenuBrowser for ManagedBrowser {
+    async fn menu_text_candidates(&self) -> Vec<TextCandidate> {
+        let evaluated = tokio::time::timeout(
+            browser_driver::IO_TIMEOUT,
+            self.page.evaluate(TEXT_LANE_CANDIDATES_EXPRESSION),
+        )
+        .await;
+        match evaluated {
+            Ok(Ok(result)) => result
+                .into_value::<Vec<TextCandidate>>()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    async fn menu_text_probe(&self, x: f64, y: f64, word: &str) -> Option<TextProbe> {
+        let expression = text_lane_probe_expression(x, y, word);
+        let evaluated =
+            tokio::time::timeout(browser_driver::IO_TIMEOUT, self.page.evaluate(expression)).await;
+        match evaluated {
+            Ok(Ok(result)) => result.into_value::<Option<TextProbe>>().ok().flatten(),
+            _ => None,
+        }
+    }
+
     async fn menu_click_at(
         &self,
         x: f64,

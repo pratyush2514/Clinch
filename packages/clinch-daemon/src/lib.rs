@@ -597,8 +597,12 @@ pub async fn serve_connection(service: Arc<service::AppService>, stream: tokio::
             // No readable id: nothing to correlate — ignore and stay open.
             continue;
         };
-        // Log command names and ids only — never params or payloads.
-        eprintln!("[clinch-daemon] cmd={} id={}", req.cmd, req.id);
+        // Log command names and ids only — never params or payloads. Opt-in
+        // (`CLINCH_LOG_COMMANDS=1`): the desktop UI polls `bridge_status`
+        // in a loop, so an always-on line floods the terminal.
+        if std::env::var("CLINCH_LOG_COMMANDS").is_ok_and(|value| value == "1") {
+            eprintln!("[clinch-daemon] cmd={} id={}", req.cmd, req.id);
+        }
         match handle_request(&service, req, &mut ctx).await {
             Action::Reply(response) => {
                 if out_tx.send(WireMessage::Response(response)).is_err() {
