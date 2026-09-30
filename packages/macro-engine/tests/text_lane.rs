@@ -662,15 +662,25 @@ async fn direct_ax_match_never_runs_the_text_lane() {
 }
 
 #[tokio::test]
-async fn non_sign_out_verb_never_runs_the_text_lane() {
+async fn settings_verb_runs_the_text_lane_too() {
+    // The lane covers every identity-menu verb (see `identity_menu.rs`);
+    // this fake never leaves the root, so the settings verifier refuses.
     let browser = TextBrowser::new(
         vec![text("Settings", 1000.0, 420.0)],
         Some(probe("Settings", true)),
         false,
     );
-    let _ = run(&browser, VerbKind::Settings, None).await;
-    assert_eq!(browser.candidate_calls.load(Ordering::SeqCst), 0);
-    assert!(browser.clicks_at().await.is_empty());
+    let diagnostic = miss_diagnostic(run(&browser, VerbKind::Settings, None).await);
+    assert!(browser.candidate_calls.load(Ordering::SeqCst) > 0);
+    // Clicked misses chain within the click budget (the menu stays open in
+    // this fake); every click lands on the Settings row.
+    let clicks_at = browser.clicks_at().await;
+    assert!(!clicks_at.is_empty());
+    assert!(clicks_at.iter().all(|point| *point == (1000.0, 420.0)));
+    assert!(
+        diagnostic.contains("text_lane: missed (verification failed)"),
+        "got: {diagnostic}"
+    );
 }
 
 #[tokio::test]

@@ -1316,6 +1316,23 @@ pub enum VerifierKind {
     NotificationSurface,
 }
 
+impl VerifierKind {
+    /// Whether this verifier belongs to an identity-menu verb — one whose
+    /// destination is a row of the shared identity menu (profile, settings,
+    /// notifications, sign out). Gates the deterministic text lane.
+    /// Exhaustive on purpose: a new verifier must decide here whether its
+    /// verb picks a row of that menu.
+    #[must_use]
+    pub fn is_identity_menu(self) -> bool {
+        match self {
+            VerifierKind::UrlPathTokens(_)
+            | VerifierKind::IdentityEvidence
+            | VerifierKind::AuthSignedOut
+            | VerifierKind::NotificationSurface => true,
+        }
+    }
+}
+
 /// One row of the verb table: the verb, the closed vocabulary that names
 /// its destination in revealed chrome, and the verifier that proves the
 /// action landed.
@@ -2594,13 +2611,16 @@ enum TextLaneOutcome {
     MissedAfterClick,
 }
 
-/// Deterministic text lane (sign-out only): find the verb's word as
-/// rendered text inside the menu region, guard the point against
-/// occlusion, click through the trusted path, and let the existing
-/// signed-out verifier decide. No model is involved. Every non-success
-/// path journals `text_lane: missed (<reason>)` and never fails the run
-/// (only a CDP failure of the click itself propagates, exactly like the
-/// other menu clicks).
+/// Deterministic text lane (identity-menu verbs, see
+/// [`VerifierKind::is_identity_menu`]): find one of the verb's own
+/// vocabulary words, in declared order, as rendered text inside the menu
+/// region, guard the point against occlusion, click through the trusted
+/// path, and let the verb's existing verifier decide. One flow for every
+/// identity-menu verb — only the vocabulary and verifier come from `spec`.
+/// No model is involved. Every non-success path journals
+/// `text_lane: missed (<reason>)` and never fails the run (only a CDP
+/// failure of the click itself propagates, exactly like the other menu
+/// clicks).
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure of the click.
@@ -2612,6 +2632,15 @@ async fn text_lane_step<B: ChromeActionBrowser>(
     tried: &mut Vec<String>,
     clicks_used: &mut usize,
 ) -> Result<TextLaneOutcome, IntentError> {
+    // The lane never invents words: a verb without a vocabulary declines.
+    if spec
+        .vocabulary
+        .iter()
+        .all(|word| normalize_text_lane(word).is_empty())
+    {
+        tried.push("text_lane: missed (no vocabulary)".to_owned());
+        return Ok(TextLaneOutcome::MissedWithoutClick);
+    }
     let Some(region) = browser
         .menu_viewport_size()
         .await
@@ -2916,16 +2945,19 @@ pub async fn pursue_chrome_action_with_vision<B: ChromeActionBrowser>(
             AlreadyOpenMenuOutcome::Skipped => {}
         }
 
-        // Shared gate for the text lane and the visual fallback (sign-out
-        // only): an opener was clicked, and no control directly names the
-        // verb — the menu rows are AX-blind (role-less) or misnamed.
-        let ax_blind_signout = matches!(spec.verifier, VerifierKind::AuthSignedOut)
+        // Shared gate for the text lane (every identity-menu verb) and the
+        // visual fallback (sign-out only): an opener was clicked, and no
+        // control directly names the verb — the menu rows are AX-blind
+        // (role-less) or misnamed.
+        let ax_blind_menu = spec.verifier.is_identity_menu()
             && !clicked.is_empty()
             && !matches!(
                 select_revealed_action_tiered(&elements, &clicked, &previously_seen, spec),
                 Some((_, MatchTier::Direct))
             );
-        let menu_origin_point = if ax_blind_signout {
+        let ax_blind_signout =
+            ax_blind_menu && matches!(spec.verifier, VerifierKind::AuthSignedOut);
+        let menu_origin_point = if ax_blind_menu {
             visual_opener_point(browser, &elements, &clicked).await
         } else {
             None
@@ -2936,7 +2968,7 @@ pub async fn pursue_chrome_action_with_vision<B: ChromeActionBrowser>(
         // without a vision model. A miss without a click falls through to
         // vision on this same snapshot; a clicked miss re-snapshots and
         // retires vision for the run (the menu has likely closed).
-        if ax_blind_signout {
+        if ax_blind_menu {
             match text_lane_step(
                 browser,
                 origin,
