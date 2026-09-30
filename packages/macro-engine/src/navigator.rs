@@ -97,6 +97,241 @@ pub trait PageNavigator: Send + Sync {
         let _ = (target, screenshot_jpeg_b64);
         VisualLocation::Unsupported
     }
+
+    /// Harness entry point for one model turn: the element list, the
+    /// optional screenshot, and the harness notes (stale-ref signals, loop
+    /// nudges, a rejected `done`) accumulated since the last turn. Returns
+    /// the proposed actions in order — normally exactly one; a model that
+    /// over-answers with several is executed as a batch that halts on the
+    /// first page change or failure — or `None` on any failure.
+    ///
+    /// The default drops the notes and delegates to
+    /// [`PageNavigator::next_action_visual`], so existing implementers keep
+    /// working; navigators that talk to a model override this to render
+    /// the notes into the (fixed-shape) user message.
+    fn next_turn(&self, turn: &NavigatorTurn<'_>) -> Option<Vec<PageAction>> {
+        self.next_action_visual(
+            turn.goal,
+            turn.elements,
+            turn.zones,
+            turn.screenshot_jpeg_b64,
+        )
+        .map(|action| vec![action])
+    }
+
+    /// Whether a screenshot attached to the next turn would reach the
+    /// model. The harness skips the capture (and journals why) when this
+    /// is `false` — e.g. after a text-only model rejected the image part.
+    /// The default is `true`, so existing implementers keep their shape.
+    fn accepts_screenshots(&self) -> bool {
+        true
+    }
+}
+
+/// One model turn's input, as the harness hands it to
+/// [`PageNavigator::next_turn`]. `zones[i]` describes `elements[i]`;
+/// `notes` are plain-language harness signals for this turn only (never
+/// page content, never credentials).
+#[derive(Clone, Copy, Debug)]
+pub struct NavigatorTurn<'a> {
+    pub goal: &'a str,
+    pub elements: &'a [AxElement],
+    pub zones: &'a [Option<PositionZone>],
+    pub screenshot_jpeg_b64: Option<&'a str>,
+    pub notes: &'a [String],
+}
+
+// ---- Model-phase harness policy (pure; the loop lives in the executor) ----
+
+/// Trailing window of normalized actions the loop detector counts
+/// repeats over.
+pub const LOOP_WINDOW: usize = 20;
+
+/// Repeat counts (of one normalized action inside [`LOOP_WINDOW`]) at
+/// which the model gets an escalating plain-language nudge.
+pub const LOOP_NUDGE_REPEATS: [usize; 3] = [5, 8, 12];
+
+/// Consecutive unchanged page observations (same host+path and the same
+/// control set) before the page-stagnation nudge.
+pub const STAGNATION_NUDGE_TURNS: usize = 3;
+
+/// Most actions executed from one model reply. The vocabulary asks for
+/// exactly one; anything past this is skipped and journaled.
+pub const MAX_BATCH_ACTIONS: usize = 3;
+
+/// Stale-ref re-reads per pass: a model that keeps naming ids the live
+/// page no longer has stops acting after this many.
+pub const MAX_STALE_REREADS: usize = 2;
+
+/// Rejected `done` claims per pass: after this many the next `done` ends
+/// the pass (the verification tail still runs).
+pub const MAX_DONE_REJECTIONS: usize = 1;
+
+/// Screenshots attached per pass — the bound on vision spend.
+pub const MAX_SCREENSHOTS_PER_PASS: usize = 3;
+
+/// A snapshot with at most this many actionable controls is treated as
+/// canvas-heavy / opaque to the AX tree, and earns a screenshot.
+pub const SPARSE_TREE_ELEMENTS: usize = 3;
+
+/// Why a screenshot accompanies a model turn. Screenshots are on demand,
+/// never every step: the model is stateless per turn, so no screenshot
+/// history is ever resent either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenshotReason {
+    /// First look at the page in this pass.
+    FirstTurn,
+    /// The turn after a rejected `done`: the model re-checks visually.
+    VerifyTurn,
+    /// The AX tree exposes almost nothing (canvas-heavy page).
+    SparseTree,
+}
+
+impl std::fmt::Display for ScreenshotReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            ScreenshotReason::FirstTurn => "first-turn",
+            ScreenshotReason::VerifyTurn => "verify-turn",
+            ScreenshotReason::SparseTree => "sparse-tree",
+        })
+    }
+}
+
+/// Screenshot policy for one turn: `turn` is the 0-based turn index in
+/// the pass, `verify_turn` marks the turn after a rejected `done`,
+/// `snapshot_len` is the full actionable-control count, `sent` how many
+/// screenshots this pass already attached. `None` means text-only.
+#[must_use]
+pub fn screenshot_reason(
+    turn: usize,
+    verify_turn: bool,
+    snapshot_len: usize,
+    sent: usize,
+) -> Option<ScreenshotReason> {
+    if sent >= MAX_SCREENSHOTS_PER_PASS {
+        return None;
+    }
+    if verify_turn {
+        Some(ScreenshotReason::VerifyTurn)
+    } else if turn == 0 {
+        Some(ScreenshotReason::FirstTurn)
+    } else if snapshot_len <= SPARSE_TREE_ELEMENTS {
+        Some(ScreenshotReason::SparseTree)
+    } else {
+        None
+    }
+}
+
+/// A model action normalized for loop detection: clicks key on what the
+/// user perceives (role + trimmed lowercase name), never the snapshot's
+/// node id, so a re-rendered control still counts as the same action.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NormalizedAction {
+    Click {
+        role: String,
+        name: String,
+    },
+    /// A click on an id the live page does not have.
+    StaleClick,
+    Done,
+    GiveUp,
+}
+
+impl NormalizedAction {
+    /// Normalized click on `element`.
+    #[must_use]
+    pub fn click(element: &AxElement) -> Self {
+        Self::Click {
+            role: element.role.clone(),
+            name: element.name.trim().to_lowercase(),
+        }
+    }
+}
+
+/// Deterministic 64-bit hash of anything hashable (std's `SipHash` with
+/// fixed keys: stable within a process, which is all a run needs).
+fn stable_hash<T: std::hash::Hash + ?Sized>(value: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Fingerprint of the live page for stagnation detection and batch
+/// halting: host + path (query and fragment ignored) plus the ordered
+/// role+name set of the actionable controls. Node ids are excluded — a
+/// re-render that changes nothing visible is not a page change.
+#[must_use]
+pub fn page_fingerprint(url: Option<&url::Url>, elements: &[AxElement]) -> u64 {
+    let location = url.map_or_else(String::new, |url| {
+        format!("{}{}", url.host_str().unwrap_or(""), url.path())
+    });
+    let controls: Vec<(&str, String)> = elements
+        .iter()
+        .map(|element| (element.role.as_str(), element.name.trim().to_lowercase()))
+        .collect();
+    stable_hash(&(location, controls))
+}
+
+/// Loop detection over normalized action hashes plus page stagnation.
+/// Pure: the loop feeds it every proposed action and every observation,
+/// and turns the returned nudge (if any) into a harness note + journal
+/// line. Nudges escalate at [`LOOP_NUDGE_REPEATS`]; the stagnation nudge
+/// fires every [`STAGNATION_NUDGE_TURNS`] unchanged observations.
+#[derive(Debug, Default)]
+pub struct LoopDetector {
+    window: std::collections::VecDeque<u64>,
+    last_page: Option<u64>,
+    stagnant: usize,
+}
+
+impl LoopDetector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one proposed action; `Some(nudge)` when its repeat count in
+    /// the trailing window hits a [`LOOP_NUDGE_REPEATS`] threshold.
+    pub fn record_action(&mut self, action: &NormalizedAction) -> Option<String> {
+        let key = stable_hash(action);
+        self.window.push_back(key);
+        while self.window.len() > LOOP_WINDOW {
+            self.window.pop_front();
+        }
+        let repeats = self.window.iter().filter(|seen| **seen == key).count();
+        let level = LOOP_NUDGE_REPEATS
+            .iter()
+            .position(|threshold| *threshold == repeats)?;
+        Some(match level {
+            0 => format!(
+                "You have proposed the same action {repeats} times and it has not advanced the goal. Try a different control."
+            ),
+            1 => format!(
+                "Still repeating the same action ({repeats} times). Choose a clearly different control, or give_up if none can advance the goal."
+            ),
+            _ => format!(
+                "The same action has been proposed {repeats} times. Stop repeating it: pick a different control or give_up."
+            ),
+        })
+    }
+
+    /// Record one page observation; `Some(nudge)` when the page has not
+    /// changed for [`STAGNATION_NUDGE_TURNS`] consecutive observations.
+    pub fn record_page(&mut self, fingerprint: u64) -> Option<String> {
+        if self.last_page == Some(fingerprint) {
+            self.stagnant += 1;
+        } else {
+            self.stagnant = 0;
+        }
+        self.last_page = Some(fingerprint);
+        (self.stagnant > 0 && self.stagnant.is_multiple_of(STAGNATION_NUDGE_TURNS)).then(|| {
+            format!(
+                "The page has not changed over the last {} actions. Your clicks are having no visible effect; try a different control or give_up.",
+                self.stagnant
+            )
+        })
+    }
 }
 
 /// Answer to a [`PageNavigator::locate_visual`] query. Coordinates are the

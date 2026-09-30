@@ -898,6 +898,22 @@ impl PageGoalOutcome {
         }
         self
     }
+
+    /// Append the model-harness journal lines found in a tried-journal to
+    /// a `Verified` outcome's `tried_lines`, so a model-phase completion
+    /// carries its turn/verdict record. Other variants pass through.
+    #[must_use]
+    fn with_model_lines(mut self, tried: &[String]) -> Self {
+        if let Self::Verified { tried_lines, .. } = &mut self {
+            tried_lines.extend(
+                tried
+                    .iter()
+                    .filter(|line| is_model_harness_line(line))
+                    .cloned(),
+            );
+        }
+        self
+    }
 }
 
 /// In-page follow-up budget: observe-act steps before the pursuit gives up
@@ -4663,6 +4679,55 @@ struct ModelLoopState {
     tried: Vec<String>,
     last_label: Option<String>,
     revealed_username: Option<String>,
+    /// Normalized-action and page-stagnation loop detection, per run (the
+    /// escalation pass inherits the main pass's history).
+    loop_detector: crate::navigator::LoopDetector,
+}
+
+/// Per-pass harness bookkeeping for [`model_loop_pass`]: the notes queued
+/// for the next turn and the bounded counters. Reset for the escalation
+/// pass, so a fresh model gets its own budget.
+#[derive(Default)]
+struct ModelPassHarness {
+    /// Plain-language harness notes for the next turn only (stale ref,
+    /// loop nudge, rejected `done`).
+    notes: Vec<String>,
+    screenshots_sent: usize,
+    /// The next turn follows a rejected `done` and earns a screenshot.
+    verify_turn: bool,
+    stale_rereads: usize,
+    done_rejections: usize,
+    /// Clicks executed this pass: bounded by the step budget even when a
+    /// model reply carries a batch.
+    clicks: usize,
+    vision_skip_journaled: bool,
+}
+
+/// Fixed per-pass inputs of [`model_loop_pass`]'s helpers.
+struct ModelPassCtx<'a> {
+    origin: &'a url::Url,
+    goal: &'a str,
+    spec: Option<&'a VerbSpec>,
+    max_steps: usize,
+    deterministic_miss: &'a str,
+}
+
+/// Journal prefixes of the model harness: every model call, stale-ref
+/// event, batch halt, loop nudge, screenshot decision and done verdict.
+/// A model-phase `Verified` outcome carries these lines in `tried_lines`.
+const MODEL_HARNESS_PREFIXES: &[&str] = &[
+    "model_turn:",
+    "model_stale_ref:",
+    "model_batch:",
+    "model_loop:",
+    "model_done_verify:",
+    "model_screenshot:",
+];
+
+fn is_model_harness_line(line: &str) -> bool {
+    MODEL_HARNESS_PREFIXES
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
 }
 
 /// Gear 2: the generalist agent loop — observe, propose, act.
@@ -4843,6 +4908,26 @@ async fn model_loop_exit<B: ChromeActionBrowser>(
 /// itself. `max_steps` is the acting budget: [`MODEL_GOAL_MAX_STEPS`]
 /// from the verb's [`IdentityMenuPolicy`].
 ///
+/// Harness (every event journaled with a `model_*:` prefix):
+/// * **Stable refs**: element ids are CDP `backendNodeId`s, and the pick
+///   is resolved against the same snapshot the turn rendered; retry
+///   exclusion and loop detection key on role+name, which survives
+///   re-renders.
+/// * **Stale refs fail loudly**: an id missing from the snapshot, or a
+///   node detached before the click, is never substituted — the next turn
+///   re-reads the page and tells the model (bounded by
+///   [`crate::navigator::MAX_STALE_REREADS`]).
+/// * **Batch halt**: a multi-action reply runs in order and halts at the
+///   first page change or failed action; the rest are journaled as
+///   skipped.
+/// * **Loop detection**: normalized actions and page fingerprints feed a
+///   [`crate::navigator::LoopDetector`]; nudges ride the next turn's
+///   notes.
+/// * **Verify-before-done**: `done` is checked against a fresh read of
+///   the live page by the verb's verifier; a rejection is fed back once
+///   (with a screenshot), then ends the pass.
+/// * **Screenshots on demand**: see [`crate::navigator::screenshot_reason`].
+///
 /// # Errors
 /// Returns [`IntentError::NoMatch`] when the goal is not reached or not
 /// verified, and [`IntentError::Browser`] on CDP failure.
@@ -4860,7 +4945,7 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
     deterministic_miss: &str,
     state: &mut ModelLoopState,
 ) -> Result<PageGoalOutcome, IntentError> {
-    use crate::navigator::PageAction;
+    use crate::navigator::page_fingerprint;
     // Neutral acting state: the previous phase may have left a wrong menu
     // open, whose light-dismiss would swallow the pass's first click.
     // Best-effort no-op when nothing is open.
@@ -4868,67 +4953,61 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
     let policy = spec.map_or(IdentityMenuPolicy::STANDARD, VerbSpec::menu_policy);
     // The header filter's fail-safe line is journaled once per pass.
     let mut filter_fallback_journaled = false;
+    let ctx = ModelPassCtx {
+        origin,
+        goal,
+        spec,
+        max_steps,
+        deterministic_miss,
+    };
+    let mut pass = ModelPassHarness::default();
+    // Fixed for the whole run: the goal text (and the navigator's system
+    // prompt) never change between turns, so a provider's prefix cache
+    // keeps hitting; only the element list and the notes vary.
+    let prompt_goal = model_goal_text(goal, spec);
 
-    for _ in 0..max_steps {
+    for step in 0..max_steps {
         // Untruncated: the pick is validated against the same full list
         // the loop observed — a control past the head truncation is
         // clickable when the model names it.
         let (elements, _, _) = browser.menu_snapshot(origin).await;
-        let prompt_goal = model_goal_text(goal, spec);
-        // The navigator renders the head slice; zones describe exactly
-        // that slice, best-effort — unzoned on failure.
-        let mut head: Vec<AxElement> = elements
-            .iter()
-            .take(crate::MAX_NAVIGATOR_ELEMENTS)
-            .cloned()
-            .collect();
-        // One measurement round feeds both the zones and the header
-        // filter — never a second CDP pass.
-        let points = model_zone_points(browser, &head).await;
-        let mut zones = zones_from_points(&points);
-        // Policy-gated guard: offer the model only header-strip
-        // candidates (see [`header_strip_model_filter`]); the live miss
-        // clicked a feed ad's options button from this very turn.
-        if policy.header_strip_filter
-            && let Some(strip_bottom) = header_strip_bottom(browser).await
-        {
-            (head, zones) = header_strip_model_filter(
-                head,
-                zones,
-                &points,
-                strip_bottom,
-                policy.journal_tag,
-                &mut state.tried,
-                &mut filter_fallback_journaled,
-            );
+        let page_url = browser.settings_current_url().await;
+        let fingerprint = page_fingerprint(page_url.as_ref(), &elements);
+        if let Some(nudge) = state.loop_detector.record_page(fingerprint) {
+            state
+                .tried
+                .push("model_loop: nudge (page unchanged across recent actions)".to_owned());
+            pass.notes.push(nudge);
         }
-        // Phase 2: the visual turn — a best-effort viewport screenshot
-        // accompanies the element list. The capture must never fail the
-        // run: `None` degrades to the text-only turn.
-        let screenshot = browser.menu_screenshot().await;
-        // The navigator is synchronous (one bounded HTTP call); the async
-        // runtime never blocks on it. Everything the closure touches is
-        // owned, so the future stays `'static`.
-        let owned_navigator = navigator.clone();
-        let action = tokio::task::spawn_blocking(move || {
-            owned_navigator.next_action_visual(&prompt_goal, &head, &zones, screenshot.as_deref())
-        })
-        .await
-        .map_err(|_| {
-            IntentError::NoMatch(format!("navigator task failed; {deterministic_miss}"))
-        })?;
+        let (head, zones) = model_turn_head(
+            browser,
+            &elements,
+            policy,
+            &mut state.tried,
+            &mut filter_fallback_journaled,
+        )
+        .await;
+        let (screenshot, shot_label) = model_turn_screenshot(
+            browser,
+            step,
+            elements.len(),
+            navigator.accepts_screenshots(),
+            &mut state.tried,
+            &mut pass,
+        )
+        .await;
+        let turn = ModelTurnInput {
+            goal: prompt_goal.clone(),
+            head,
+            zones,
+            screenshot,
+            shot_label,
+            notes: std::mem::take(&mut pass.notes),
+        };
+        let actions = model_turn_call(&navigator, turn, step, &ctx, &mut state.tried).await?;
         // A decline stops the acting loop; the verification tail — never
         // the model — decides completion.
-        let decline_reason: Option<String> = match &action {
-            None => Some("navigator declined".to_owned()),
-            Some(PageAction::GiveUp { reason }) => Some(format!("navigator gave up ({reason})")),
-            // Done is a decline, not a completion claim: the model never
-            // declares the goal achieved. The tail still runs the
-            // verifier, so a correct page completes on evidence.
-            Some(PageAction::Done) => Some("navigator done (treated as decline)".to_owned()),
-            Some(PageAction::Click { .. }) => None,
-        };
-        if let Some(reason) = decline_reason {
+        let Some(actions) = actions.filter(|actions| !actions.is_empty()) else {
             return model_loop_exit(
                 browser,
                 origin,
@@ -4936,22 +5015,20 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
                 goal,
                 deterministic_miss,
                 state,
-                &reason,
+                "navigator declined",
             )
             .await;
-        }
-        if let Some(PageAction::Click { target }) = action
-            && let Some(outcome) = model_loop_click_arm(
-                browser,
-                origin,
-                goal,
-                spec,
-                &elements,
-                target,
-                deterministic_miss,
-                state,
-            )
-            .await?
+        };
+        if let Some(outcome) = model_loop_turn_actions(
+            browser,
+            &ctx,
+            &elements,
+            fingerprint,
+            actions,
+            state,
+            &mut pass,
+        )
+        .await?
         {
             return Ok(outcome);
         }
@@ -4966,6 +5043,441 @@ async fn model_loop_pass<B: ChromeActionBrowser>(
         &format!("navigator exhausted {max_steps} steps"),
     )
     .await
+}
+
+/// Owned inputs of one model call (moved onto the blocking thread).
+struct ModelTurnInput {
+    goal: String,
+    head: Vec<AxElement>,
+    zones: Vec<Option<crate::navigator::PositionZone>>,
+    screenshot: Option<String>,
+    /// Journal label of the screenshot decision (`first-turn`, `none`, …).
+    shot_label: String,
+    notes: Vec<String>,
+}
+
+/// One model call, journaled: exactly one `model_turn:` line per call
+/// (step, rendered element count, screenshot decision, note count, the
+/// reply), plus a `model_screenshot:` line when the navigator rejected
+/// the attached image. The navigator is synchronous (one bounded HTTP
+/// call); the async runtime never blocks on it — everything the closure
+/// touches is owned, so the future stays `'static`.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the blocking task fails.
+async fn model_turn_call(
+    navigator: &std::sync::Arc<dyn crate::navigator::PageNavigator>,
+    turn: ModelTurnInput,
+    step: usize,
+    ctx: &ModelPassCtx<'_>,
+    tried: &mut Vec<String>,
+) -> Result<Option<Vec<crate::navigator::PageAction>>, IntentError> {
+    let attached = turn.screenshot.is_some();
+    let journal_head = format!(
+        "model_turn: step {}/{} elements {} screenshot {} notes {}",
+        step + 1,
+        ctx.max_steps,
+        turn.head.len(),
+        turn.shot_label,
+        turn.notes.len(),
+    );
+    let owned_navigator = navigator.clone();
+    let actions = tokio::task::spawn_blocking(move || {
+        owned_navigator.next_turn(&crate::navigator::NavigatorTurn {
+            goal: &turn.goal,
+            elements: &turn.head,
+            zones: &turn.zones,
+            screenshot_jpeg_b64: turn.screenshot.as_deref(),
+            notes: &turn.notes,
+        })
+    })
+    .await
+    .map_err(|_| {
+        IntentError::NoMatch(format!("navigator task failed; {}", ctx.deterministic_miss))
+    })?;
+    tried.push(format!(
+        "{journal_head} -> {}",
+        describe_model_actions(actions.as_deref())
+    ));
+    if attached && !navigator.accepts_screenshots() {
+        tried.push(
+            "model_screenshot: navigator rejected the image; text-only for the rest of the run"
+                .to_owned(),
+        );
+    }
+    Ok(actions)
+}
+
+/// The element slice one model turn renders, with its 1:1 zones. The
+/// navigator renders the head slice ([`crate::MAX_NAVIGATOR_ELEMENTS`]);
+/// zones describe exactly that slice, best-effort — unzoned on failure.
+/// One measurement round feeds both the zones and the policy-gated
+/// header-strip filter — never a second CDP pass.
+async fn model_turn_head<B: MenuBrowser>(
+    browser: &B,
+    elements: &[AxElement],
+    policy: IdentityMenuPolicy,
+    tried: &mut Vec<String>,
+    filter_fallback_journaled: &mut bool,
+) -> (Vec<AxElement>, Vec<Option<crate::navigator::PositionZone>>) {
+    let head: Vec<AxElement> = elements
+        .iter()
+        .take(crate::MAX_NAVIGATOR_ELEMENTS)
+        .cloned()
+        .collect();
+    let points = model_zone_points(browser, &head).await;
+    let zones = zones_from_points(&points);
+    // Policy-gated guard: offer the model only header-strip candidates
+    // (see [`header_strip_model_filter`]); the live miss clicked a feed
+    // ad's options button from this very turn.
+    if policy.header_strip_filter
+        && let Some(strip_bottom) = header_strip_bottom(browser).await
+    {
+        return header_strip_model_filter(
+            head,
+            zones,
+            &points,
+            strip_bottom,
+            policy.journal_tag,
+            tried,
+            filter_fallback_journaled,
+        );
+    }
+    (head, zones)
+}
+
+/// Screenshots on demand, never every step: first look, the turn after a
+/// rejected `done`, or a page the AX tree can't describe — capped per
+/// pass (see [`crate::navigator::screenshot_reason`]). Skipped when the
+/// navigator can't use an image (journaled once per pass). The capture
+/// must never fail the run: `None` degrades to the text-only turn.
+/// Returns the screenshot and its journal label.
+async fn model_turn_screenshot<B: MenuBrowser>(
+    browser: &B,
+    step: usize,
+    snapshot_len: usize,
+    navigator_has_vision: bool,
+    tried: &mut Vec<String>,
+    pass: &mut ModelPassHarness,
+) -> (Option<String>, String) {
+    let reason = crate::navigator::screenshot_reason(
+        step,
+        std::mem::take(&mut pass.verify_turn),
+        snapshot_len,
+        pass.screenshots_sent,
+    );
+    match reason {
+        None => (None, "none".to_owned()),
+        Some(reason) if !navigator_has_vision => {
+            if !pass.vision_skip_journaled {
+                pass.vision_skip_journaled = true;
+                tried.push(format!(
+                    "model_screenshot: skipped ({reason}; navigator has no vision), text-only"
+                ));
+            }
+            (None, "none".to_owned())
+        }
+        Some(reason) => match browser.menu_screenshot().await {
+            Some(shot) => {
+                pass.screenshots_sent += 1;
+                (Some(shot), reason.to_string())
+            }
+            None => (None, format!("none ({reason}: capture failed)")),
+        },
+    }
+}
+
+/// Journal rendering of one model reply: `declined`, or the actions in
+/// order (`click 42`, `done`, `give_up (reason)`).
+fn describe_model_actions(actions: Option<&[crate::navigator::PageAction]>) -> String {
+    use crate::navigator::PageAction;
+    match actions {
+        None | Some([]) => "declined".to_owned(),
+        Some(actions) => actions
+            .iter()
+            .map(|action| match action {
+                PageAction::Click { target } => format!("click {target}"),
+                PageAction::Done => "done".to_owned(),
+                PageAction::GiveUp { reason } => format!("give_up ({reason})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Journal the unexecuted tail of a batch as explicit skip results.
+fn journal_batch_skip(
+    tried: &mut Vec<String>,
+    actions: &[crate::navigator::PageAction],
+    executed: usize,
+    why: &str,
+) {
+    if actions.len() <= executed {
+        return;
+    }
+    tried.push(format!(
+        "model_batch: halted after {executed} of {} actions ({why}); skipped [{}]",
+        actions.len(),
+        describe_model_actions(Some(&actions[executed..])),
+    ));
+}
+
+/// Execute one model reply's actions in order, halting at the first page
+/// change or failure. `elements`/`fingerprint` are the snapshot the turn
+/// rendered: every action after the first requires the live page to
+/// still match it, so a stale batch never runs on a new page.
+///
+/// Returns `Some` when the run ends here, `None` to observe again.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the pass ends unverified, and
+/// [`IntentError::Browser`] on CDP failure.
+async fn model_loop_turn_actions<B: ChromeActionBrowser>(
+    browser: &B,
+    ctx: &ModelPassCtx<'_>,
+    elements: &[AxElement],
+    fingerprint: u64,
+    actions: Vec<crate::navigator::PageAction>,
+    state: &mut ModelLoopState,
+    pass: &mut ModelPassHarness,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    use crate::navigator::{MAX_BATCH_ACTIONS, NormalizedAction, PageAction, page_fingerprint};
+    for (index, action) in actions.iter().enumerate() {
+        if index > 0 {
+            if index >= MAX_BATCH_ACTIONS {
+                journal_batch_skip(&mut state.tried, &actions, index, "batch cap");
+                return Ok(None);
+            }
+            let (fresh, _, _) = browser.menu_snapshot(ctx.origin).await;
+            let url = browser.settings_current_url().await;
+            if page_fingerprint(url.as_ref(), &fresh) != fingerprint {
+                journal_batch_skip(&mut state.tried, &actions, index, "page changed");
+                return Ok(None);
+            }
+        }
+        match action {
+            PageAction::GiveUp { reason } => {
+                journal_batch_skip(&mut state.tried, &actions, index + 1, "turn ended");
+                let _ = state.loop_detector.record_action(&NormalizedAction::GiveUp);
+                return model_loop_exit(
+                    browser,
+                    ctx.origin,
+                    ctx.spec,
+                    ctx.goal,
+                    ctx.deterministic_miss,
+                    state,
+                    &format!("navigator gave up ({reason})"),
+                )
+                .await
+                .map(Some);
+            }
+            PageAction::Done => {
+                journal_batch_skip(&mut state.tried, &actions, index + 1, "turn ended");
+                if let Some(nudge) = state.loop_detector.record_action(&NormalizedAction::Done) {
+                    journal_loop_nudge(state, pass, nudge);
+                }
+                return model_loop_done(browser, ctx, state, pass).await;
+            }
+            PageAction::Click { target } => {
+                if pass.clicks >= ctx.max_steps {
+                    journal_batch_skip(&mut state.tried, &actions, index, "click budget spent");
+                    return Ok(None);
+                }
+                let element = match resolve_live_target(browser, elements, *target).await {
+                    Ok(element) => element,
+                    Err(why) => {
+                        journal_batch_skip(&mut state.tried, &actions, index + 1, "stale ref");
+                        return model_loop_stale_ref(browser, ctx, state, pass, *target, why).await;
+                    }
+                };
+                if let Some(nudge) = state
+                    .loop_detector
+                    .record_action(&NormalizedAction::click(element))
+                {
+                    journal_loop_nudge(state, pass, nudge);
+                }
+                pass.clicks += 1;
+                if let Some(outcome) = model_loop_click_arm(
+                    browser,
+                    ctx.origin,
+                    ctx.goal,
+                    ctx.spec,
+                    elements,
+                    *target,
+                    ctx.deterministic_miss,
+                    state,
+                )
+                .await?
+                {
+                    return Ok(Some(outcome));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Queue a loop nudge for the next turn and journal it.
+fn journal_loop_nudge(state: &mut ModelLoopState, pass: &mut ModelPassHarness, nudge: String) {
+    state
+        .tried
+        .push(format!("model_loop: nudge (repeated action): {nudge}"));
+    pass.notes.push(nudge);
+}
+
+/// Resolve the model's pick on the live page: the id must be in the
+/// snapshot the turn rendered AND the node must still have a box — a
+/// node detached between snapshot and click would otherwise surface as a
+/// CDP failure and abort the run. Never substitutes another element.
+async fn resolve_live_target<'a, B: MenuBrowser>(
+    browser: &B,
+    elements: &'a [AxElement],
+    target: i64,
+) -> Result<&'a AxElement, &'static str> {
+    let element = elements
+        .iter()
+        .find(|element| element.backend_node_id == target)
+        .ok_or("is not on the live page")?;
+    browser
+        .menu_node_rect(target)
+        .await
+        .map(|_| element)
+        .map_err(|_| "detached or hidden before the click")
+}
+
+/// Stale ref: journal it loudly, hand the model a fresh read with a
+/// "stale ref, re-read" note, and let it decide again — bounded by
+/// [`crate::navigator::MAX_STALE_REREADS`], after which the pass ends in
+/// the verification tail.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the pass ends unverified, and
+/// [`IntentError::Browser`] on CDP failure.
+async fn model_loop_stale_ref<B: ChromeActionBrowser>(
+    browser: &B,
+    ctx: &ModelPassCtx<'_>,
+    state: &mut ModelLoopState,
+    pass: &mut ModelPassHarness,
+    target: i64,
+    why: &str,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    use crate::navigator::{MAX_STALE_REREADS, NormalizedAction};
+    pass.stale_rereads += 1;
+    if let Some(nudge) = state
+        .loop_detector
+        .record_action(&NormalizedAction::StaleClick)
+    {
+        journal_loop_nudge(state, pass, nudge);
+    }
+    if pass.stale_rereads > MAX_STALE_REREADS {
+        state.tried.push(format!(
+            "model_stale_ref: element {target} {why}; re-read budget ({MAX_STALE_REREADS}) spent, ending the pass"
+        ));
+        return model_loop_exit(
+            browser,
+            ctx.origin,
+            ctx.spec,
+            ctx.goal,
+            ctx.deterministic_miss,
+            state,
+            "navigator kept naming stale elements",
+        )
+        .await
+        .map(Some);
+    }
+    state.tried.push(format!(
+        "model_stale_ref: element {target} {why}; not substituted, re-reading the page"
+    ));
+    pass.notes.push(format!(
+        "Element {target} from your last answer is no longer on the page (stale ref). The element list is a fresh read of the page; choose again from it."
+    ));
+    Ok(None)
+}
+
+/// Verify-before-done: the model's `done` is a claim, not a completion.
+/// Re-read the live page through the verb's verifier and journal the
+/// verdict. Confirmed → `Verified` (the verifier decided). Rejected →
+/// fed back to the model once, with a screenshot on the next turn; a
+/// second rejection ends the pass. Without a verb spec there is no
+/// verifier, so `done` stays a decline.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the pass ends unverified, and
+/// [`IntentError::Browser`] on CDP failure.
+async fn model_loop_done<B: ChromeActionBrowser>(
+    browser: &B,
+    ctx: &ModelPassCtx<'_>,
+    state: &mut ModelLoopState,
+    pass: &mut ModelPassHarness,
+) -> Result<Option<PageGoalOutcome>, IntentError> {
+    use crate::navigator::MAX_DONE_REJECTIONS;
+    let Some(spec) = ctx.spec else {
+        state.tried.push(
+            "model_done_verify: no verifier for this goal; done treated as decline".to_owned(),
+        );
+        return model_loop_exit(
+            browser,
+            ctx.origin,
+            ctx.spec,
+            ctx.goal,
+            ctx.deterministic_miss,
+            state,
+            "navigator done (treated as decline)",
+        )
+        .await
+        .map(Some);
+    };
+    if verify_verb(
+        browser,
+        ctx.origin,
+        spec,
+        state.last_label.as_deref().or(Some(ctx.goal)),
+        state.revealed_username.as_deref(),
+    )
+    .await
+    {
+        state
+            .tried
+            .push("model_done_verify: verified on a fresh read of the live page".to_owned());
+        return Ok(Some(
+            model_verified_outcome(
+                browser,
+                ctx.origin,
+                ctx.goal,
+                &state.tried,
+                state.last_label.as_deref(),
+                state.revealed_username.as_deref(),
+            )
+            .await,
+        ));
+    }
+    pass.done_rejections += 1;
+    if pass.done_rejections > MAX_DONE_REJECTIONS {
+        state.tried.push(
+            "model_done_verify: rejected again (goal not met on the live page); ending the pass"
+                .to_owned(),
+        );
+        return model_loop_exit(
+            browser,
+            ctx.origin,
+            ctx.spec,
+            ctx.goal,
+            ctx.deterministic_miss,
+            state,
+            "navigator done (verifier rejected)",
+        )
+        .await
+        .map(Some);
+    }
+    state.tried.push(
+        "model_done_verify: rejected (goal not met on the live page); model continues".to_owned(),
+    );
+    pass.notes.push(
+        "You answered done, but a fresh read of the live page shows the goal is NOT achieved yet. Look again and choose the next action, or give_up."
+            .to_owned(),
+    );
+    pass.verify_turn = true;
+    Ok(None)
 }
 
 /// One model-picked click inside [`pursue_with_model`]: validate the
@@ -5070,7 +5582,8 @@ async fn model_loop_click<B: ChromeActionBrowser>(
                     hit_lines: Vec::new(),
                     tried_lines: Vec::new(),
                 }
-                .with_hit_lines(tried),
+                .with_hit_lines(tried)
+                .with_model_lines(tried),
             ));
         }
         tried.push(tried_label(
@@ -5282,20 +5795,43 @@ async fn model_loop_tail<B: ChromeActionBrowser>(
     )
     .await
     {
-        let landed = browser
-            .settings_current_url()
-            .await
-            .unwrap_or_else(|| origin.clone());
-        return Ok(PageGoalOutcome::Verified {
-            label: last_label.unwrap_or(goal).to_owned(),
-            landed,
-            username: revealed_username.map(str::to_owned),
-            hit_lines: Vec::new(),
-            tried_lines: Vec::new(),
-        }
-        .with_hit_lines(tried));
+        return Ok(model_verified_outcome(
+            browser,
+            origin,
+            goal,
+            tried,
+            last_label,
+            revealed_username,
+        )
+        .await);
     }
     Err(IntentError::NoMatch(journal))
+}
+
+/// The model phase's `Verified` outcome, built only after the verifier
+/// passed: the landed URL read from the live page, click evidence in
+/// `hit_lines`, and the model-harness journal in `tried_lines`.
+async fn model_verified_outcome<B: SettingsBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    goal: &str,
+    tried: &[String],
+    last_label: Option<&str>,
+    revealed_username: Option<&str>,
+) -> PageGoalOutcome {
+    let landed = browser
+        .settings_current_url()
+        .await
+        .unwrap_or_else(|| origin.clone());
+    PageGoalOutcome::Verified {
+        label: last_label.unwrap_or(goal).to_owned(),
+        landed,
+        username: revealed_username.map(str::to_owned),
+        hit_lines: Vec::new(),
+        tried_lines: Vec::new(),
+    }
+    .with_hit_lines(tried)
+    .with_model_lines(tried)
 }
 
 /// Wait for the live page's URL to change from what it is now: shared by

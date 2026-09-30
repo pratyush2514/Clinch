@@ -51,7 +51,7 @@
 
 use crate::domain_grounder::GrounderProvider;
 use macro_engine::{
-    MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone, VisualLocation,
+    MAX_NAVIGATOR_ELEMENTS, NavigatorTurn, PageAction, PageNavigator, PositionZone, VisualLocation,
 };
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -72,7 +72,7 @@ const MAX_NAME_CHARS: usize = 60;
 /// The single instruction both providers receive. It names no sites and no
 /// controls — the only page knowledge in the call is the rendered element
 /// list in the user line.
-const SYSTEM_PROMPT: &str = "You are a web page navigator. Given a goal and a numbered list of page elements, reply with ONLY one JSON object describing the next single action — no other text.\n\n{\"action\": \"click\", \"target\": 42} — click the element with this id\n{\"action\": \"done\"} — the goal is already achieved on this page; nothing to click\n{\"action\": \"give_up\", \"reason\": \"brief reason\"} — no element can advance the goal\n\nRules: target must be an id from the list. Prefer elements whose visible name relates to the goal. A [zone] suffix like [top-right] names the element's coarse on-page position — account controls usually live there. If the goal hides behind a menu, click the menu button first. You may also receive a screenshot of the page; use it to identify controls visually, e.g. the account avatar in the top-right. Reply with element ids from the list only — never coordinates.";
+const SYSTEM_PROMPT: &str = "You are a web page navigator. Given a goal and a numbered list of page elements, reply with ONLY one JSON object describing the next single action — no other text.\n\n{\"action\": \"click\", \"target\": 42} — click the element with this id\n{\"action\": \"done\"} — the goal is already achieved on this page; nothing to click\n{\"action\": \"give_up\", \"reason\": \"brief reason\"} — no element can advance the goal\n\nRules: target must be an id from the list. Prefer elements whose visible name relates to the goal. A [zone] suffix like [top-right] names the element's coarse on-page position — account controls usually live there. If the goal hides behind a menu, click the menu button first. You may also receive a screenshot of the page; use it to identify controls visually, e.g. the account avatar in the top-right. Reply with element ids from the list only — never coordinates. The user message may end with harness notes (a stale element id, a repeated action, a rejected done); take them into account.";
 
 /// Raw environment values for navigator construction.
 /// [`LlmPageNavigator::from_env`] reads the process environment into this;
@@ -481,6 +481,26 @@ impl LlmPageNavigator {
             .ok()?;
         payload.get("response")?.as_str().map(str::to_owned)
     }
+
+    /// One provider call for a rendered element block, with or without a
+    /// screenshot; the raw reply content, or `None` on any failure.
+    fn complete(
+        &self,
+        goal: &str,
+        rendered: &str,
+        screenshot_jpeg_b64: Option<&str>,
+    ) -> Option<String> {
+        match self.provider {
+            GrounderProvider::Groq => match screenshot_jpeg_b64 {
+                Some(b64) => self.groq_completion_visual(goal, rendered, b64),
+                None => self.groq_completion(goal, rendered),
+            },
+            GrounderProvider::Ollama => match screenshot_jpeg_b64 {
+                Some(b64) => self.ollama_generate_visual(goal, rendered, b64),
+                None => self.ollama_generate(goal, rendered),
+            },
+        }
+    }
 }
 
 impl PageNavigator for LlmPageNavigator {
@@ -510,17 +530,20 @@ impl PageNavigator for LlmPageNavigator {
         screenshot_jpeg_b64: Option<&str>,
     ) -> Option<PageAction> {
         let rendered = render_elements(elements, zones);
-        let content = match self.provider {
-            GrounderProvider::Groq => match screenshot_jpeg_b64 {
-                Some(b64) => self.groq_completion_visual(goal, &rendered, b64)?,
-                None => self.groq_completion(goal, &rendered)?,
-            },
-            GrounderProvider::Ollama => match screenshot_jpeg_b64 {
-                Some(b64) => self.ollama_generate_visual(goal, &rendered, b64)?,
-                None => self.ollama_generate(goal, &rendered)?,
-            },
-        };
+        let content = self.complete(goal, &rendered, screenshot_jpeg_b64)?;
         parse_page_action(&content)
+    }
+
+    fn next_turn(&self, turn: &NavigatorTurn<'_>) -> Option<Vec<PageAction>> {
+        let rendered = with_harness_notes(render_elements(turn.elements, turn.zones), turn.notes);
+        let content = self.complete(turn.goal, &rendered, turn.screenshot_jpeg_b64)?;
+        parse_page_actions(&content)
+    }
+
+    fn accepts_screenshots(&self) -> bool {
+        !self
+            .vision_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn locate_visual(&self, target: &str, screenshot_jpeg_b64: &str) -> VisualLocation {
@@ -654,6 +677,47 @@ fn render_elements(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Append the harness notes after the element list: the user message keeps
+/// one fixed shape (`goal`, `elements`, then optional `harness notes`), so
+/// the system prompt and message layout never change between turns.
+#[must_use]
+pub fn with_harness_notes(rendered: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return rendered;
+    }
+    let lines: Vec<String> = notes.iter().map(|note| format!("- {note}")).collect();
+    format!("{rendered}\nharness notes:\n{}", lines.join("\n"))
+}
+
+/// Parse the model's reply into the actions it proposed, in order: one
+/// [`PageAction`] (the contract), or a JSON array of them (a model that
+/// over-answered — the harness runs it as a batch that halts on the first
+/// page change). Same tolerance as [`parse_page_action`]; an array with
+/// any element outside the closed enum declines as a whole.
+#[must_use]
+pub fn parse_page_actions(content: &str) -> Option<Vec<PageAction>> {
+    if let Some(action) = parse_page_action(content) {
+        return Some(vec![action]);
+    }
+    let trimmed = content.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map_or(trimmed, str::trim);
+    serde_json::from_str::<Vec<PageAction>>(unfenced)
+        .ok()
+        .or_else(|| {
+            let start = unfenced.find('[')?;
+            let end = unfenced.rfind(']')?;
+            if end <= start {
+                return None;
+            }
+            serde_json::from_str(unfenced[start..=end].trim()).ok()
+        })
+        .filter(|actions| !actions.is_empty())
 }
 
 /// Parse one [`PageAction`] from the model's strict-JSON reply. Tolerates

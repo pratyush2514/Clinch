@@ -26,7 +26,10 @@ pub use executor::{
     visual_target_description, wait_for_settled_candidates,
 };
 pub use navigator::{
-    MAX_NAVIGATOR_ELEMENTS, PageAction, PageNavigator, PositionZone, VisualLocation,
+    LOOP_NUDGE_REPEATS, LOOP_WINDOW, LoopDetector, MAX_BATCH_ACTIONS, MAX_DONE_REJECTIONS,
+    MAX_NAVIGATOR_ELEMENTS, MAX_SCREENSHOTS_PER_PASS, MAX_STALE_REREADS, NavigatorTurn,
+    NormalizedAction, PageAction, PageNavigator, PositionZone, SPARSE_TREE_ELEMENTS,
+    STAGNATION_NUDGE_TURNS, ScreenshotReason, VisualLocation, page_fingerprint, screenshot_reason,
     visual_point_to_pixels, zone_for,
 };
 use serde::{Deserialize, Serialize};
