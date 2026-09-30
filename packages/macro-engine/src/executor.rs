@@ -5697,20 +5697,18 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     let Some(spec) = spec else {
         // Generic noun hunt: no verifier exists, so a navigation ends the
         // loop as before.
-        return Ok(match wait_for_url_change(browser).await {
-            Some(landed) => Some(
+        if let Some(landed) = wait_for_url_change(browser).await {
+            return Ok(Some(
                 PageGoalOutcome::Navigated {
                     label,
                     landed,
                     hit_lines: Vec::new(),
                 }
                 .with_hit_lines(tried),
-            ),
-            None => {
-                tried.push(tried_label(element, "clicked, no navigation"));
-                None
-            }
-        });
+            ));
+        }
+        tried.push(tried_label(element, "clicked, no navigation"));
+        return Ok(None);
     };
     // The verifier decides after every click, polled while the page
     // settles: a verified landing ends the loop at once, and a page that
