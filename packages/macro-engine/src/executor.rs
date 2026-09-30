@@ -5554,9 +5554,7 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     {
         *revealed_username = username_from_menu_text(&label);
     }
-    let journal_before = tried.len();
-    browser.menu_click_reported(element, tried).await?;
-    ensure_click_hit_line(tried, journal_before, element);
+    model_click_dispatch(browser, element, tried, deterministic_miss).await?;
     clicked.push(ClickedControl::of(element));
     *last_label = Some(label.clone());
     let navigated = wait_for_url_change(browser).await;
@@ -5613,6 +5611,38 @@ async fn model_loop_click<B: ChromeActionBrowser>(
         tried.push(tried_label(element, "clicked, no navigation"));
     }
     Ok(None)
+}
+
+/// Dispatch one model-picked click with its evidence: exactly one
+/// `click_hit_test:` line on success. A click the browser refused to
+/// dispatch (e.g. a target still outside the viewport after scrolling)
+/// is journaled as `model_click: not dispatched (<why>)` and ends the run
+/// as the honest miss carrying the whole trail — never silently.
+///
+/// # Errors
+/// Returns [`IntentError::NoMatch`] when the click was not dispatched,
+/// and [`IntentError::Browser`] on CDP failure.
+async fn model_click_dispatch<B: MenuBrowser>(
+    browser: &B,
+    element: &AxElement,
+    tried: &mut Vec<String>,
+    deterministic_miss: &str,
+) -> Result<(), IntentError> {
+    let journal_before = tried.len();
+    match browser.menu_click_reported(element, tried).await {
+        Ok(()) => {
+            ensure_click_hit_line(tried, journal_before, element);
+            Ok(())
+        }
+        Err(IntentError::NoMatch(reason)) => {
+            tried.push(format!("model_click: not dispatched ({reason})"));
+            Err(IntentError::NoMatch(format!(
+                "navigator's pick was not clicked; tried [{}]; {deterministic_miss}",
+                tried.join("; ")
+            )))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Every model-issued click carries exactly one `click_hit_test:` line,
@@ -6380,11 +6410,59 @@ pub async fn click_batch_with<D: BatchDriver>(
 ///
 /// # Errors
 /// Returns [`IntentError::Browser`] on CDP failure.
+/// Center of a measured rect, in the viewport-relative CSS pixels the box
+/// model, `Input.dispatchMouseEvent`, and `elementFromPoint` all share.
+fn rect_center(highlight: &Highlight) -> (f64, f64) {
+    (
+        highlight.x + highlight.width / 2.0,
+        highlight.y + highlight.height / 2.0,
+    )
+}
+
+/// Whether a click point lies inside the live viewport `(width, height)`
+/// (`window.innerWidth × innerHeight`, same CSS-pixel space as the point).
+/// Pure and unit-tested: a point outside receives no element, so the press
+/// would land on nothing.
+#[must_use]
+pub fn click_point_in_viewport(point: (f64, f64), viewport: (f64, f64)) -> bool {
+    let (x, y) = point;
+    let (width, height) = viewport;
+    x.is_finite()
+        && y.is_finite()
+        && width > 0.0
+        && height > 0.0
+        && (0.0..width).contains(&x)
+        && (0.0..height).contains(&y)
+}
+
 async fn click_element_reported(
     browser: &ManagedBrowser,
     element: &AxElement,
 ) -> Result<IntentOutcome, IntentError> {
-    let highlight = browser.node_rect(element.backend_node_id).await?;
+    let mut highlight = browser.node_rect(element.backend_node_id).await?;
+    // Box-model coordinates are viewport-relative: a node below the fold
+    // measures past the viewport, and a press dispatched there lands on
+    // nothing. Only then: scroll it into view and re-measure. A target
+    // already on screen takes the exact path it always did.
+    let mut scrolled_from: Option<(f64, f64)> = None;
+    if let Some(viewport) = browser.viewport_size().await {
+        let center = rect_center(&highlight);
+        if !click_point_in_viewport(center, viewport) {
+            let _ = browser.scroll_node_into_view(element.backend_node_id).await;
+            highlight = browser.node_rect(element.backend_node_id).await?;
+            let now = rect_center(&highlight);
+            if !click_point_in_viewport(now, viewport) {
+                return Err(IntentError::NoMatch(format!(
+                    "click target outside the viewport at ({}, {}) of {}x{} after scrolling; not clicked",
+                    now.0.round(),
+                    now.1.round(),
+                    viewport.0.round(),
+                    viewport.1.round(),
+                )));
+            }
+            scrolled_from = Some(center);
+        }
+    }
     let mark = Mark {
         index: 0,
         x: highlight.x,
@@ -6404,7 +6482,16 @@ async fn click_element_reported(
             return Err(error.into());
         }
     };
-    let hit_line = hit.journal_line(&element.role, &element.name);
+    let mut hit_line = hit.journal_line(&element.role, &element.name);
+    if let Some((x, y)) = scrolled_from {
+        use std::fmt::Write as _;
+        let _ = write!(
+            hit_line,
+            " [scrolled into view from ({}, {})]",
+            x.round(),
+            y.round()
+        );
+    }
     Ok(IntentOutcome {
         mark,
         highlight,

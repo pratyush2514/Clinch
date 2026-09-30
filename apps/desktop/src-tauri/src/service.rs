@@ -4036,6 +4036,13 @@ impl AppService {
     /// `CLINCH_ESCALATION_MODEL` (and `CLINCH_ESCALATION_PROVIDER`,
     /// defaulting to groq). Unset keeps today's behavior — the model phase
     /// misses honestly with no escalation pass.
+    /// Record journal lines in order (best-effort, like every `record`).
+    async fn record_all(&self, lines: &[String]) {
+        for line in lines {
+            let _ = self.record(line).await;
+        }
+    }
+
     /// Build the model-guided navigator for one dispatch plus its journal
     /// line. Opt-in via `CLINCH_NAVIGATOR_PROVIDER` (`groq` | `ollama`);
     /// unset keeps the follow-up purely deterministic. The armed line names
@@ -4388,11 +4395,14 @@ impl AppService {
                 label,
                 landed,
                 hit_lines,
+                tried_lines,
                 ..
             }) => {
-                for line in &hit_lines {
-                    let _ = self.record(line).await;
-                }
+                // The attempt trail first (gear-1 lane lines and the model
+                // harness's `model_*` turn/verdict lines), then the click
+                // evidence — same order as the log-out lane.
+                self.record_all(&tried_lines).await;
+                self.record_all(&hit_lines).await;
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: verified '{label}' → {}",
@@ -4596,11 +4606,14 @@ impl AppService {
                 landed,
                 username,
                 hit_lines,
+                tried_lines,
                 ..
             }) => {
-                for line in &hit_lines {
-                    let _ = self.record(line).await;
-                }
+                // The attempt trail first (gear-1 lane lines and the model
+                // harness's `model_*` turn/verdict lines), then the click
+                // evidence — same order as the log-out lane.
+                self.record_all(&tried_lines).await;
+                self.record_all(&hit_lines).await;
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: verified '{label}' → {}",
@@ -4825,11 +4838,14 @@ impl AppService {
                 label,
                 landed,
                 hit_lines,
+                tried_lines,
                 ..
             }) => {
-                for line in &hit_lines {
-                    let _ = self.record(line).await;
-                }
+                // The attempt trail first (gear-1 lane lines and the model
+                // harness's `model_*` turn/verdict lines), then the click
+                // evidence — same order as the log-out lane.
+                self.record_all(&tried_lines).await;
+                self.record_all(&hit_lines).await;
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: verified '{label}' → {}",
@@ -4910,12 +4926,8 @@ impl AppService {
                 tried_lines,
                 ..
             }) => {
-                for line in &tried_lines {
-                    let _ = self.record(line).await;
-                }
-                for line in &hit_lines {
-                    let _ = self.record(line).await;
-                }
+                self.record_all(&tried_lines).await;
+                self.record_all(&hit_lines).await;
                 let _ = self
                     .record(&format!(
                         "in_page_goal_done: signed out via '{label}' → {}",

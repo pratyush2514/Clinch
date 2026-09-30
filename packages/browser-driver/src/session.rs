@@ -424,6 +424,26 @@ impl ManagedBrowser {
             matches: 1,
         })
     }
+
+    /// Scroll the node's center into the viewport if it is not already
+    /// visible (`DOM.scrollIntoViewIfNeeded`, the same behavior as
+    /// `Element.scrollIntoView` centering). A no-op for visible nodes.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] on CDP failure or timeout.
+    pub async fn scroll_node_into_view(&self, backend_node_id: i64) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::dom::{
+            BackendNodeId, ScrollIntoViewIfNeededParams,
+        };
+        let params = ScrollIntoViewIfNeededParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .build();
+        tokio::time::timeout(IO_TIMEOUT, self.page.execute(params))
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|_| BrowserError::Connection)?;
+        Ok(())
+    }
     /// Best-effort `href` of the DOM node behind a backend node id, for
     /// links the live page reveals (account menus disclose profile URLs).
     /// Resolved lazily per candidate — never for the whole snapshot.

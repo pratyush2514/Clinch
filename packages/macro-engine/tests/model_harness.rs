@@ -11,7 +11,8 @@ use macro_engine::{
     ChromeActionBrowser, IntentError, LOOP_NUDGE_REPEATS, LOOP_WINDOW, LoopDetector,
     MAX_SCREENSHOTS_PER_PASS, MenuBrowser, NavigatorTurn, NormalizedAction, PageAction,
     PageGoalOutcome, PageNavigator, STAGNATION_NUDGE_TURNS, ScreenshotReason, SettingsBrowser,
-    VerbKind, VerbSpec, page_fingerprint, pursue_with_model, screenshot_reason,
+    VerbKind, VerbSpec, click_point_in_viewport, page_fingerprint, pursue_with_model,
+    screenshot_reason,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -68,6 +69,7 @@ struct HarnessBrowser {
     auth: AuthState,
     land_on_click: HashMap<i64, Url>,
     detached: HashSet<i64>,
+    refused: HashSet<i64>,
     screenshot: Option<String>,
 }
 
@@ -80,6 +82,7 @@ impl HarnessBrowser {
             auth,
             land_on_click: HashMap::new(),
             detached: HashSet::new(),
+            refused: HashSet::new(),
             screenshot: None,
         }
     }
@@ -91,6 +94,13 @@ impl HarnessBrowser {
 
     fn with_detached(mut self, id: i64) -> Self {
         self.detached.insert(id);
+        self
+    }
+
+    /// The click path refuses this id (as the production click does for a
+    /// target still outside the viewport after scrolling).
+    fn with_refused(mut self, id: i64) -> Self {
+        self.refused.insert(id);
         self
     }
 
@@ -146,6 +156,11 @@ impl MenuBrowser for HarnessBrowser {
 
     async fn menu_click(&self, element: &AxElement) -> Result<(), IntentError> {
         let id = element.backend_node_id;
+        if self.refused.contains(&id) {
+            return Err(IntentError::NoMatch(format!(
+                "click target outside the viewport at (1259, 1457) of 1920x1080 after scrolling; not clicked (id {id})"
+            )));
+        }
         let step = {
             let mut clicks = self.clicks.lock().unwrap_or_else(PoisonError::into_inner);
             clicks.push(id);
@@ -798,4 +813,52 @@ async fn screenshot_rejection_journals_the_providers_reason() {
 async fn screenshot_rejection_without_a_reason_says_so() {
     let line = rejection_line(None).await;
     assert!(line.contains("(navigator reported no reason)"), "{line}");
+}
+
+// ---- off-viewport clicks ----
+
+#[test]
+fn click_point_must_lie_inside_the_live_viewport() {
+    let viewport = (1920.0, 1080.0);
+    assert!(
+        !click_point_in_viewport((1259.0, 1457.0), viewport),
+        "the lab's below-the-fold point"
+    );
+    assert!(click_point_in_viewport((1259.0, 540.0), viewport));
+    assert!(click_point_in_viewport((0.0, 0.0), viewport));
+    assert!(
+        !click_point_in_viewport((1920.0, 10.0), viewport),
+        "right edge is outside"
+    );
+    assert!(!click_point_in_viewport((10.0, -1.0), viewport));
+    assert!(!click_point_in_viewport((f64::NAN, 10.0), viewport));
+    assert!(!click_point_in_viewport((10.0, 10.0), (0.0, 1080.0)));
+}
+
+#[tokio::test]
+async fn refused_model_click_is_journaled_with_the_whole_trail() {
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated).with_refused(4);
+    let navigator = Arc::new(TurnNavigator::singles(vec![PageAction::Click {
+        target: 4,
+    }]));
+    let diagnostic = miss(run(&browser, navigator, settings_spec()).await);
+    assert!(browser.clicks().is_empty(), "nothing was dispatched");
+    assert!(
+        diagnostic.starts_with("navigator's pick was not clicked; tried ["),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(
+            "model_click: not dispatched (click target outside the viewport at (1259, 1457) of 1920x1080 after scrolling; not clicked (id 4))"
+        ),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("model_turn: step 1/8"),
+        "the turn journal survives: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("click_hit_test:"),
+        "no hit-test line for a click that never happened: {diagnostic}"
+    );
 }
