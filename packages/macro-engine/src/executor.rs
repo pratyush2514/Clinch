@@ -5100,10 +5100,12 @@ async fn model_turn_call(
         describe_model_actions(actions.as_deref())
     ));
     if attached && !navigator.accepts_screenshots() {
-        tried.push(
-            "model_screenshot: navigator rejected the image; text-only for the rest of the run"
-                .to_owned(),
-        );
+        let reason = navigator
+            .vision_rejection()
+            .unwrap_or_else(|| "navigator reported no reason".to_owned());
+        tried.push(format!(
+            "model_screenshot: navigator rejected the image ({reason}); text-only for the rest of the run"
+        ));
     }
     Ok(actions)
 }
@@ -5552,7 +5554,9 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     {
         *revealed_username = username_from_menu_text(&label);
     }
+    let journal_before = tried.len();
     browser.menu_click_reported(element, tried).await?;
+    ensure_click_hit_line(tried, journal_before, element);
     clicked.push(ClickedControl::of(element));
     *last_label = Some(label.clone());
     let navigated = wait_for_url_change(browser).await;
@@ -5609,6 +5613,22 @@ async fn model_loop_click<B: ChromeActionBrowser>(
         tried.push(tried_label(element, "clicked, no navigation"));
     }
     Ok(None)
+}
+
+/// Every model-issued click carries exactly one `click_hit_test:` line,
+/// like a deterministic click: when the browser seam journaled none since
+/// `journal_before`, push an explicit line naming why — never silence.
+fn ensure_click_hit_line(tried: &mut Vec<String>, journal_before: usize, element: &AxElement) {
+    if tried[journal_before..]
+        .iter()
+        .any(|line| line.starts_with("click_hit_test:"))
+    {
+        return;
+    }
+    tried.push(format!(
+        "click_hit_test: unavailable (click seam reported no hit test; expected role=\"{}\" name~=\"{}\")",
+        element.role, element.name
+    ));
 }
 
 /// Goal text for one model turn: the caller's goal plus, when a verb spec

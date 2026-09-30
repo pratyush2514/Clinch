@@ -129,7 +129,7 @@ fn journal_line_reports_unavailable() {
     let hit = ClickHitTest::from_probe(1.0, 2.0, &json!(null));
     assert_eq!(
         hit.journal_line("button", "avatar"),
-        "click_hit_test: unavailable"
+        "click_hit_test: (1, 2) unavailable (no element at the click point)"
     );
 }
 
@@ -146,4 +146,86 @@ fn journal_line_rounds_coordinates() {
         hit.journal_line("link", "x"),
         "click_hit_test: (61, 39) -> A role=link name=\"x\""
     );
+}
+
+// ---- reasons and the pre-click fallback ----
+
+#[test]
+fn unavailable_line_carries_coordinates_and_reason() {
+    let hit = ClickHitTest::unavailable(
+        640.4,
+        39.6,
+        "probe failed: Execution context was destroyed.",
+    );
+    assert_eq!(
+        hit.journal_line("button", "Settings"),
+        "click_hit_test: (640, 40) unavailable (probe failed: Execution context was destroyed.)"
+    );
+}
+
+#[test]
+fn available_post_click_report_wins_unchanged() {
+    let pre = ClickHitTest::from_probe(
+        10.0,
+        20.0,
+        &json!({"tag": "SPAN", "role": "", "name": "old"}),
+    );
+    let merged = available_hit().with_pre_click_fallback(pre);
+    assert_eq!(
+        merged.journal_line("button", "avatar"),
+        available_hit().journal_line("button", "avatar"),
+        "the ordinary line keeps its exact format"
+    );
+}
+
+#[test]
+fn navigating_click_falls_back_to_the_pre_click_probe() {
+    // The click navigated: the post-click probe hit a destroyed context,
+    // but the pre-click probe saw the element the press landed on.
+    let post =
+        ClickHitTest::unavailable(60.4, 40.2, "probe failed: Execution context was destroyed.");
+    let merged = post.with_pre_click_fallback(available_hit());
+    assert_eq!(
+        merged.journal_line("button", "avatar"),
+        "click_hit_test: (60, 40) -> BUTTON role=button name=\"User avatar\" \
+         [pre-click probe; post-click probe failed: probe failed: Execution context was destroyed.]"
+    );
+}
+
+#[test]
+fn pre_click_fallback_still_flags_mismatch() {
+    let post = ClickHitTest::unavailable(5.0, 5.0, "probe timed out");
+    let pre = ClickHitTest::from_probe(
+        5.0,
+        5.0,
+        &json!({"tag": "DIV", "role": "", "name": "ad slot"}),
+    );
+    let line = post
+        .with_pre_click_fallback(pre)
+        .journal_line("button", "avatar");
+    assert!(
+        line.contains(" MISMATCH(expected role=\"button\" name~=\"avatar\")"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("[pre-click probe; post-click probe failed: probe timed out]"),
+        "{line}"
+    );
+}
+
+#[test]
+fn both_probes_failing_keeps_both_reasons() {
+    let post = ClickHitTest::unavailable(7.0, 8.0, "probe timed out");
+    let pre = ClickHitTest::from_probe(7.0, 8.0, &json!(null));
+    assert_eq!(
+        post.with_pre_click_fallback(pre)
+            .journal_line("button", "x"),
+        "click_hit_test: (7, 8) unavailable (post-click: probe timed out; pre-click: no element at the click point)"
+    );
+}
+
+#[test]
+fn unavailable_reason_is_bounded() {
+    let hit = ClickHitTest::unavailable(0.0, 0.0, &"x".repeat(1000));
+    assert!(hit.journal_line("", "").len() < 250);
 }

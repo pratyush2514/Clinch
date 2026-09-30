@@ -126,6 +126,15 @@ pub trait PageNavigator: Send + Sync {
     fn accepts_screenshots(&self) -> bool {
         true
     }
+
+    /// Why the model rejected an attached screenshot, once it has:
+    /// sanitized `http <status>: <provider error body>` (or a transport
+    /// phrase) — never a key, never image bytes. `None` means no rejection
+    /// happened or the navigator cannot say; the harness journals that
+    /// explicitly instead of inventing a reason.
+    fn vision_rejection(&self) -> Option<String> {
+        None
+    }
 }
 
 /// One model turn's input, as the harness hands it to

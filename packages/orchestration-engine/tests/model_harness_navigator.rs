@@ -6,8 +6,10 @@
 //! Hermetic: every HTTP test points the adapter at a loopback mock.
 
 use browser_driver::AxElement;
-use macro_engine::{NavigatorTurn, PageAction, PageNavigator};
-use orchestration_engine::{LlmPageNavigator, parse_page_actions, with_harness_notes};
+use macro_engine::{NavigatorTurn, PageAction, PageNavigator, VisualLocation};
+use orchestration_engine::{
+    LlmPageNavigator, NavigatorEnv, parse_page_actions, sanitize_provider_error, with_harness_notes,
+};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -256,5 +258,157 @@ fn accepts_screenshots_flips_off_after_a_rejected_image() {
     assert!(
         !nav.accepts_screenshots(),
         "the harness stops capturing once the model rejected the image"
+    );
+}
+
+// ---- sanitized provider errors ----
+
+const FAKE_KEY: &str = "gsk_test0000000000000000000000000000000000000000000000";
+
+#[test]
+fn provider_error_keeps_status_and_body() {
+    assert_eq!(
+        sanitize_provider_error(
+            400,
+            "{\"error\": {\"message\": \"model does not support image input\",\n \"type\": \"invalid_request_error\"}}",
+            &[FAKE_KEY],
+        ),
+        "http 400: {\"error\": {\"message\": \"model does not support image input\", \"type\": \"invalid_request_error\"}}"
+    );
+    assert_eq!(sanitize_provider_error(503, "  ", &[]), "http 503");
+}
+
+#[test]
+fn provider_error_never_carries_the_key_or_image_bytes() {
+    let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let body = format!(
+        "{{\"error\": \"bad key {FAKE_KEY}\", \"echo\": \"data:image/jpeg;base64,{image}\", \"auth\": \"Bearer sk-unrelatedtoken0000000000000000000000000000\"}}"
+    );
+    let clean = sanitize_provider_error(401, &body, &[FAKE_KEY]);
+    assert!(!clean.contains(FAKE_KEY), "{clean}");
+    assert!(!clean.contains("gsk_"), "{clean}");
+    assert!(!clean.contains(image), "{clean}");
+    assert!(!clean.contains("iVBORw0KGgo"), "{clean}");
+    assert!(!clean.contains("unrelatedtoken"), "{clean}");
+    assert!(clean.starts_with("http 401: "), "{clean}");
+    assert!(clean.contains("[redacted]"), "{clean}");
+}
+
+#[test]
+fn provider_error_is_bounded_and_single_line() {
+    let body = "error text \n\t with\r\nbreaks ".repeat(100);
+    let clean = sanitize_provider_error(500, &body, &[]);
+    assert!(!clean.contains(['\n', '\r', '\t']));
+    assert!(
+        clean.chars().count() <= "http 500: ".len() + 301,
+        "{}",
+        clean.len()
+    );
+}
+
+#[test]
+fn model_ids_and_prose_survive_sanitizing() {
+    let clean = sanitize_provider_error(
+        404,
+        "The model `meta-llama/llama-4-scout-17b-16e-instruct` does not exist",
+        &[],
+    );
+    assert!(
+        clean.contains("meta-llama/llama-4-scout-17b-16e-instruct"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn vision_rejection_reason_comes_from_the_provider_reply() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let base = mock_server_seq(
+        vec![
+            (
+                400,
+                r#"{"error": {"message": "content must be a string", "type": "invalid_request_error"}}"#.to_owned(),
+            ),
+            (200, groq_envelope(r#"{"action": "done"}"#)),
+        ],
+        captured,
+    );
+    let nav = LlmPageNavigator::groq(FAKE_KEY, &base, "text-only-model");
+    assert_eq!(nav.vision_rejection(), None, "nothing rejected yet");
+    let elements = snapshot();
+    let zones = vec![None; elements.len()];
+    let _ = nav.next_turn(&NavigatorTurn {
+        goal: "open settings",
+        elements: &elements,
+        zones: &zones,
+        screenshot_jpeg_b64: Some("aGVsbG8="),
+        notes: &[],
+    });
+    assert_eq!(
+        nav.vision_rejection().as_deref(),
+        Some(
+            r#"http 400: {"error": {"message": "content must be a string", "type": "invalid_request_error"}}"#
+        )
+    );
+}
+
+#[test]
+fn visual_fallback_failure_names_the_status() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let base = mock_server_seq(
+        vec![(
+            429,
+            r#"{"error": {"message": "rate limit reached"}}"#.to_owned(),
+        )],
+        captured,
+    );
+    let env = NavigatorEnv {
+        provider: Some("groq".to_owned()),
+        groq_api_key: Some(FAKE_KEY.to_owned()),
+        groq_base_url: Some(base),
+        vision_model: Some("vision-model".to_owned()),
+        ..Default::default()
+    };
+    let Some(nav) = LlmPageNavigator::from_env_values(&env) else {
+        panic!("navigator builds")
+    };
+    match nav.locate_visual("the log out row", "aGVsbG8=") {
+        VisualLocation::Failed(reason) => assert_eq!(
+            reason,
+            r#"vision request failed (http 429: {"error": {"message": "rate limit reached"}})"#
+        ),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// ---- the armed journal line's model description ----
+
+#[test]
+fn describe_names_the_resolved_default_model() {
+    let env = NavigatorEnv {
+        provider: Some("groq".to_owned()),
+        groq_api_key: Some(FAKE_KEY.to_owned()),
+        ..Default::default()
+    };
+    let Some(nav) = LlmPageNavigator::from_env_values(&env) else {
+        panic!("navigator builds")
+    };
+    assert_eq!(nav.describe(), "provider groq, model openai/gpt-oss-20b");
+    assert!(!nav.describe().contains(FAKE_KEY));
+}
+
+#[test]
+fn describe_names_overrides_and_the_vision_fallback_model() {
+    let env = NavigatorEnv {
+        provider: Some("ollama".to_owned()),
+        ollama_model: Some(" qwen2.5vl:7b ".to_owned()),
+        vision_model: Some("qwen2.5vl:7b".to_owned()),
+        ..Default::default()
+    };
+    let Some(nav) = LlmPageNavigator::from_env_values(&env) else {
+        panic!("navigator builds")
+    };
+    assert_eq!(
+        nav.describe(),
+        "provider ollama, model qwen2.5vl:7b, vision fallback model qwen2.5vl:7b"
     );
 }

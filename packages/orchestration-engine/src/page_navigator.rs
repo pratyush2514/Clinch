@@ -118,6 +118,10 @@ pub struct LlmPageNavigator {
     /// `spawn_blocking` means interior mutability; `Relaxed` is enough —
     /// the only invariant is "at most one failed vision call per run".
     vision_disabled: std::sync::atomic::AtomicBool,
+    /// Sanitized reason of the vision rejection that set
+    /// `vision_disabled` (`http <status>: <provider body>` or a transport
+    /// phrase) — surfaced to the harness journal, never the key or bytes.
+    vision_rejection: std::sync::Mutex<Option<String>>,
 }
 
 impl LlmPageNavigator {
@@ -298,6 +302,7 @@ impl LlmPageNavigator {
             agent,
             vision_model: None,
             vision_disabled: std::sync::atomic::AtomicBool::new(false),
+            vision_rejection: std::sync::Mutex::new(None),
         }
     }
 
@@ -306,6 +311,19 @@ impl LlmPageNavigator {
     #[must_use]
     pub fn model_name(&self) -> &str {
         &self.model
+    }
+
+    /// The resolved configuration for the `model-guided phase armed`
+    /// journal line: provider, model id (defaults applied), and the
+    /// visual-fallback model when one is set. Never the key or base URL
+    /// credentials.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let line = format!("provider {}, model {}", self.provider.as_str(), self.model);
+        match self.vision_model.as_deref() {
+            Some(vision) => format!("{line}, vision fallback model {vision}"),
+            None => line,
+        }
     }
 
     /// POST a JSON body and parse the JSON response, or return a sanitized
@@ -334,7 +352,15 @@ impl LlmPageNavigator {
         })?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(format!("navigator http {status}"));
+            // The provider's error body is the only evidence of WHY a
+            // request was refused; it is sanitized before it can reach any
+            // journal line (no key, no image bytes, bounded length).
+            let body = response.into_body().read_to_string().unwrap_or_default();
+            return Err(sanitize_provider_error(
+                status,
+                &body,
+                &[self.api_key.as_str()],
+            ));
         }
         response
             .into_body()
@@ -365,16 +391,30 @@ impl LlmPageNavigator {
         {
             return self.groq_completion(goal, elements);
         }
-        self.groq_completion_raw(&groq_user_content(
-            goal,
-            elements,
-            Some(screenshot_jpeg_b64),
-        ))
-        .or_else(|| {
-            self.vision_disabled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.groq_completion(goal, elements)
-        })
+        match self.chat_completion_result(
+            &self.model,
+            SYSTEM_PROMPT,
+            &groq_user_content(goal, elements, Some(screenshot_jpeg_b64)),
+        ) {
+            Ok(content) => Some(content),
+            Err(reason) => {
+                self.reject_vision(&reason, screenshot_jpeg_b64);
+                self.groq_completion(goal, elements)
+            }
+        }
+    }
+
+    /// Disable vision for the rest of the run and keep the sanitized
+    /// reason for the harness journal. `reason` is already sanitized by
+    /// [`LlmPageNavigator::post_json`]; the screenshot bytes are scrubbed
+    /// once more in case the provider echoed them in a non-HTTP failure.
+    fn reject_vision(&self, reason: &str, screenshot_jpeg_b64: &str) {
+        self.vision_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let clean = scrub_secrets(reason, &[self.api_key.as_str(), screenshot_jpeg_b64]);
+        if let Ok(mut slot) = self.vision_rejection.lock() {
+            *slot = Some(clean);
+        }
     }
 
     /// One Groq chat completion with an explicit user-message `content`
@@ -393,6 +433,19 @@ impl LlmPageNavigator {
         system_prompt: &str,
         user_content: &serde_json::Value,
     ) -> Option<String> {
+        self.chat_completion_result(model, system_prompt, user_content)
+            .ok()
+    }
+
+    /// [`LlmPageNavigator::chat_completion`] with the failure reason kept:
+    /// sanitized `http <status>: <provider body>`, a transport/timeout
+    /// phrase, or a malformed/empty-reply phrase. Never carries the key.
+    fn chat_completion_result(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_content: &serde_json::Value,
+    ) -> Result<String, String> {
         let auth = format!("Bearer {}", self.api_key.as_str());
         // gpt-oss is a reasoning model: its reasoning tokens draw from
         // max_tokens before any content is emitted. 256 leaves headroom for
@@ -409,28 +462,29 @@ impl LlmPageNavigator {
         if model.contains("gpt-oss") {
             body["reasoning_effort"] = serde_json::Value::String("low".to_owned());
         }
-        let payload = self
-            .post_json(
-                &format!("{}/chat/completions", self.base_url),
-                Some(auth.as_str()),
-                body,
-            )
-            .ok()?;
-        payload
-            .get("choices")?
-            .as_array()?
-            .first()?
-            .get("message")?
-            .get("content")?
-            .as_str()
-            .filter(|content| !content.trim().is_empty())
-            .map(str::to_owned)
+        let payload = self.post_json(
+            &format!("{}/chat/completions", self.base_url),
+            Some(auth.as_str()),
+            body,
+        )?;
+        let content = payload
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "malformed completion envelope".to_owned())?;
+        if content.trim().is_empty() {
+            return Err("empty completion content".to_owned());
+        }
+        Ok(content.to_owned())
     }
 
     /// One Ollama generation with `format: "json"`; the `response` field is
     /// the raw strict-JSON payload, or `None` on any failure.
     fn ollama_generate(&self, goal: &str, elements: &str) -> Option<String> {
-        self.ollama_generate_raw(goal, elements, None)
+        self.ollama_generate_raw(goal, elements, None).ok()
     }
 
     /// One Ollama generation carrying a viewport screenshot in the
@@ -450,23 +504,24 @@ impl LlmPageNavigator {
         {
             return self.ollama_generate(goal, elements);
         }
-        self.ollama_generate_raw(goal, elements, Some(screenshot_jpeg_b64))
-            .or_else(|| {
-                self.vision_disabled
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+        match self.ollama_generate_raw(goal, elements, Some(screenshot_jpeg_b64)) {
+            Ok(content) => Some(content),
+            Err(reason) => {
+                self.reject_vision(&reason, screenshot_jpeg_b64);
                 self.ollama_generate(goal, elements)
-            })
+            }
+        }
     }
 
     /// One Ollama generation with an optional base64-JPEG `images` entry;
-    /// the `response` field is the raw strict-JSON payload, or `None` on
-    /// any failure.
+    /// the `response` field is the raw strict-JSON payload, or the
+    /// sanitized failure reason.
     fn ollama_generate_raw(
         &self,
         goal: &str,
         elements: &str,
         screenshot_jpeg_b64: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         let mut body = serde_json::json!({
             "model": self.model,
             "stream": false,
@@ -476,10 +531,12 @@ impl LlmPageNavigator {
         if let Some(b64) = screenshot_jpeg_b64 {
             body["images"] = serde_json::json!([b64]);
         }
-        let payload = self
-            .post_json(&format!("{}/api/generate", self.base_url), None, body)
-            .ok()?;
-        payload.get("response")?.as_str().map(str::to_owned)
+        let payload = self.post_json(&format!("{}/api/generate", self.base_url), None, body)?;
+        payload
+            .get("response")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "malformed generate envelope".to_owned())
     }
 
     /// One provider call for a rendered element block, with or without a
@@ -546,6 +603,13 @@ impl PageNavigator for LlmPageNavigator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn vision_rejection(&self) -> Option<String> {
+        self.vision_rejection
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
     fn locate_visual(&self, target: &str, screenshot_jpeg_b64: &str) -> VisualLocation {
         let Some(model) = self.vision_model.as_deref() else {
             return VisualLocation::Unsupported;
@@ -556,7 +620,7 @@ impl PageNavigator for LlmPageNavigator {
                     {"type": "text", "text": format!("target: {target}")},
                     {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{screenshot_jpeg_b64}")}},
                 ]);
-                self.chat_completion(model, VISION_SYSTEM_PROMPT, &user)
+                self.chat_completion_result(model, VISION_SYSTEM_PROMPT, &user)
             }
             GrounderProvider::Ollama => {
                 let body = serde_json::json!({
@@ -567,18 +631,23 @@ impl PageNavigator for LlmPageNavigator {
                     "images": [screenshot_jpeg_b64],
                 });
                 self.post_json(&format!("{}/api/generate", self.base_url), None, body)
-                    .ok()
                     .and_then(|payload| {
                         payload
                             .get("response")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned)
+                            .ok_or_else(|| "malformed generate envelope".to_owned())
                     })
             }
         };
         match content {
-            Some(content) => parse_visual_location(&content),
-            None => VisualLocation::Failed("vision request failed".to_owned()),
+            Ok(content) => parse_visual_location(&content),
+            // Sanitized reason (status + provider body, no key, no image
+            // bytes) so the visual-fallback miss line says WHY.
+            Err(reason) => VisualLocation::Failed(format!(
+                "vision request failed ({})",
+                scrub_secrets(&reason, &[self.api_key.as_str(), screenshot_jpeg_b64])
+            )),
         }
     }
 }
@@ -677,6 +746,74 @@ fn render_elements(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Longest provider error detail kept for the journal, in characters.
+const MAX_PROVIDER_ERROR_CHARS: usize = 300;
+
+/// Runs of base64/key-like characters at least this long are redacted:
+/// image bytes and bearer tokens are long unbroken runs, ordinary error
+/// prose and model ids (broken by `-`, `.`, spaces) are not.
+const REDACT_RUN_CHARS: usize = 40;
+
+/// Sanitized one-line failure for a non-2xx provider reply:
+/// `http <status>: <body>` with every `secrets` occurrence and every long
+/// base64-like run redacted, control characters and whitespace collapsed,
+/// and the detail capped at [`MAX_PROVIDER_ERROR_CHARS`]. Pure and
+/// unit-tested; the only way provider error text reaches a journal.
+#[must_use]
+pub fn sanitize_provider_error(status: u16, body: &str, secrets: &[&str]) -> String {
+    let detail = scrub_secrets(body, secrets);
+    if detail.is_empty() {
+        format!("http {status}")
+    } else {
+        format!("http {status}: {detail}")
+    }
+}
+
+/// Redact `secrets` and long base64-like runs, collapse whitespace and
+/// control characters, cap the length. Idempotent on its own output.
+#[must_use]
+fn scrub_secrets(text: &str, secrets: &[&str]) -> String {
+    let mut scrubbed = text.to_owned();
+    for secret in secrets.iter().map(|secret| secret.trim()) {
+        if !secret.is_empty() {
+            scrubbed = scrubbed.replace(secret, "[redacted]");
+        }
+    }
+    let is_run_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=');
+    let mut out = String::with_capacity(scrubbed.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() >= REDACT_RUN_CHARS {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in scrubbed.chars() {
+        if is_run_char(c) {
+            run.push(c);
+            continue;
+        }
+        flush(&mut run, &mut out);
+        if c.is_whitespace() || c.is_control() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    let trimmed = out.trim();
+    if trimmed.chars().count() > MAX_PROVIDER_ERROR_CHARS {
+        let capped: String = trimmed.chars().take(MAX_PROVIDER_ERROR_CHARS).collect();
+        format!("{capped}…")
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 /// Append the harness notes after the element list: the user message keeps

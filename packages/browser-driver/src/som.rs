@@ -188,6 +188,10 @@ pub fn hit_test_expression(x: f64, y: f64) -> String {
 /// is close enough for a diagnostic.
 const HIT_TEST_FIELD_CAP: usize = 80;
 
+/// Cap on an unavailable report's reason, in characters: CDP error text
+/// is bounded so one failure can't flood the journal.
+const HIT_TEST_REASON_CAP: usize = 160;
+
 /// What the page itself reports under a click point: the element
 /// `document.elementFromPoint` finds at the coordinates the trusted CDP
 /// input events landed on. Pure diagnostic — the click never depends on
@@ -201,13 +205,22 @@ pub struct ClickHitTest {
     pub tag: String,
     pub role: String,
     pub name: String,
+    /// Why the probe could not report (empty when `available`): the
+    /// journal says what failed instead of a bare "unavailable".
+    pub reason: String,
+    /// Provenance note rendered after the line (empty for the ordinary
+    /// post-click report): set when the pre-click probe stood in for a
+    /// failed post-click probe.
+    pub note: String,
 }
 
 impl ClickHitTest {
     /// The never-available report: every probe failure (eval error, timeout,
     /// page exception, `null` hit, unparsable payload) funnels here so the
-    /// diagnostic can never fail the click it follows.
-    fn unavailable(x: f64, y: f64) -> Self {
+    /// diagnostic can never fail the click it follows. `reason` names the
+    /// failure for the journal.
+    #[must_use]
+    pub fn unavailable(x: f64, y: f64, reason: &str) -> Self {
         ClickHitTest {
             x,
             y,
@@ -215,7 +228,30 @@ impl ClickHitTest {
             tag: String::new(),
             role: String::new(),
             name: String::new(),
+            reason: reason.chars().take(HIT_TEST_REASON_CAP).collect(),
+            note: String::new(),
         }
+    }
+
+    /// Combine the post-click report (`self`) with the pre-click probe at
+    /// the same point. A click that navigates tears the page down under
+    /// the post-click probe; the pre-click probe (the element the press
+    /// was dispatched onto) then stands in, flagged as such. An available
+    /// post-click report wins unchanged, so the ordinary line keeps its
+    /// exact format. When both fail, both reasons are kept.
+    #[must_use]
+    pub fn with_pre_click_fallback(self, pre: ClickHitTest) -> Self {
+        if self.available {
+            return self;
+        }
+        if pre.available {
+            return ClickHitTest {
+                note: format!("pre-click probe; post-click probe failed: {}", self.reason),
+                ..pre
+            };
+        }
+        let reason = format!("post-click: {}; pre-click: {}", self.reason, pre.reason);
+        ClickHitTest { reason, ..self }
     }
 
     /// Parse a `Runtime.evaluate` probe payload into a report. Public so the
@@ -235,7 +271,15 @@ impl ClickHitTest {
         }
         let tag = field(value, "tag");
         if tag.is_empty() {
-            return Self::unavailable(x, y);
+            return Self::unavailable(
+                x,
+                y,
+                if value.is_null() {
+                    "no element at the click point"
+                } else {
+                    "probe returned no tag"
+                },
+            );
         }
         ClickHitTest {
             x,
@@ -244,6 +288,8 @@ impl ClickHitTest {
             tag,
             role: field(value, "role"),
             name: field(value, "name"),
+            reason: String::new(),
+            note: String::new(),
         }
     }
 
@@ -253,12 +299,22 @@ impl ClickHitTest {
     /// - plus ` MISMATCH(expected role="<er>" name~="<en>")` when neither the
     ///   role equals the expected role (case-insensitively) nor the name
     ///   contains the expected name (case-insensitively)
-    /// - unavailable: `click_hit_test: unavailable`
+    /// - plus ` [<note>]` when the pre-click probe stood in
+    /// - unavailable: `click_hit_test: (X, Y) unavailable (<reason>)`
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn journal_line(&self, expected_role: &str, expected_name: &str) -> String {
         if !self.available {
-            return "click_hit_test: unavailable".to_owned();
+            let reason = if self.reason.is_empty() {
+                "probe reported no reason"
+            } else {
+                self.reason.as_str()
+            };
+            return format!(
+                "click_hit_test: ({}, {}) unavailable ({reason})",
+                self.x.round() as i64,
+                self.y.round() as i64,
+            );
         }
         let role = if self.role.is_empty() {
             "-"
@@ -285,6 +341,9 @@ impl ClickHitTest {
                 line,
                 " MISMATCH(expected role=\"{expected_role}\" name~=\"{expected_name}\")"
             );
+        }
+        if !self.note.is_empty() {
+            let _ = write!(line, " [{}]", self.note);
         }
         line
     }
@@ -320,8 +379,22 @@ impl ManagedBrowser {
     /// Returns [`BrowserError`] on invalid geometry, CDP failure, or timeout
     /// of the click itself; the post-click probe is best-effort.
     pub async fn click_mark_reported(&self, mark: &Mark) -> Result<ClickHitTest, BrowserError> {
+        // Pre-click probe at the exact point the press will land: read-only
+        // and before any input, so the input sequence itself is unchanged.
+        // It stands in only when the post-click probe fails (a navigating
+        // click tears the page down under it).
+        let pre = if mark.validate().is_ok() {
+            let (px, py) = mark.click_point();
+            Some(self.hit_test(px, py).await)
+        } else {
+            None
+        };
         let (x, y) = self.click_mark_core(mark).await?;
-        Ok(self.hit_test(x, y).await)
+        let post = self.hit_test(x, y).await;
+        Ok(match pre {
+            Some(pre) => post.with_pre_click_fallback(pre),
+            None => post,
+        })
     }
 
     /// Best-effort `document.elementFromPoint` probe at `(x, y)`. Never
@@ -335,21 +408,26 @@ impl ManagedBrowser {
             .return_by_value(true)
             .build()
         else {
-            return ClickHitTest::unavailable(x, y);
+            return ClickHitTest::unavailable(x, y, "probe expression rejected");
         };
-        let Ok(Ok(evaluation)) = tokio::time::timeout(IO_TIMEOUT, self.page.execute(params)).await
-        else {
-            return ClickHitTest::unavailable(x, y);
+        let evaluation = match tokio::time::timeout(IO_TIMEOUT, self.page.execute(params)).await {
+            Ok(Ok(evaluation)) => evaluation,
+            // The CDP error text (e.g. a destroyed execution context after a
+            // navigation) is the useful part; it carries no page content.
+            Ok(Err(error)) => {
+                return ClickHitTest::unavailable(x, y, &format!("probe failed: {error}"));
+            }
+            Err(_) => return ClickHitTest::unavailable(x, y, "probe timed out"),
         };
         // `execute` wraps the CDP response: CommandResponse.result is the
         // EvaluateReturns, whose .result is the RemoteObject.
         let returns = evaluation.result;
         if returns.exception_details.is_some() {
-            return ClickHitTest::unavailable(x, y);
+            return ClickHitTest::unavailable(x, y, "page exception in probe");
         }
         match returns.result.value {
             Some(value) if !value.is_null() => ClickHitTest::from_probe(x, y, &value),
-            _ => ClickHitTest::unavailable(x, y),
+            _ => ClickHitTest::unavailable(x, y, "no element at the click point"),
         }
     }
 

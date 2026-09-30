@@ -1106,6 +1106,6 @@ fn click_hit_test_journal_line_format() {
     let unavailable = ClickHitTest::from_probe(10.0, 20.0, &serde_json::json!(null));
     assert_eq!(
         unavailable.journal_line("button", "Avatar"),
-        "click_hit_test: unavailable"
+        "click_hit_test: (10, 20) unavailable (no element at the click point)"
     );
 }

@@ -34,7 +34,8 @@ pub use intent_resolver::{
 pub use llm_intent_parser::LlmIntentParser;
 pub use macro_engine::{Macro, MacroError, MacroStep, Recorder, ReplayError};
 pub use page_navigator::{
-    LlmPageNavigator, NavigatorEnv, parse_page_actions, parse_visual_location, with_harness_notes,
+    LlmPageNavigator, NavigatorEnv, parse_page_actions, parse_visual_location,
+    sanitize_provider_error, with_harness_notes,
 };
 pub use route_proposer::{
     BraveSiteSearch, ChainedSiteSearch, DomainGrounder, DuckDuckGoSiteSearch, InMemoryShortcuts,

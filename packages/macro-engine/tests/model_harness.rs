@@ -697,3 +697,105 @@ async fn goal_text_is_fixed_for_the_whole_run() {
         "no per-step goal reshaping; notes travel separately"
     );
 }
+
+// ---- observability: one hit-test line per model click, rejection reason ----
+
+#[tokio::test]
+async fn every_model_click_journals_one_click_hit_test_line() {
+    // The fake seam reports no hit test (the trait default); the harness
+    // still journals an explicit line per click, never silence.
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated)
+        .with_landing_on_click(2, "https://www.example.com/settings");
+    let navigator = Arc::new(TurnNavigator::singles(vec![
+        PageAction::Click { target: 1 },
+        PageAction::Click { target: 2 },
+    ]));
+    match run(&browser, navigator, settings_spec()).await {
+        Ok(PageGoalOutcome::Verified { hit_lines, .. }) => {
+            assert_eq!(
+                hit_lines,
+                vec![
+                    "click_hit_test: unavailable (click seam reported no hit test; expected role=\"button\" name~=\"alpha\")".to_owned(),
+                    "click_hit_test: unavailable (click seam reported no hit test; expected role=\"button\" name~=\"beta\")".to_owned(),
+                ],
+                "one line per model click, in click order"
+            );
+        }
+        other => panic!("expected Verified, got {other:?}"),
+    }
+}
+
+/// Vision-capable until its first screenshot, then rejects it with a
+/// provider reason (what `LlmPageNavigator` does on a 4xx).
+struct RejectingVision {
+    rejected: std::sync::atomic::AtomicBool,
+    reason: Option<String>,
+}
+
+impl PageNavigator for RejectingVision {
+    fn next_action(&self, _goal: &str, _elements: &[AxElement]) -> Option<PageAction> {
+        None
+    }
+
+    fn next_turn(&self, turn: &NavigatorTurn<'_>) -> Option<Vec<PageAction>> {
+        if turn.screenshot_jpeg_b64.is_some() {
+            self.rejected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        None
+    }
+
+    fn accepts_screenshots(&self) -> bool {
+        !self.rejected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn vision_rejection(&self) -> Option<String> {
+        self.reason.clone()
+    }
+}
+
+async fn rejection_line(reason: Option<&str>) -> String {
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated).with_screenshot();
+    let navigator = Arc::new(RejectingVision {
+        rejected: std::sync::atomic::AtomicBool::new(false),
+        reason: reason.map(str::to_owned),
+    });
+    let diagnostic = miss(
+        pursue_with_model(
+            &browser,
+            &origin(),
+            "harness test goal",
+            navigator,
+            Some(settings_spec()),
+            "deterministic: nothing found".to_owned(),
+            None,
+        )
+        .await,
+    );
+    let start = diagnostic
+        .find("model_screenshot: navigator rejected")
+        .unwrap_or_else(|| panic!("no rejection line: {diagnostic}"));
+    let tail = "text-only for the rest of the run";
+    let end = diagnostic[start..]
+        .find(tail)
+        .map_or(diagnostic.len(), |offset| start + offset + tail.len());
+    diagnostic[start..end].to_owned()
+}
+
+#[tokio::test]
+async fn screenshot_rejection_journals_the_providers_reason() {
+    let line = rejection_line(Some(
+        "http 400: {\"error\":{\"message\":\"model does not support image input\"}}",
+    ))
+    .await;
+    assert_eq!(
+        line,
+        "model_screenshot: navigator rejected the image (http 400: {\"error\":{\"message\":\"model does not support image input\"}}); text-only for the rest of the run"
+    );
+}
+
+#[tokio::test]
+async fn screenshot_rejection_without_a_reason_says_so() {
+    let line = rejection_line(None).await;
+    assert!(line.contains("(navigator reported no reason)"), "{line}");
+}

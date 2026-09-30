@@ -4036,6 +4036,30 @@ impl AppService {
     /// `CLINCH_ESCALATION_MODEL` (and `CLINCH_ESCALATION_PROVIDER`,
     /// defaulting to groq). Unset keeps today's behavior — the model phase
     /// misses honestly with no escalation pass.
+    /// Build the model-guided navigator for one dispatch plus its journal
+    /// line. Opt-in via `CLINCH_NAVIGATOR_PROVIDER` (`groq` | `ollama`);
+    /// unset keeps the follow-up purely deterministic. The armed line names
+    /// the resolved provider and model id (defaults applied), so a lab
+    /// journal shows exactly which model made the calls.
+    fn page_navigator() -> (
+        Option<std::sync::Arc<dyn macro_engine::PageNavigator>>,
+        String,
+    ) {
+        match orchestration_engine::LlmPageNavigator::from_env() {
+            Some(navigator) => {
+                let line = format!(
+                    "in_page_goal_navigator: model-guided phase armed ({})",
+                    navigator.describe()
+                );
+                (Some(std::sync::Arc::new(navigator) as _), line)
+            }
+            None => (
+                None,
+                "in_page_goal_navigator: deterministic only".to_owned(),
+            ),
+        }
+    }
+
     fn model_escalation() -> Option<macro_engine::ModelEscalation> {
         orchestration_engine::LlmPageNavigator::escalation_from_env().map(|navigator| {
             let model_name = navigator.model_name().to_owned();
@@ -4066,19 +4090,8 @@ impl AppService {
         // names `groq` or `ollama`; unset keeps the follow-up purely
         // deterministic. Built once per dispatch and shared across the
         // model phase's steps.
-        let navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>> =
-            orchestration_engine::LlmPageNavigator::from_env()
-                .map(|navigator| std::sync::Arc::new(navigator) as _);
-        let _ = self
-            .record(&format!(
-                "in_page_goal_navigator: {}",
-                if navigator.is_some() {
-                    "model-guided phase armed"
-                } else {
-                    "deterministic only"
-                }
-            ))
-            .await;
+        let (navigator, navigator_line) = Self::page_navigator();
+        let _ = self.record(&navigator_line).await;
         // Gear-2 escalation is opt-in separately: when armed, one
         // additional bounded model pass runs under the escalation model
         // after the main pass's tail fails verification.
@@ -4529,19 +4542,8 @@ impl AppService {
             spec.kind.as_str(),
             portal.host_str().unwrap_or("?")
         );
-        let navigator: Option<std::sync::Arc<dyn macro_engine::PageNavigator>> =
-            orchestration_engine::LlmPageNavigator::from_env()
-                .map(|navigator| std::sync::Arc::new(navigator) as _);
-        let _ = self
-            .record(&format!(
-                "in_page_goal_navigator: {}",
-                if navigator.is_some() {
-                    "model-guided phase armed"
-                } else {
-                    "deterministic only"
-                }
-            ))
-            .await;
+        let (navigator, navigator_line) = Self::page_navigator();
+        let _ = self.record(&navigator_line).await;
         let escalation = Self::model_escalation();
         let _ = self
             .record(&format!(
