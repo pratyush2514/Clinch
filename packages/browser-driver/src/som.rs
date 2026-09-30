@@ -176,7 +176,26 @@ const HIT_TEST_EXPRESSION: &str = "(() => {
     if (!inner || inner === el) break;
     el = inner;
   }
-  return {tag: el.tagName, role: el.getAttribute('role')||'', name: (el.getAttribute('aria-label')||el.innerText||'').trim().slice(0,80), idcls: ('#'+(el.id||'')+' .'+(el.className||'').toString().split(/\\s+/).join('.')).slice(0,80)};
+  const ROLES = ['button','link','menuitem','menuitemcheckbox','menuitemradio','tab','option','checkbox','radio','switch','combobox','textbox'];
+  const implicitRole = (n) => {
+    const t = n.tagName;
+    if (t === 'A' && n.hasAttribute('href')) return 'link';
+    if (t === 'BUTTON' || t === 'SUMMARY') return 'button';
+    if (t === 'SELECT') return 'combobox';
+    if (t === 'TEXTAREA') return 'textbox';
+    if (t === 'INPUT') { const k = (n.type||'text').toLowerCase(); return (k === 'button' || k === 'submit' || k === 'reset' || k === 'image') ? 'button' : (k === 'checkbox' || k === 'radio') ? k : 'textbox'; }
+    return '';
+  };
+  const interactiveRole = (n) => { const r = (n.getAttribute('role')||'').toLowerCase(); return ROLES.includes(r) ? r : implicitRole(n); };
+  let target = null;
+  for (let n = el, depth = 0; n && depth < 16; depth++) {
+    if (n.nodeType === 1 && interactiveRole(n)) { target = n; break; }
+    const root = n.getRootNode && n.getRootNode();
+    n = n.parentElement || (root && root.host) || null;
+  }
+  const label = (n) => (n.getAttribute('aria-label')||n.getAttribute('title')||n.innerText||'').trim().slice(0,80);
+  const within = target && target !== el ? {tag: target.tagName, role: interactiveRole(target), name: label(target)} : null;
+  return {tag: el.tagName, role: el.getAttribute('role')||'', name: (el.getAttribute('aria-label')||el.innerText||'').trim().slice(0,80), idcls: ('#'+(el.id||'')+' .'+(el.className||'').toString().split(/\\s+/).join('.')).slice(0,80), within};
 })()";
 
 /// Substitute the click point into the probe const's `{x}`/`{y}`
@@ -217,6 +236,14 @@ pub struct ClickHitTest {
     /// post-click report): set when the pre-click probe stood in for a
     /// failed post-click probe.
     pub note: String,
+    /// The nearest interactive ancestor (`tag`, `role`, `name`) of the hit
+    /// element, crossing shadow hosts, when the hit element is not itself
+    /// interactive — e.g. the SVG icon inside an "Open inbox" link. The
+    /// press activates that ancestor, so a match there is a match. Empty
+    /// tag when absent.
+    pub within_tag: String,
+    pub within_role: String,
+    pub within_name: String,
 }
 
 impl ClickHitTest {
@@ -235,6 +262,9 @@ impl ClickHitTest {
             name: String::new(),
             reason: reason.chars().take(HIT_TEST_REASON_CAP).collect(),
             note: String::new(),
+            within_tag: String::new(),
+            within_role: String::new(),
+            within_name: String::new(),
         }
     }
 
@@ -311,6 +341,18 @@ impl ClickHitTest {
             name: field(value, "name"),
             reason: String::new(),
             note: String::new(),
+            within_tag: value
+                .get("within")
+                .map(|within| field(within, "tag"))
+                .unwrap_or_default(),
+            within_role: value
+                .get("within")
+                .map(|within| field(within, "role"))
+                .unwrap_or_default(),
+            within_name: value
+                .get("within")
+                .map(|within| field(within, "name"))
+                .unwrap_or_default(),
         }
     }
 
@@ -320,6 +362,9 @@ impl ClickHitTest {
     /// - plus ` MISMATCH(expected role="<er>" name~="<en>")` when neither the
     ///   role equals the expected role (case-insensitively) nor the name
     ///   contains the expected name (case-insensitively)
+    /// - plus ` [inside <tag> role=<role> name="<name>"]` when the hit
+    ///   element sits inside an interactive ancestor; either one matching
+    ///   the expectation is a match (the press activates the ancestor)
     /// - plus ` [<note>]` when the pre-click probe stood in
     /// - unavailable: `click_hit_test: (X, Y) unavailable (<reason>)`
     #[must_use]
@@ -352,12 +397,26 @@ impl ClickHitTest {
             role,
             self.name,
         );
-        let role_matches = self.role.eq_ignore_ascii_case(expected_role);
-        let name_matches = self
-            .name
-            .to_lowercase()
-            .contains(&expected_name.to_lowercase());
-        if !(role_matches || name_matches) {
+        if !self.within_tag.is_empty() {
+            let within_role = if self.within_role.is_empty() {
+                "-"
+            } else {
+                self.within_role.as_str()
+            };
+            let _ = write!(
+                line,
+                " [inside {} role={within_role} name=\"{}\"]",
+                self.within_tag, self.within_name
+            );
+        }
+        let expected = expected_name.to_lowercase();
+        let matches = |role: &str, name: &str| {
+            role.eq_ignore_ascii_case(expected_role) || name.to_lowercase().contains(&expected)
+        };
+        let hit_matches = matches(&self.role, &self.name);
+        let within_matches =
+            !self.within_tag.is_empty() && matches(&self.within_role, &self.within_name);
+        if !(hit_matches || within_matches) {
             let _ = write!(
                 line,
                 " MISMATCH(expected role=\"{expected_role}\" name~=\"{expected_name}\")"

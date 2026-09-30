@@ -12,7 +12,7 @@ use macro_engine::{
     MAX_NAVIGATOR_ELEMENTS, MAX_SCREENSHOTS_PER_PASS, MenuBrowser, NavigatorTurn, NormalizedAction,
     PageAction, PageGoalOutcome, PageNavigator, STAGNATION_NUDGE_TURNS, ScreenshotReason,
     SettingsBrowser, VerbKind, VerbSpec, click_point_in_viewport, model_candidates,
-    page_fingerprint, pursue_with_model, screenshot_reason,
+    page_fingerprint, pursue_verb_goal, pursue_with_model, screenshot_reason,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -68,6 +68,7 @@ struct HarnessBrowser {
     url: Arc<AsyncMutex<Url>>,
     auth: AuthState,
     land_on_click: HashMap<i64, Url>,
+    land_delay_ms: HashMap<i64, u64>,
     detached: HashSet<i64>,
     refused: HashSet<i64>,
     screenshot: Option<String>,
@@ -82,6 +83,7 @@ impl HarnessBrowser {
             url: Arc::new(AsyncMutex::new(origin())),
             auth,
             land_on_click: HashMap::new(),
+            land_delay_ms: HashMap::new(),
             detached: HashSet::new(),
             refused: HashSet::new(),
             screenshot: None,
@@ -96,6 +98,12 @@ impl HarnessBrowser {
 
     fn with_detached(mut self, id: i64) -> Self {
         self.detached.insert(id);
+        self
+    }
+
+    /// Land this id's click after `delay_ms` instead of the default 50ms.
+    fn with_landing_delay(mut self, id: i64, delay_ms: u64) -> Self {
+        self.land_delay_ms.insert(id, delay_ms);
         self
     }
 
@@ -180,9 +188,10 @@ impl MenuBrowser for HarnessBrowser {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| url(&format!("https://www.example.com/harness-step-{step}")));
+        let delay_ms = self.land_delay_ms.get(&id).copied().unwrap_or(50);
         let url = Arc::clone(&self.url);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             *url.lock().await = target;
         });
         Ok(())
@@ -1011,6 +1020,132 @@ async fn layout_unavailable_journals_the_document_order_truncation() {
     assert!(
         diagnostic.contains(
             "model_candidates: 102 actionable; offered the first 60 in document order (layout unavailable)"
+        ),
+        "{diagnostic}"
+    );
+}
+
+// ---- post-click settle and settle-time verification ----
+
+#[tokio::test]
+async fn click_with_no_effect_settles_fast_instead_of_idling() {
+    // The click lands on the same URL (a panel toggle, nothing new): the
+    // settle ends once the page stops changing — not after a fixed 10s
+    // navigation timeout.
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated)
+        .with_landing_on_click(1, "https://www.example.com/");
+    let navigator = Arc::new(TurnNavigator::singles(vec![PageAction::Click {
+        target: 1,
+    }]));
+    let started = std::time::Instant::now();
+    let diagnostic = miss(run(&browser, navigator, settings_spec()).await);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "settled in {:?}",
+        started.elapsed()
+    );
+    assert!(
+        diagnostic.contains("goal not met (no navigation)")
+            && diagnostic.contains("model_settle: page settled after"),
+        "{diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn instant_navigation_counts_as_navigation() {
+    // The URL flips before any post-click read: the pre-click URL still
+    // proves the click navigated.
+    let browser =
+        HarnessBrowser::new(neutral_tree(), AuthState::Authenticated).with_landing_delay(1, 0);
+    let navigator = Arc::new(TurnNavigator::singles(vec![PageAction::Click {
+        target: 1,
+    }]));
+    let diagnostic = miss(run(&browser, navigator, settings_spec()).await);
+    assert!(
+        diagnostic.contains("goal not met (navigated)"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("clicked, navigated, verifier failed"),
+        "{diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn verified_click_returns_at_the_first_poll() {
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated)
+        .with_landing_on_click(2, "https://www.example.com/settings");
+    let navigator = Arc::new(TurnNavigator::singles(vec![PageAction::Click {
+        target: 2,
+    }]));
+    let started = std::time::Instant::now();
+    let lines = verified_tried_lines(run(&browser, navigator, settings_spec()).await);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("model_settle: verified after")),
+        "{lines:?}"
+    );
+}
+
+async fn verb_goal(
+    browser: &HarnessBrowser,
+    navigator: Arc<TurnNavigator>,
+) -> Result<PageGoalOutcome, IntentError> {
+    pursue_verb_goal(browser, &origin(), settings_spec(), Some(navigator), None).await
+}
+
+#[tokio::test]
+async fn settle_time_verification_turns_a_late_landing_into_a_pass() {
+    // The click's navigation lands after the post-click settle gave up and
+    // after the model gave up too; the final page is the settings page, so
+    // the run passes — the final state is what counts.
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated)
+        .with_landing_on_click(2, "https://www.example.com/settings")
+        .with_landing_delay(2, 2500);
+    let navigator = Arc::new(TurnNavigator::new(vec![
+        Some(vec![PageAction::Click { target: 2 }]),
+        Some(vec![PageAction::GiveUp {
+            reason: "nothing else to try".to_owned(),
+        }]),
+    ]));
+    match verb_goal(&browser, navigator).await {
+        Ok(PageGoalOutcome::Verified {
+            label,
+            landed,
+            tried_lines,
+            ..
+        }) => {
+            assert_eq!(label, "final page");
+            assert_eq!(landed.path(), "/settings");
+            assert!(
+                tried_lines.iter().any(|line| line.starts_with(
+                    "settle_verify: verified on the final page https://www.example.com/settings"
+                )),
+                "{tried_lines:?}"
+            );
+            assert!(
+                tried_lines
+                    .iter()
+                    .any(|line| line.contains("navigator gave up")),
+                "the model trail is kept: {tried_lines:?}"
+            );
+        }
+        other => panic!("expected the settle-time verifier to pass, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn settle_time_verification_journals_the_final_page_on_a_miss() {
+    let browser = HarnessBrowser::new(neutral_tree(), AuthState::Authenticated);
+    let navigator = Arc::new(TurnNavigator::new(vec![Some(vec![PageAction::GiveUp {
+        reason: "nothing to try".to_owned(),
+    }])]));
+    let diagnostic = miss(verb_goal(&browser, navigator).await);
+    assert!(
+        diagnostic.ends_with(
+            "settle_verify: goal not met on the final page https://www.example.com/ (title \"\")"
         ),
         "{diagnostic}"
     );

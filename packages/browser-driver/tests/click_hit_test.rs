@@ -256,3 +256,56 @@ fn non_navigating_click_keeps_the_post_click_report() {
         .journal_line("button", "avatar");
     assert_eq!(line, available_hit().journal_line("button", "avatar"));
 }
+
+#[test]
+fn click_on_an_icon_inside_the_expected_link_is_a_match() {
+    // The press hit the SVG inside the "Open inbox" link: the link is what
+    // the click activates, so this is a match, not a mismatch.
+    let hit = ClickHitTest::from_probe(
+        1480.0,
+        28.0,
+        &json!({
+            "tag": "svg",
+            "role": "",
+            "name": "",
+            "within": {"tag": "A", "role": "link", "name": "Open inbox"},
+        }),
+    );
+    assert_eq!(
+        hit.journal_line("link", "Open inbox"),
+        "click_hit_test: (1480, 28) -> svg role=- name=\"\" [inside A role=link name=\"Open inbox\"]"
+    );
+}
+
+#[test]
+fn a_foreign_interactive_ancestor_is_still_a_mismatch() {
+    let hit = ClickHitTest::from_probe(
+        300.0,
+        900.0,
+        &json!({
+            "tag": "path",
+            "role": "",
+            "name": "",
+            "within": {"tag": "BUTTON", "role": "button", "name": "Ad options"},
+        }),
+    );
+    let line = hit.journal_line("link", "Open inbox");
+    assert!(
+        line.contains("[inside BUTTON role=button name=\"Ad options\"]")
+            && line.ends_with(" MISMATCH(expected role=\"link\" name~=\"Open inbox\")"),
+        "{line}"
+    );
+}
+
+#[test]
+fn no_interactive_ancestor_keeps_the_plain_line() {
+    let hit = ClickHitTest::from_probe(
+        60.4,
+        40.2,
+        &json!({"tag": "BUTTON", "role": "button", "name": "User avatar", "within": null}),
+    );
+    assert_eq!(
+        hit.journal_line("button", "avatar"),
+        available_hit().journal_line("button", "avatar")
+    );
+}

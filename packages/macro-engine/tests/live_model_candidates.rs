@@ -14,7 +14,7 @@
 use browser_driver::{AxElement, LaunchOptions, ManagedBrowser};
 use macro_engine::{
     MAX_NAVIGATOR_ELEMENTS, MenuBrowser, NavigatorTurn, PageAction, PageGoalOutcome, PageNavigator,
-    SettingsBrowser, model_candidates, pursue_with_model,
+    SettingsBrowser, VerbKind, VerbSpec, model_candidates, pursue_verb_goal, pursue_with_model,
 };
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -28,7 +28,14 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const BELL: &str = "Open inbox";
 const AVATAR: &str = "Open user actions";
 
-fn home_page() -> String {
+/// `avatar_navigates`: the avatar leaves the page instantly (step 5) or,
+/// like a real account button, opens a small menu (step 6).
+fn home_page(avatar_navigates: bool) -> String {
+    let avatar_script = if avatar_navigates {
+        "root.getElementById('avatar').addEventListener('click', () => { location.href = '/user'; });"
+    } else {
+        "root.getElementById('avatar').addEventListener('click', () => { root.getElementById('menu').hidden = !root.getElementById('menu').hidden; });"
+    };
     let mut sidebar = String::new();
     for i in 0..100 {
         let _ = write!(sidebar, "<a href=\"/c/{i}\">Community {i}</a><br>");
@@ -51,11 +58,14 @@ customElements.define('site-header', class extends HTMLElement {{
     super();
     const root = this.attachShadow({{ mode: 'open' }});
     root.innerHTML = '<div style="position:fixed;top:0;left:0;right:0;height:56px;display:flex;justify-content:flex-end;gap:12px;background:#fff">' +
-      '<a href="/">Logo</a><button id="bell" aria-label="{BELL}">B</button><button id="avatar" aria-label="{AVATAR}">A</button></div>';
-    // The bell routes after a beat, like an SPA route change; the avatar
-    // navigates instantly, tearing the page down under the post-click probe.
-    root.getElementById('bell').addEventListener('click', () => {{ setTimeout(() => {{ location.href = '/notifications'; }}, 300); }});
-    root.getElementById('avatar').addEventListener('click', () => {{ location.href = '/user'; }});
+      '<a href="/">Logo</a>' +
+      '<a id="bell" href="/notifications" aria-label="{BELL}" style="display:inline-block;width:32px;height:32px"><svg width="32" height="32" viewBox="0 0 32 32"><path d="M16 4a8 8 0 0 0-8 8v6l-3 4h22l-3-4v-6a8 8 0 0 0-8-8z"/></svg></a>' +
+      '<button id="avatar" aria-label="{AVATAR}">A</button>' +
+      '<div id="menu" hidden style="position:fixed;top:56px;right:0;background:#fff"><a href="/user">Profile</a><a href="/settings">Settings</a></div></div>';
+    // The bell is a link with an SVG icon (the hit lands on the icon) that
+    // routes after a beat, like an SPA route change.
+    root.getElementById('bell').addEventListener('click', (e) => {{ e.preventDefault(); setTimeout(() => {{ location.href = '/notifications'; }}, 300); }});
+    {avatar_script}
   }}
 }});
 </script></body></html>"#
@@ -64,7 +74,8 @@ customElements.define('site-header', class extends HTMLElement {{
 
 fn page_for(path: &str) -> String {
     match path {
-        "/" => home_page(),
+        "/" => home_page(true),
+        "/muse" => home_page(false),
         "/notifications" => {
             "<!doctype html><title>Notifications</title><h1>Notifications</h1>".to_owned()
         }
@@ -281,6 +292,58 @@ async fn assert_navigating_click_reports_its_target(
     Ok(())
 }
 
+/// Step 6 — the Muse flow through the real verb path: "open notifications"
+/// on a page whose bell is an icon link named "Open inbox" (no
+/// notifications word, so the deterministic gear misses) and whose avatar
+/// opens a menu. The model clicks the bell, the verifier confirms the
+/// notifications page, and the click evidence is a match on the link the
+/// icon sits in.
+async fn assert_open_notifications_muse_flow(browser: &ManagedBrowser, origin: &Url) -> TestResult {
+    let muse = origin.join("/muse")?;
+    browser.navigate(&muse).await?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let navigator = Arc::new(BellNavigator {
+        offered: Mutex::new(Vec::new()),
+    });
+    let started = std::time::Instant::now();
+    let outcome = pursue_verb_goal(
+        browser,
+        &muse,
+        VerbSpec::for_kind(VerbKind::Notifications),
+        Some(navigator.clone()),
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let Ok(PageGoalOutcome::Verified {
+        landed,
+        hit_lines,
+        tried_lines,
+        ..
+    }) = outcome
+    else {
+        return Err(format!("expected a verified notifications landing, got {outcome:?}").into());
+    };
+    println!(
+        "open notifications: verified in {elapsed:?}; tried {tried_lines:?}; hits {hit_lines:?}"
+    );
+    assert_eq!(landed.path(), "/notifications");
+    let bell_hit = hit_lines
+        .iter()
+        .find(|line| line.contains(&format!("name=\"{BELL}\"")))
+        .ok_or_else(|| format!("no hit-test line on the bell: {hit_lines:?}"))?;
+    assert!(
+        bell_hit.contains(&format!("[inside A role=link name=\"{BELL}\"]"))
+            && !bell_hit.contains("MISMATCH"),
+        "{bell_hit}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the flow must not stall: {elapsed:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "needs CLINCH_CHROMIUM_PATH and launches a real off-screen browser"]
 async fn live_model_candidates_offer_the_header_past_the_document_order_head() -> TestResult {
@@ -315,5 +378,6 @@ async fn live_model_candidates_offer_the_header_past_the_document_order_head() -
     .await?;
     assert_candidates_lead_with_the_header(&browser, &elements).await?;
     assert_model_turn_clicks_the_bell(&browser, &origin).await?;
-    assert_navigating_click_reports_its_target(&browser, &origin).await
+    assert_navigating_click_reports_its_target(&browser, &origin).await?;
+    assert_open_notifications_muse_flow(&browser, &origin).await
 }

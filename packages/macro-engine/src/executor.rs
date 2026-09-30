@@ -1100,6 +1100,34 @@ pub async fn pursue_verb_goal<B: ChromeActionBrowser>(
         }
         None => (deterministic_miss, false),
     };
+    // Settle-time verification: whatever ended the model phase, the final
+    // page decides. A navigation still landing when the loop stopped is
+    // judged where it lands; for `LogOut` this runs BEFORE the cookie
+    // backstop, so a UI logout that worked is never "rescued" by clearing
+    // cookies.
+    let ui_miss = if model_ran {
+        let (verified, line) = settle_time_verify(browser, origin, spec).await;
+        if verified {
+            let landed = browser
+                .settings_current_url()
+                .await
+                .unwrap_or_else(|| origin.clone());
+            return Ok(PageGoalOutcome::Verified {
+                label: "final page".to_owned(),
+                landed,
+                username: None,
+                hit_lines: ui_miss
+                    .split("; ")
+                    .filter(|segment| segment.starts_with("click_hit_test:"))
+                    .map(str::to_owned)
+                    .collect(),
+                tried_lines: fallback_tried_lines(&ui_miss, &line),
+            });
+        }
+        format!("{ui_miss}; {line}")
+    } else {
+        ui_miss
+    };
     // `LogOut`-only deterministic backstop: both UI gears failed to reach a
     // verified signed-out state. Clearing the managed profile's session
     // cookies ends the session without depending on the page's menu
@@ -4736,6 +4764,8 @@ const MODEL_HARNESS_PREFIXES: &[&str] = &[
     "model_loop:",
     "model_done_verify:",
     "model_screenshot:",
+    "model_settle:",
+    "model_candidates:",
 ];
 
 fn is_model_harness_line(line: &str) -> bool {
@@ -5658,63 +5688,219 @@ async fn model_loop_click<B: ChromeActionBrowser>(
     {
         *revealed_username = username_from_menu_text(&label);
     }
+    // Read BEFORE the click: a navigation that lands instantly must still
+    // count as a navigation.
+    let url_before = browser.settings_current_url().await;
     model_click_dispatch(browser, element, tried, deterministic_miss).await?;
     clicked.push(ClickedControl::of(element));
     *last_label = Some(label.clone());
-    let navigated = wait_for_url_change(browser).await;
-    if let Some(spec) = spec {
-        // The verifier decides after every click: an early
-        // verified landing ends the loop instead of burning
-        // the remaining budget on clicks that could navigate
-        // away again.
-        if verify_verb(
-            browser,
-            origin,
-            spec,
-            Some(&label),
-            revealed_username.as_deref(),
-        )
-        .await
-        {
+    let Some(spec) = spec else {
+        // Generic noun hunt: no verifier exists, so a navigation ends the
+        // loop as before.
+        return Ok(match wait_for_url_change(browser).await {
+            Some(landed) => Some(
+                PageGoalOutcome::Navigated {
+                    label,
+                    landed,
+                    hit_lines: Vec::new(),
+                }
+                .with_hit_lines(tried),
+            ),
+            None => {
+                tried.push(tried_label(element, "clicked, no navigation"));
+                None
+            }
+        });
+    };
+    // The verifier decides after every click, polled while the page
+    // settles: a verified landing ends the loop at once, and a page that
+    // stopped changing ends the wait early instead of idling out a fixed
+    // navigation timeout.
+    let settle = settle_after_click(
+        browser,
+        origin,
+        spec,
+        &label,
+        revealed_username.as_deref(),
+        url_before.as_ref(),
+    )
+    .await;
+    tried.push(settle.journal_line());
+    if settle.verified {
+        return Ok(Some(
+            model_verified_outcome(
+                browser,
+                origin,
+                goal,
+                tried,
+                Some(&label),
+                revealed_username.as_deref(),
+            )
+            .await,
+        ));
+    }
+    tried.push(tried_label(
+        element,
+        if settle.navigated {
+            "clicked, navigated, verifier failed"
+        } else {
+            "clicked, no navigation, verifier failed"
+        },
+    ));
+    Ok(None)
+}
+
+/// Poll interval of [`settle_after_click`] and [`settle_time_verify`].
+pub const CLICK_SETTLE_POLL_MS: u64 = 250;
+/// Hard cap on one post-click settle: a page still changing after this is
+/// judged as it stands (it was 10s of idle waiting before).
+pub const CLICK_SETTLE_WINDOW_MS: u64 = 4000;
+/// Unchanged consecutive page reads that count as "settled".
+pub const CLICK_SETTLE_STABLE_POLLS: usize = 2;
+/// Minimum wait before a stable page may end the settle early, so a click
+/// whose effect starts a beat later (an SPA route change) is not cut off.
+pub const CLICK_SETTLE_MIN_MS: u64 = 500;
+
+/// What one post-click settle observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClickSettle {
+    pub verified: bool,
+    /// The URL left the pre-click URL (read before the click, so an
+    /// instant navigation still counts).
+    pub navigated: bool,
+    /// The page stopped changing before the window elapsed.
+    pub settled: bool,
+    pub elapsed_ms: u64,
+}
+
+impl ClickSettle {
+    /// The `model_settle:` journal line.
+    #[must_use]
+    pub fn journal_line(&self) -> String {
+        let navigation = if self.navigated {
+            "navigated"
+        } else {
+            "no navigation"
+        };
+        if self.verified {
+            format!(
+                "model_settle: verified after {}ms ({navigation})",
+                self.elapsed_ms
+            )
+        } else if self.settled {
+            format!(
+                "model_settle: page settled after {}ms, goal not met ({navigation})",
+                self.elapsed_ms
+            )
+        } else {
+            format!(
+                "model_settle: {}ms window elapsed, goal not met ({navigation})",
+                self.elapsed_ms
+            )
+        }
+    }
+}
+
+/// After a model click: poll the verb's verifier every
+/// [`CLICK_SETTLE_POLL_MS`] until it passes, the page stops changing
+/// ([`CLICK_SETTLE_STABLE_POLLS`] identical fingerprints after
+/// [`CLICK_SETTLE_MIN_MS`]), or [`CLICK_SETTLE_WINDOW_MS`] elapses. The
+/// verifier alone decides; the polling only decides WHEN to ask it.
+async fn settle_after_click<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+    label: &str,
+    username: Option<&str>,
+    before: Option<&url::Url>,
+) -> ClickSettle {
+    let started = std::time::Instant::now();
+    let elapsed_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut last_page: Option<u64> = None;
+    let mut stable = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(CLICK_SETTLE_POLL_MS)).await;
+        let verified = verify_verb(browser, origin, spec, Some(label), username).await;
+        // Read after the verifier, so a navigation landing mid-check is
+        // reported as the navigation it was.
+        let now = browser.settings_current_url().await;
+        let navigated =
+            matches!((before, &now), (Some(from), Some(now)) if navigated_away(from, now));
+        let mut outcome = ClickSettle {
+            verified,
+            navigated,
+            settled: false,
+            elapsed_ms: elapsed_ms(),
+        };
+        if verified || outcome.elapsed_ms >= CLICK_SETTLE_WINDOW_MS {
+            return outcome;
+        }
+        let (elements, _, _) = browser.menu_snapshot(origin).await;
+        let page = crate::navigator::page_fingerprint(now.as_ref(), &elements);
+        stable = if last_page == Some(page) {
+            stable + 1
+        } else {
+            0
+        };
+        last_page = Some(page);
+        if stable >= CLICK_SETTLE_STABLE_POLLS && outcome.elapsed_ms >= CLICK_SETTLE_MIN_MS {
+            outcome.settled = true;
+            return outcome;
+        }
+    }
+}
+
+/// Settle-time verification window: how long the final page may take to
+/// finish landing before the miss is written.
+pub const SETTLE_VERIFY_WINDOW_MS: u64 = 3000;
+
+/// Settle-time verification: after the model phase ends (miss, give-up,
+/// exhausted budget, refused click), read the FINAL page — polled for up
+/// to [`SETTLE_VERIFY_WINDOW_MS`] so a navigation still landing is judged
+/// on where it lands — and let the verb's verifier decide. The final state
+/// is what counts: "only the verifier declares completion" applies at
+/// settle too. Returns the `settle_verify:` journal line and whether it
+/// verified.
+async fn settle_time_verify<B: ChromeActionBrowser>(
+    browser: &B,
+    origin: &url::Url,
+    spec: &VerbSpec,
+) -> (bool, String) {
+    let started = std::time::Instant::now();
+    loop {
+        if verify_verb(browser, origin, spec, None, None).await {
             let landed = browser
                 .settings_current_url()
                 .await
-                .unwrap_or_else(|| origin.clone());
-            return Ok(Some(
-                PageGoalOutcome::Verified {
-                    label,
-                    landed,
-                    username: revealed_username.clone(),
-                    hit_lines: Vec::new(),
-                    tried_lines: Vec::new(),
-                }
-                .with_hit_lines(tried)
-                .with_model_lines(tried),
-            ));
+                .map_or_else(|| "unreadable".to_owned(), |url| url.to_string());
+            return (
+                true,
+                format!(
+                    "settle_verify: verified on the final page {landed} after {}ms",
+                    started.elapsed().as_millis()
+                ),
+            );
         }
-        tried.push(tried_label(
-            element,
-            if navigated.is_some() {
-                "clicked, navigated, verifier failed"
-            } else {
-                "clicked, no navigation, verifier failed"
-            },
-        ));
-    } else if let Some(landed) = navigated {
-        // Generic noun hunt: no verifier exists, so a
-        // navigation ends the loop as before.
-        return Ok(Some(
-            PageGoalOutcome::Navigated {
-                label,
-                landed,
-                hit_lines: Vec::new(),
-            }
-            .with_hit_lines(tried),
-        ));
-    } else {
-        tried.push(tried_label(element, "clicked, no navigation"));
+        if started.elapsed() >= std::time::Duration::from_millis(SETTLE_VERIFY_WINDOW_MS) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(CLICK_SETTLE_POLL_MS)).await;
     }
-    Ok(None)
+    let landed = browser
+        .settings_current_url()
+        .await
+        .map_or_else(|| "unreadable".to_owned(), |url| url.to_string());
+    let title: String = browser
+        .settings_page_title()
+        .await
+        .unwrap_or_default()
+        .chars()
+        .take(80)
+        .collect();
+    (
+        false,
+        format!("settle_verify: goal not met on the final page {landed} (title \"{title}\")"),
+    )
 }
 
 /// Dispatch one model-picked click with its evidence: exactly one
